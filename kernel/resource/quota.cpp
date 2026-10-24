@@ -5,14 +5,14 @@ namespace resource {
 
 Reservation::Reservation(Reservation&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)), ref_(std::move(other.ref_)),
-      usage_(std::exchange(other.usage_, Budget{})) {}
+      usage_(std::exchange(other.usage_, Capacity{})) {}
 
 auto Reservation::operator=(Reservation&& other) noexcept -> Reservation& {
     if (this != &other) {
         reset();
         owner_ = std::exchange(other.owner_, nullptr);
         ref_ = std::move(other.ref_);
-        usage_ = std::exchange(other.usage_, Budget{});
+        usage_ = std::exchange(other.usage_, Capacity{});
     }
     return *this;
 }
@@ -21,14 +21,14 @@ Reservation::~Reservation() noexcept { reset(); }
 
 Release::Release(Release&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)), ref_(std::move(other.ref_)),
-      usage_(std::exchange(other.usage_, Budget{})) {}
+      usage_(std::exchange(other.usage_, Capacity{})) {}
 
 auto Release::operator=(Release&& other) noexcept -> Release& {
     if (this != &other) {
         complete();
         owner_ = std::exchange(other.owner_, nullptr);
         ref_ = std::move(other.ref_);
-        usage_ = std::exchange(other.usage_, Budget{});
+        usage_ = std::exchange(other.usage_, Capacity{});
     }
     return *this;
 }
@@ -37,14 +37,14 @@ Release::~Release() noexcept { complete(); }
 
 Usage::Usage(Usage&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)), ref_(std::move(other.ref_)),
-      amount_(std::exchange(other.amount_, Budget{})) {}
+      amount_(std::exchange(other.amount_, Capacity{})) {}
 
 auto Usage::operator=(Usage&& other) noexcept -> Usage& {
     if (this != &other) {
         reset();
         owner_ = std::exchange(other.owner_, nullptr);
         ref_ = std::move(other.ref_);
-        amount_ = std::exchange(other.amount_, Budget{});
+        amount_ = std::exchange(other.amount_, Capacity{});
     }
     return *this;
 }
@@ -66,7 +66,7 @@ auto Reservation::commit() && noexcept -> Usage {
     Usage result;
     result.owner_ = std::exchange(owner_, nullptr);
     result.ref_ = std::move(ref_);
-    result.amount_ = std::exchange(usage_, Budget{});
+    result.amount_ = std::exchange(usage_, Capacity{});
     return result;
 }
 
@@ -79,7 +79,7 @@ void Release::complete() noexcept {
     ref_.reset();
 }
 
-auto Usage::split(Budget part) noexcept -> Usage {
+auto Usage::split(Capacity part) noexcept -> Usage {
     libk_assert(owner_ && ref_ && amount_.contains(part) && !part.empty());
     if (part == amount_) return Usage{std::move(*this)};
     amount_.memory -= part.memory;
@@ -123,11 +123,11 @@ void Allocation::commit(Reservation&& reservation) noexcept {
     epoch_ = 1;
     owner_ = std::exchange(reservation.owner_, nullptr);
     ref_ = std::move(reservation.ref_);
-    usage_ = std::exchange(reservation.usage_, Budget{});
+    usage_ = std::exchange(reservation.usage_, Capacity{});
     owner_->attach(*this);
 }
 
-auto Allocation::reserve(Budget usage) const noexcept -> std::expected<Reservation, errc> {
+auto Allocation::reserve(Capacity usage) const noexcept -> std::expected<Reservation, errc> {
     object::ref<> quota;
     Quota* owner;
     {
@@ -138,7 +138,7 @@ auto Allocation::reserve(Budget usage) const noexcept -> std::expected<Reservati
     return owner->reserve(std::move(quota), usage);
 }
 
-auto acquire(const object::ref<>& quota, Budget amount) noexcept
+auto acquire(const object::ref<>& quota, Capacity amount) noexcept
     -> std::expected<Usage, errc> {
     if (!quota) return Usage{};
     auto owner = quota.as<Quota>();
@@ -148,7 +148,7 @@ auto acquire(const object::ref<>& quota, Budget amount) noexcept
     return std::move(*reserved).commit();
 }
 
-auto Allocation::acquire(Budget amount) const noexcept
+auto Allocation::acquire(Capacity amount) const noexcept
     -> std::expected<Usage, errc> {
     auto reservation = reserve(amount);
     if (!reservation) return std::unexpected(reservation.error());
@@ -185,11 +185,11 @@ auto Allocation::detach() noexcept -> Release {
     Release release;
     release.owner_ = std::exchange(owner_, nullptr);
     release.ref_ = std::move(ref_);
-    release.usage_ = std::exchange(usage_, Budget{});
+    release.usage_ = std::exchange(usage_, Capacity{});
     return release;
 }
 
-Quota::Quota(Budget limit, Usage delegation) noexcept
+Quota::Quota(Capacity limit, Usage delegation) noexcept
     : limit_(limit), available_(limit), delegation_(std::move(delegation)) {
     events_.update(STATE_OPEN);
 }
@@ -198,7 +198,7 @@ Quota::~Quota() noexcept {
     libk_assert(pending_ == 0 && allocations_ == 0 && available_ == limit_ && !cleanup_ && !finishing_ && !reassigning_ && !calls_);
 }
 
-auto Quota::reserve(object::ref<> self, Budget amount) noexcept -> std::expected<Reservation, errc> {
+auto Quota::reserve(object::ref<> self, Capacity amount) noexcept -> std::expected<Reservation, errc> {
     auto typed = self.as<Quota>();
     if (!typed || &typed->get() != this || amount.empty()) return std::unexpected(errc::invalid);
     {
@@ -218,8 +218,8 @@ auto Quota::reserve(object::ref<> self, Budget amount) noexcept -> std::expected
     reserved.usage_ = amount;
     return reserved;
 }
-auto Quota::limit() const noexcept -> Budget { sync::Lock guard{lock_}; return limit_; }
-auto Quota::available() const noexcept -> Budget { sync::Lock guard{lock_}; return available_; }
+auto Quota::limit() const noexcept -> Capacity { sync::Lock guard{lock_}; return limit_; }
+auto Quota::available() const noexcept -> Capacity { sync::Lock guard{lock_}; return available_; }
 auto Quota::state() const noexcept -> Phase { sync::Lock guard{lock_}; return phase_; }
 auto Quota::info(u64) const noexcept -> QuotaInfo {
     sync::Lock guard{lock_};
@@ -227,7 +227,7 @@ auto Quota::info(u64) const noexcept -> QuotaInfo {
         .memory_available=available_.memory, .cap_limit=limit_.caps, .caps_available=available_.caps,
         .allocations=allocations_, .reservations=pending_, .state=static_cast<u32>(phase_), .reserved=0};
 }
-void Quota::cancel(Budget amount) noexcept {
+void Quota::cancel(Capacity amount) noexcept {
     {
         sync::Lock guard{lock_};
         libk_assert(pending_ && limit_.memory - available_.memory >= amount.memory
@@ -251,7 +251,7 @@ void Quota::detach(Allocation&) noexcept {
     sync::Lock guard{lock_};
     libk_assert(allocations_); --allocations_;
 }
-void Quota::release(Budget amount) noexcept {
+void Quota::release(Capacity amount) noexcept {
     {
         sync::Lock guard{lock_};
         libk_assert(limit_.memory - available_.memory >= amount.memory

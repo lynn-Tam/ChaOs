@@ -9,11 +9,9 @@ namespace sched { class Domain; }
 // Common accepted-work lifetime and cancellation. Concrete providers own the
 // resources and hardware proof; this record only owns authority and results.
 class Op final {
-    friend class sched::Domain;
     mutable sync::Spin lock_;
     object::ref<> cpu_;
-    Op* cpu_previous_{}, *cpu_next_{};
-    bool cpu_admitted_{};
+    Work::Link cpu_link_{Work::Fn::bind<&Op::invalidated>(*this), Work::Fn::bind<&Op::wake>(*this)};
     Source::Action progress_;
     Work job_{Work::Fn::bind<&Op::run>(*this), Work::Fn::bind<&Op::cancel_work>(*this)};
     Work* runner_;
@@ -64,7 +62,7 @@ public:
     ~Op() noexcept {
         libk_assert(!cleanup_);
     }
-    void bind(WorkQueue& work, object::Key owner) noexcept { bindings_.bind(owner); job_.bind(owner); events_.bind_work(work, owner); }
+    void bind(WorkQueue& work, object::Key owner) noexcept { bindings_.bind(owner); job_.bind(owner); cpu_link_.bind(owner); events_.bind_work(work, owner); }
     void cpu_domain(object::ref<> cpu) noexcept { libk_assert(!phase_); cpu_ = std::move(cpu); }
     auto schedule() noexcept -> bool;
     // Continuing business returns directly to its CPU domain; only safety tails
@@ -114,7 +112,7 @@ public:
         }
     }
     auto ready() const noexcept -> bool { return bindings_.ready(); }
-    auto detach() noexcept -> bool { return bindings_.close(); }
+    auto detach() noexcept -> bool;
     // The provider has removed its active transaction before publishing Done.
     void finish(status_t status = STATUS_OK, u64 value = 0) noexcept {
         libk_assert(bindings_.drained());

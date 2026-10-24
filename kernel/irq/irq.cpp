@@ -1,3 +1,4 @@
+#include <io.hpp>
 #include <expected>
 #include <irq/irq.hpp>
 #include <ipc/notification.hpp>
@@ -6,6 +7,23 @@
 #include <cpu/cpu.hpp>
 
 namespace irq {
+auto Ctl::open() noexcept -> status_t {
+    const auto pages = mm::Pages::from_aligned_bytes(mm::pa_t{config_.address}, arch::plic_bytes(config_.context));
+    if (!pages || !claim_.covers(*pages)) return STATUS_BAD_ARGS;
+    if (!vm_.map(mapping_, *pages, cpus_, current_cpu().id)) return STATUS_NO_MEMORY;
+    mapped_ = true; work_.open(job_, Work::Fn::bind<&Ctl::progress>(*this)); return STATUS_OK;
+}
+void Ctl::activate() noexcept {
+    auto commit = [&]() noexcept {
+        arch::plic_init(mapping_.address(), config_.context, config_.sources);
+        { sync::Lock guard{routes_.lock_}; open_ = true; }
+        cpus_.attach_irq(*this);
+    };
+    static_cast<void>(bindings_.publish(Source::Action::bind(commit)));
+}
+void Ctl::set(u32 id, bool enable) noexcept { arch::plic_set(mapping_.address(), config_.context, id, enable); }
+auto Ctl::take() noexcept -> u32 { return arch::plic_take(mapping_.address(), config_.context); }
+
 
 auto Route::connect_locked(bool armed) noexcept -> bool {
     if (line_.routes.closed_ || hook_.is_linked() || line_.id == 0 || !handler_) return false;
@@ -223,36 +241,10 @@ void Irq::complete_cleanup() noexcept {
     if (cleanup) cleanup.complete();
 }
 
-} // namespace irq
-
-namespace irq {
 Ctl::Ctl(mm::KSpace& vm, Cpus& cpus, WorkQueue& work, mm::Phys::Claim&& claim, IrqConfig config) noexcept
     : vm_(vm), cpus_(cpus), work_(work), claim_(std::move(claim)), config_(config),
       routes_(Routes::Enable::bind<&Ctl::set>(*this)) {}
 Ctl::~Ctl() noexcept { libk_assert(!open_ && !mapped_ && !cleanup_); }
-auto Ctl::word(usize offset) const noexcept -> volatile u32* {
-    return reinterpret_cast<volatile u32*>(mapping_.address() + offset);
-}
-auto Ctl::open() noexcept -> status_t {
-    const auto bytes = (0x200008 + config_.context * 0x1000 + 4095) & ~usize{4095};
-    const auto pages = mm::Pages::from_aligned_bytes(mm::pa_t{config_.address}, bytes);
-    if (!pages || !claim_.covers(*pages)) return STATUS_BAD_ARGS;
-    if (!vm_.map(mapping_, *pages, cpus_, current_cpu().id)) return STATUS_NO_MEMORY;
-    mapped_ = true;
-    work_.open(job_, Work::Fn::bind<&Ctl::progress>(*this));
-    return STATUS_OK;
-}
-void Ctl::activate() noexcept {
-    auto commit = [&]() noexcept {
-        for (usize i = 0; i <= config_.sources / 32; ++i)
-            *word(0x2000 + config_.context * 0x80 + i * 4) = 0;
-        *word(0x200000 + config_.context * 0x1000) = 0;
-        arch::io_fence();
-        { sync::Lock guard{routes_.lock_}; open_ = true; }
-        cpus_.attach_irq(*this);
-    };
-    static_cast<void>(bindings_.publish(Source::Action::bind(commit)));
-}
 void Ctl::links(u64 cursor, LinkRecords& out) const noexcept {
     bindings_.links(out, LINK_PHYS, cursor);
     for (auto& row : std::span{out.records, out.count}) { row.first = config_.address; row.bytes = config_.bytes; }
@@ -262,24 +254,6 @@ auto Ctl::line(u32 id) noexcept -> std::expected<Line, status_t> {
     if (!open_ || routes_.closed_) return std::unexpected(STATUS_CLOSED);
     if (!id || id > config_.sources) return std::unexpected(STATUS_BAD_ARGS);
     return Line{routes_, id};
-}
-void Ctl::set(u32 id, bool enable) noexcept {
-    arch::io_fence();
-    auto* priority = word(id * 4);
-    if (!*priority) *priority = 1;
-    auto* bank = word(0x2000 + config_.context * 0x80 + (id / 32) * 4);
-    if (enable) { *bank |= u32{1} << (id % 32); *priority = *priority; }
-    else *bank &= ~(u32{1} << (id % 32));
-    arch::io_fence();
-}
-auto Ctl::take() noexcept -> u32 {
-    arch::io_fence();
-    auto* claim = word(0x200004 + config_.context * 0x1000);
-    const auto id = *claim;
-    // PLIC completion must precede masking; driver ACK only rearms the source.
-    if (id) *claim = id;
-    arch::io_fence();
-    return id;
 }
 void Ctl::dispatch() noexcept { routes_.dispatch(Routes::Take::bind<&Ctl::take>(*this)); }
 void Ctl::retire(object::cleanup&& cleanup) noexcept {
@@ -306,20 +280,3 @@ void Ctl::progress() noexcept {
     cleanup.complete();
 }
 } // namespace irq
-
-void Cpus::attach_irq(irq::Ctl& controller) noexcept {
-    sync::Lock guard{irq_lock_};
-    controller.next_ = interrupts_;
-    interrupts_ = &controller;
-}
-void Cpus::detach_irq(irq::Ctl& controller) noexcept {
-    sync::Lock guard{irq_lock_};
-    for (auto** link = &interrupts_; *link; link = &(*link)->next_)
-        if (*link == &controller) { *link = controller.next_; controller.next_ = nullptr; return; }
-    libk_assert(false);
-}
-void Cpus::dispatch_irq(CpuId cpu) noexcept {
-    sync::Lock guard{irq_lock_};
-    for (auto* controller = interrupts_; controller; controller = controller->next_)
-        if (controller->config_.cpu == cpu.raw) controller->dispatch();
-}

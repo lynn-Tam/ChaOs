@@ -24,7 +24,7 @@ namespace irq { class Irq; class Ctl; }
 namespace io { class Iommu; class Space; class IoOp; }
 namespace sched { class Sc; class Domain; }
 namespace cap { class CSpace; }
-namespace resource { class Quota; class Allocation; struct Budget; }
+namespace resource { class Quota; class Allocation; struct Capacity; }
 namespace mm { class Mem; class VSpace; class VmOp; class Phys; }
 class Pager;
 class Thread;

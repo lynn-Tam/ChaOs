@@ -1,6 +1,7 @@
 #include <cpu/cpu.hpp>
+#include <irq/irq.hpp>
 #include <cpu/ipi.hpp>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <boot/info.hpp>
 #include <trap.hpp>
 #include <console.hpp>
@@ -143,8 +144,24 @@ void Cpus::start() noexcept {
         const auto pa = pages_.owner().phys(mm::va_t{reinterpret_cast<usize>(&cpu.start)}, sizeof(cpu.start));
         libk_assert(pa);
         const auto started = arch::start_secondary(cpu.hw.raw, boot_layout.secondary.pa, pa->raw());
-        if (!started)
+        if (!started) {
             console::print<"cpu: start hart={} error={}\n">(cpu.hw.raw, started.error());
+            panic("secondary CPU start failed");
+        }
+    }
+    auto& clock = get(boot_id())->dispatcher().clock();
+    const auto deadline = libk::checked_add(clock.rd_ticks(), *clock.ticks<5, time::s>());
+    libk_assert(deadline);
+    // Boot has not entered idle yet. Publish userspace only after every peer
+    // can consume the mail and hardware receipts it will be required to ACK.
+    while (online_.load(std::memory_order_acquire) + 1 != count()) {
+        if (clock.rd_ticks() >= *deadline) {
+            for (usize i = 1; i < count(); ++i) {
+                const auto& cpu = *get(CpuId{i});
+                if (!cpu.online()) console::print<"cpu: online timeout hart={}\n">(cpu.hw.raw);
+            }
+            panic("secondary CPU online timeout");
+        }
     }
 }
 
@@ -159,4 +176,21 @@ auto current_cpu() noexcept -> Cpu& {
     auto* cpu = Cpu::local();
     libk_assert(cpu);
     return *cpu;
+}
+
+void Cpus::attach_irq(irq::Ctl& controller) noexcept {
+    sync::Lock guard{irq_lock_};
+    controller.next_ = interrupts_;
+    interrupts_ = &controller;
+}
+void Cpus::detach_irq(irq::Ctl& controller) noexcept {
+    sync::Lock guard{irq_lock_};
+    for (auto** link = &interrupts_; *link; link = &(*link)->next_)
+        if (*link == &controller) { *link = controller.next_; controller.next_ = nullptr; return; }
+    libk_assert(false);
+}
+void Cpus::dispatch_irq(CpuId cpu) noexcept {
+    sync::Lock guard{irq_lock_};
+    for (auto* controller = interrupts_; controller; controller = controller->next_)
+        if (controller->config_.cpu == cpu.raw) controller->dispatch();
 }

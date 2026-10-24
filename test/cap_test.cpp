@@ -12,9 +12,9 @@
 #include <libk/noncopyable.hpp>
 #include <utility>
 #include <mm/pmm.hpp>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <boot/info.hpp>
-#include <sched/sc.hpp>
+#include <sched/sched.hpp>
 #include <task/thread.hpp>
 #include <uapi/mem.h>
 
@@ -330,7 +330,7 @@ bool test_typed_attenuation_covers_all_families(
     const View pool{
         attenuation_rights,
         QuotaLimit{
-            resource::Budget{1024 * 1024, 16},
+            resource::Capacity{1024 * 1024, 16},
             OBJ_KINDS}};
     attenuation_bytes(bytes, ObjQuota);
     put64(bytes, CAP_ATTENUATION_WORD0_OFFSET, 4096);
@@ -642,7 +642,7 @@ bool test_delegation_revoke_waits_for_existing_lease(
     if (hint.status != STATUS_OK || hint.sequence == seen) return false;
     auto child_sample = fixture.b().observe(*child, {}, Graph::max_depth);
     if (!child_sample) return false;
-    GrantRecords grants;
+    static GrantRecords grants;
     if (fixture.a().inspect(GrantQuery{source->raw(), 0, 0, 0}, cap::Graph::max_depth, grants) != STATUS_OK
         || grants.count != 1 || grants.root.grant_id != grants.seed
         || grants.records[0].parent_id != grants.seed
@@ -1122,11 +1122,11 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
         return false;
     }
 
-    constexpr resource::Budget limit{
+    constexpr resource::Capacity limit{
         .memory = 8 * mm::page_size,
         .caps = 8,
     };
-    constexpr resource::Budget object_charge{
+    constexpr resource::Capacity object_charge{
         .memory = mm::page_size,
     };
     auto made_pool = cap_test_quotas->create(limit);
@@ -1155,7 +1155,7 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
     }
     auto installed = space->insert(
         std::move(root).value(), View{basic_rights});
-    const resource::Budget after_install{
+    const resource::Capacity after_install{
         .memory = limit.memory - object_charge.memory
             - 3 * mm::page_size,
         .caps = limit.caps - 1,
@@ -1164,7 +1164,7 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
         || !space->transfer(installed.value(), fixture.b(), cap::XferOp::Derive, inspect_rights)) {
         return false;
     }
-    const resource::Budget after_delegate{
+    const resource::Capacity after_delegate{
         .memory = after_install.memory - Graph::node_usage().memory,
         .caps = after_install.caps,
     };
@@ -1196,7 +1196,7 @@ bool test_sponsored_cspace_refunds_reusable_capacity(
         // still holds the reservation, even when the source is closing.
     }
     fixture.drain();
-    if (space->table_pages() != 0 || pool->available() != resource::Budget{
+    if (space->table_pages() != 0 || pool->available() != resource::Capacity{
             .memory = limit.memory - object_charge.memory, .caps = limit.caps}) {
         return false;
     }
@@ -1304,7 +1304,7 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
     if (!fixture.initialize()) {
         return false;
     }
-    constexpr resource::Budget limit{
+    constexpr resource::Capacity limit{
         .memory = 4 * mm::page_size,
         .caps = 4,
     };
@@ -1319,7 +1319,7 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
         if (!self || !target) return false;
         auto fee = pool->reserve(std::move(self), Graph::node_usage());
         auto rejected = fixture.pending_target(1);
-        if (!fee || !rejected || rejected->root(fixture.graph(), std::move(*fee),
+        if (!fee || !rejected || fixture.graph().create_root(std::move(*fee), rejected->reference(),
                                         View{Rights::of(Right::Signal)})) return false;
         rejected->reset(); // Private target rollback before any grant exists.
         fee->reset();
@@ -1343,18 +1343,9 @@ bool pending_rollback_closes_lineage(bool deferred) noexcept {
     if (!child_reservation || !target_ref) {
         return false;
     }
-    auto allocation = creation.value().root(fixture.graph(), std::move(*root_fee), View{all_context_rights});
+    auto allocation = fixture.graph().create_root(std::move(*root_fee), creation->reference(), View{all_context_rights});
     if (!allocation) {
         return false;
-    }
-    // A pending slot accepts one initial lineage, never a second owner.
-    {
-        auto quota = object::ref<>{pool};
-        if (!quota) return false;
-        auto fee = pool->reserve(std::move(quota), Graph::node_usage());
-        if (!fee) return false;
-        auto duplicate = creation->root(fixture.graph(), std::move(*fee), View{all_context_rights});
-        if (duplicate || duplicate.error() != GrantError::InvalidState) return false;
     }
     auto root_lease = allocation.value().acquire();
     auto child_target = fixture.target_ref(0);
@@ -1401,7 +1392,7 @@ bool test_pending_rollback_defers_refund(const TestContext&) noexcept {
 bool test_scope_close_is_independent_from_quota(const TestContext&) noexcept {
     CapFixture fixture;
     if (!fixture.initialize()) return false;
-    constexpr resource::Budget limit{8 * mm::page_size, 16};
+    constexpr resource::Capacity limit{8 * mm::page_size, 16};
     auto new_scope = cap_test_scopes->create();
     auto new_quota = cap_test_quotas->create(limit);
     if (!new_scope || !new_quota) return false;
@@ -1413,7 +1404,7 @@ bool test_scope_close_is_independent_from_quota(const TestContext&) noexcept {
     if (!owner || !fee || !grant_fee) return false;
     auto made = cap_test_contexts->create(std::move(*owner), std::move(*fee), sched::Sc::Config{1, 10}, 0);
     if (!made) return false;
-    auto root = made->root(fixture.graph(), std::move(*grant_fee), View{inspect_rights});
+    auto root = fixture.graph().create_root(std::move(*grant_fee), made->reference(), View{inspect_rights});
     if (!root) return false;
     const auto id = root->target_id();
     const auto grant = root->id();
@@ -1448,7 +1439,7 @@ bool test_scope_close_is_independent_from_quota(const TestContext&) noexcept {
 bool test_scope_adopt_keeps_quota(const TestContext&) noexcept {
     CapFixture fixture;
     if (!fixture.initialize()) return false;
-    constexpr resource::Budget limit{8 * mm::page_size, 16};
+    constexpr resource::Capacity limit{8 * mm::page_size, 16};
     auto new_source = cap_test_scopes->create();
     auto new_destination = cap_test_scopes->create();
     auto new_quota = cap_test_quotas->create(limit);
@@ -1506,7 +1497,7 @@ bool test_scope_control_quota_cycles(const TestContext&) noexcept {
         auto owner = object::Scope::reserve(host);
         if (!owner) return {};
         auto made = cap_test_quotas->create(std::move(*owner), resource::Reservation{},
-            resource::Budget{8 * mm::page_size, 16});
+            resource::Capacity{8 * mm::page_size, 16});
         return made ? made->publish() : object::ref<resource::Quota>{};
     };
     auto a = quota(), b = quota();
@@ -1536,7 +1527,7 @@ bool test_scope_control_quota_cycles(const TestContext&) noexcept {
 bool test_destroy_allocation_progress_and_quota_close(const TestContext&) noexcept {
     CapFixture fixture{};
     if (!fixture.initialize()) return false;
-    constexpr resource::Budget limit{.memory = 8 * mm::page_size, .caps = 8};
+    constexpr resource::Capacity limit{.memory = 8 * mm::page_size, .caps = 8};
     auto pending = cap_test_quotas->create(limit);
     if (!pending) return false;
     auto pool = std::move(pending).value().publish();
@@ -1551,7 +1542,7 @@ bool test_destroy_allocation_progress_and_quota_close(const TestContext&) noexce
         auto child_charge = pool->reserve(std::move(child_ref), Graph::node_usage());
         auto target = fixture.target_ref(index);
         if (!creation || !child_charge || !target) return false;
-        auto allocation = creation.value().root(fixture.graph(), std::move(*root_fee), View{rights});
+        auto allocation = fixture.graph().create_root(std::move(*root_fee), creation->reference(), View{rights});
         if (!allocation) return false;
         auto pin = allocation.value().acquire();
         auto child_target = fixture.target_ref(index);
@@ -1614,7 +1605,7 @@ bool test_destroy_authority_uses_object_anchor_retirement(
 bool test_last_reference_refunds_managed_object(const TestContext&) noexcept {
     CapFixture fixture;
     if (!fixture.initialize()) return false;
-    constexpr resource::Budget limit{.memory=8 * mm::page_size, .caps=16};
+    constexpr resource::Capacity limit{.memory=8 * mm::page_size, .caps=16};
     auto made = cap_test_quotas->create(limit);
     if (!made) return false;
     auto pool = made->publish();
@@ -1623,7 +1614,7 @@ bool test_last_reference_refunds_managed_object(const TestContext&) noexcept {
     if (!fee || !root_fee) return false;
     auto object = cap_test_cspaces->create(std::move(*fee), *cap_test_pmm);
     if (!object) return false;
-    auto root = object->root(fixture.graph(), std::move(*root_fee), View{inspect_rights});
+    auto root = fixture.graph().create_root(std::move(*root_fee), object->reference(), View{inspect_rights});
     if (!root) return false;
     auto hold = object->publish();
     root->reset();

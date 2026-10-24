@@ -34,12 +34,22 @@ public:
     ~rpc_op() { if (const auto status = close(); status != STATUS_OK) sys::exit(status); }
     auto active() const noexcept -> bool { return endpoint_ != 0; }
     auto sent() const noexcept -> bool { return committed_; }
+    // Event loops may skip unrelated calls. Synchronous wait/poll remains valid
+    // without first draining the Port, so readiness is an explicit query.
+    auto pending() const noexcept -> bool {
+        if (!active()) return false;
+        const auto due = deadline();
+        return !events_ || (token_ ? readable_.pending() : writable_.pending())
+            || (due && due != UINT64_MAX && rt_admit(due) != STATUS_OK);
+    }
     auto deadline() const noexcept -> word_t { return active() && deadline_ && (!token_ || !drain_) ? deadline_ : UINT64_MAX; }
     auto cancel() noexcept -> status_t {
         disarm(); endpoint_ = 0;
         if (!token_) return STATUS_OK;
         const auto status = sys::channel_cancel(reply_.ends[0].selector(), std::exchange(token_, 0), true).status;
-        return status == STATUS_STALE || status == STATUS_CLOSED ? STATUS_OK : status;
+        if (status != STATUS_OK && status != STATUS_STALE && status != STATUS_CLOSED) return status;
+        const auto armed = readable_ ? readable_.arm().status : STATUS_OK;
+        return armed == STATUS_CLOSED ? STATUS_OK : armed;
     }
     auto close() noexcept -> status_t {
         if (const auto status = cancel(); status != STATUS_OK) return status;
@@ -72,7 +82,7 @@ public:
         if (status == STATUS_OK && !token_) status = send();
         if (status == STATUS_OK) {
             status = ch_recv(reply_.ends[0].selector(), packet, false).status;
-            if (status == STATUS_OK) { endpoint_ = token_ = 0; return STATUS_OK; }
+            if (status == STATUS_OK) { const auto observed = readable_ ? readable_.arm().status : STATUS_OK; endpoint_ = token_ = 0; return observed; }
         }
         if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
             if (token_ && readable_) {

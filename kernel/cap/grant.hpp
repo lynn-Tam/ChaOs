@@ -373,7 +373,7 @@ public:
     [[nodiscard]] auto live_count() const noexcept -> usize;
     [[nodiscard]] auto work_pending() const noexcept -> bool;
     [[nodiscard]] static auto node_usage() noexcept
-        -> resource::Budget;
+        -> resource::Capacity;
 
 private:
     friend class CSpace;

@@ -7,7 +7,7 @@
 #include <atomic>
 #include <uapi/ipc.h>
 #include <sync.hpp>
-#include <sched/sched.hpp>
+#include <time.hpp>
 #include <libk/intrusive_list.hpp>
 #include <optional>
 #include <utility>
@@ -82,7 +82,7 @@ public:
     auto prepare(u64 bits, bool replace = false) noexcept -> Publication;
     template<class Install> auto watch(Watch& watch, Condition condition, Install&& install) noexcept -> status_t;
     auto arm(Watch&, Condition) noexcept -> status_t;
-    template<class Install> auto arm(Watch&, Condition, Install&&) noexcept -> status_t;
+    template<class Install> auto arm(Watch&, Condition, Install&&, WaitResult* observed = nullptr) noexcept -> status_t;
     auto take(u64 mask = ~u64{}) noexcept -> WaitResult;
     auto snapshot() const noexcept -> WaitResult;
     // Pending means the Thread's prepaid record is armed. No borrowed stack
@@ -216,7 +216,7 @@ auto Source::watch(Watch& watch, Condition condition, Install&& install) noexcep
 }
 
 template<class Install>
-auto Source::arm(Watch& watch, Condition condition, Install&& install) noexcept -> status_t {
+auto Source::arm(Watch& watch, Condition condition, Install&& install, WaitResult* observed) noexcept -> status_t {
     Publication publication;
     status_t result = STATUS_OK;
     {
@@ -230,6 +230,7 @@ auto Source::arm(Watch& watch, Condition condition, Install&& install) noexcept 
         if (closed_) { result = STATUS_CLOSED; return; }
         watch.condition_ = condition; watch.armed_ = true;
         watch.armed_at_ = version_;
+        if (observed) *observed = {STATUS_OK, u64(matches(condition)), version_};
         if (matches(condition)) {
             ++publishers_; publication = Publication{*this};
             hint(watch, this->result(condition), publication);

@@ -5,7 +5,7 @@
 #include <libk/memory.hpp>
 #include <utility>
 #include <mm/vspace.hpp>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <sync.hpp>
 #include <libk/scope_guard.hpp>
 #include <type_traits>
@@ -141,7 +141,7 @@ auto CSpace::reserve() noexcept
     }};
     resource::Usage slot_usage{};
     if (allocation_ != nullptr) {
-        auto charged = allocation_->acquire(resource::Budget{.caps = 1});
+        auto charged = allocation_->acquire(resource::Capacity{.caps = 1});
         if (!charged) {
             return std::unexpected(CSpaceError::ResourceExhausted);
         }

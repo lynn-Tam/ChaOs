@@ -1,6 +1,6 @@
 #include <expected>
 #include <optional>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <test/test.hpp>
 
 #include <mm/table.hpp>
@@ -678,7 +678,7 @@ bool test_sponsored_table_capacity_follows_retirement(
         return false;
     }
 
-    constexpr resource::Budget limit{
+    constexpr resource::Capacity limit{
         .memory = 16 * mm::page_size,
     };
     auto pending_pool = vspace_test_groups->create(limit);
@@ -702,7 +702,7 @@ bool test_sponsored_table_capacity_follows_retirement(
     }
     auto space = std::move(pending_space).value().publish();
 
-    const resource::Budget root_baseline{
+    const resource::Capacity root_baseline{
         .memory = limit.memory - fixed.memory
             - mm::page_size,
     };
@@ -771,7 +771,7 @@ bool test_private_creation_refunds_failed_root(const TestContext&) noexcept {
     if (!fixture.initialize(true, 1)) return false;
     const auto fee = cap::Graph::node_usage();
     const auto slot = object::pool<mm::VSpace>::slot_usage();
-    const resource::Budget limit{fee.memory + slot.memory, fee.caps + slot.caps};
+    const resource::Capacity limit{fee.memory + slot.memory, fee.caps + slot.caps};
     auto pending = vspace_test_groups->create(limit);
     if (!pending) return false;
     auto pool = std::move(*pending).publish();

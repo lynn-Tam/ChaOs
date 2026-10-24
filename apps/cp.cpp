@@ -1,3 +1,4 @@
+#include <vector>
 #include <posix.hpp>
 #include <start.hpp>
 #include <unistd.h>
@@ -10,13 +11,13 @@ int main(int argc, char** argv) {
     if (source < 0) return source;
     const int target = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0);
     if (target < 0) { close(source); return target; }
-    char data[4096];
+    std::vector<char> data(io_limit);
     int status = 0;
     for (;;) {
-        const auto count = read(source, data, sizeof(data));
+        const auto count = read(source, data.data(), data.size());
         if (count < 0) { status = count; break; }
         if (count == 0) break;
-        if (write(target, data, count) != count) { status = 1; break; }
+        if (write(target, data.data(), count) != count) { status = 1; break; }
     }
     if (status == 0) status = fsync(target);
     const int target_closed = close(target);

@@ -11,7 +11,7 @@
 #include <libk/types.hpp>
 #include <cpu/cpu.hpp>
 #include <utility>
-#include <sched/sc.hpp>
+#include <sched/sched.hpp>
 #include <sched/dispatcher.hpp>
 #include <sync.hpp>
 #include <wait.hpp>
@@ -29,9 +29,9 @@ Thread::Thread(Env&& roots, UserStart start) noexcept
     libk_assert(env_.user_bound() && arch::prepare_user_frame(frame(), start));
 }
 
-Thread::Thread(Env&& roots, KernelStart step, sched::Domain* quota) noexcept
+Thread::Thread(Env&& roots, KernelStart step) noexcept
     : run_(std::in_place_type<Kernel>, std::nullopt, arch::Ctx{}, step),
-      env_(std::move(roots)), kind_(Kind::Worker), work_domain_(quota) {
+      env_(std::move(roots)), kind_(Kind::Worker) {
     libk_assert(env_.kernel_bound() && step.entry);
 }
 
@@ -120,16 +120,17 @@ void Thread::request_stop() noexcept {
         }
     }
     if (home) home->request_stop(*this);
-    else finish(STATUS_CANCELED);
+    else finish(STATUS_CANCELED, EXIT_STOP);
 }
 
-void Thread::finish(status_t status) noexcept {
+void Thread::finish(status_t status, u32 origin) noexcept {
     {
         sync::Lock guard{lock_};
         libk_assert(state_ == State::Exited && sc_ == nullptr);
         stopping_ = true;
-        exit_status_ = status;
+
     }
+    report({.origin=origin, .kind=0, .status=status, .reserved=0, .pc=0, .address=0});
     if (work_) work_->post(finalizer_);
     else finalize(); // Exclusive construction rollback without a runtime worker.
 }
@@ -151,13 +152,12 @@ auto Thread::finish_control(status_t status) noexcept -> bool {
 
 void Thread::finalize() noexcept {
     bool finish;
-    { sync::Lock guard{lock_}; if (state_ != State::Exited) return; finish = !stopped_; }
+    { sync::Lock guard{lock_}; if (state_ != State::Exited || !exit_.published()) return; finish = !stopped_; }
     if (!finish_control()) { post_finalize(); return; }
     if (finish) {
         auto publishing = roots_.hold();
         static_cast<void>(roots_.close());
         env_.detach_user();
-        static_cast<void>(exit_.claim(exit_status_));
         complete(); state_changed();
     }
     { sync::Lock guard{lock_}; if (!cleanup_) return; }
@@ -172,6 +172,16 @@ void Thread::finalize() noexcept {
     if (done) { if (work_) work_->close(finalizer_); done.complete(); }
 }
 
+void Thread::report(ThreadExit result) noexcept {
+    Source::Publication thread_result, vm_result;
+    sync::Lock guard{lock_};
+    thread_result = exit_.claim(result);
+    if (!thread_result) return;
+    if (auto* vm = env_.vspace(); vm && finalizer_.key().valid()) {
+        auto self = object::ref<>::retain_alive(finalizer_.key());
+        vm_result = vm->fail_exec(self.id().value, result);
+    }
+}
 [[noreturn]] void Thread::start(void* argument) noexcept {
     auto* const thread = static_cast<Thread*>(argument);
     libk_assert(thread != nullptr);
@@ -209,7 +219,7 @@ void Thread::return_user() noexcept {
         current_cpu().dispatcher().resched();
         libk_assert(current_cpu().current == this);
         // A ready publication can win between the test and the block attempt.
-        if (!waiting()) return;
+        if (!waiting()) { env_.root().sync(current_cpu()); return; }
     }
 }
 
@@ -276,9 +286,8 @@ auto Thread::stopped() const noexcept -> bool {
 }
 
 auto Thread::cpu_domain() noexcept -> object::ref<> {
-    if (work_domain_) return object::ref<>::retain_alive(work_domain_->close_work_.key());
     object::ref<sched::Sc> context;
-    { sync::Lock guard{lock_}; context = resource_; }
+    { sync::Lock guard{lock_}; context = sc_ref_; }
     if (!context) return {};
     sync::Lock guard{context->lock_};
     return context->domain_ ? object::ref<>::retain_alive(context->domain_->close_work_.key()) : object::ref<>{};
@@ -327,7 +336,7 @@ auto Thread::migrate(Cpus& cpus, CpuId cpu, u64 epoch) noexcept -> std::expected
     auto* target = cpus.get(cpu);
     if (!target || !target->online()) return std::unexpected(STATUS_BAD_ARGS);
     object::ref<sched::Sc> sc;
-    { sync::Lock guard{lock_}; sc = resource_ ? resource_ : pending_sc_; }
+    { sync::Lock guard{lock_}; sc = sc_ref_ ? sc_ref_ : pending_sc_; }
     if (!sc) return std::unexpected(STATUS_BUSY);
     sched::Dispatcher* previous;
     { sync::Lock resource{sc->lock_};
@@ -385,5 +394,4 @@ void Thread::complete() noexcept {
     home_ = nullptr;
     destination_ = nullptr; transferred_ = false; wait_when_.reset();
     stopped_ = true;
-    if (work_domain_) work_domain_->post_close();
 }

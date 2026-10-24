@@ -35,10 +35,11 @@ class Flush final : private libk::noncopyable_nonmovable {
     bool complete() const noexcept { return !submitted() || done_.complete(); }
     bool acknowledged(CpuId) const noexcept;
     bool executable() const noexcept { return executable_; }
+    void invalidate(va_t address, bool nonleaf = false) noexcept;
     const CpuSet &targets() const noexcept { return targets_; }
     bool adopt(OwnedPage &&page) noexcept { return pages_.attach(std::move(page)); }
     bool adopt(OwnedPage &&page, resource::Usage &&fee) noexcept {
-        if (fee.amount() != resource::Budget{.memory = page_size} || !adopt(std::move(page))) return false;
+        if (fee.amount() != resource::Capacity{.memory = page_size} || !adopt(std::move(page))) return false;
         fee_.merge(std::move(fee));
         return true;
     }
@@ -52,12 +53,16 @@ class Flush final : private libk::noncopyable_nonmovable {
     friend class KSpace;
     friend void drain_tlb(CpuId) noexcept;
     void ack(CpuId) noexcept;
+    void fence(Cpu*) const noexcept;
     resource::Usage fee_{};
     PageGroup pages_{};
     sync::Latch done_;
     Tlb *owner_{};
     CpuSet targets_{}, pending_{};
-    bool executable_{};
+    bool executable_{}, global_{};
+    u64 version_{};
+    usize begin_{~usize{}}, end_{};
+    bool full_{};
     Flush *next_{};
     Flush **link_{};
 };
@@ -75,6 +80,7 @@ class Tlb final : private libk::noncopyable_nonmovable {
         const CpuSet &targets() const noexcept { return owner_->active_; }
         bool commit(Flush &, Cpus *, CpuId local, bool executable = false, bool global = false) noexcept;
         void publish_local() noexcept;
+        void publish_leaf(va_t, bool nonleaf, bool executable) noexcept;
         void abort() noexcept {
             if (owner_) {
                 lock_.restore();
@@ -94,6 +100,7 @@ class Tlb final : private libk::noncopyable_nonmovable {
     void leave(CpuId) noexcept;
     Edit begin() noexcept { return Edit{*this}; }
     CpuSet active_cpus() const noexcept;
+    void fence_local() const noexcept;
 
   private:
     friend class Edit;
@@ -115,6 +122,7 @@ class Root final {
     usize root() const noexcept { return root_; }
     void activate(Cpu &) const noexcept;
     void adopt(Cpu &) const noexcept;
+    void sync(Cpu &) const noexcept;
 
   private:
     Tlb *state_{};

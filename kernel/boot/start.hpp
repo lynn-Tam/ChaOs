@@ -9,8 +9,8 @@
 #include <ipc/notification.hpp>
 #include <ipc/port.hpp>
 #include <mm/pager.hpp>
-#include <object/scope.hpp>
-#include <sched/sc.hpp>
+#include <object/pool.hpp>
+#include <sched/sched.hpp>
 
 // Cold ownership only. Runtime code borrows the concrete entities it needs;
 // none of these resources are destroyed while CPUs can still execute.
@@ -38,4 +38,4 @@ enum class BootErr : u8 {
     InvalidState, MappingFailed, CapabilityFailed, SchedulingFailed,
 };
 auto boot_root(Boot&, Cpu&, const BootInfo&, mm::BootPages&&, mm::BootPages&&) noexcept
-    -> std::expected<void, BootErr>;
+    -> std::expected<object::ref<Thread>, BootErr>;

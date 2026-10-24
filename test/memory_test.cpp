@@ -8,7 +8,7 @@
 #include <utility>
 #include <mm/mem.hpp>
 #include <mm/pager.hpp>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <mm/vspace.hpp>
 #include <boot/info.hpp>
 

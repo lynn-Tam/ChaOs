@@ -1,6 +1,6 @@
 #include <mm/slab.hpp>
 #include <ipc/port.hpp>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <libk/checked_arithmetic.hpp>
 
 namespace ipc {
@@ -123,7 +123,7 @@ auto Port::watch(cap::Resolved<Port>& port, const cap::GrantPin& grant, Source& 
     return id;
 }
 
-auto Port::arm(u64 id, u64 seen) noexcept -> status_t {
+auto Port::arm(u64 id, u64 seen) noexcept -> WaitResult {
     std::expected<cap::GrantPin, cap::GrantError> grant = std::unexpected(cap::GrantError::InvalidState);
     Watch* watch;
     Source* source;
@@ -134,8 +134,8 @@ auto Port::arm(u64 id, u64 seen) noexcept -> status_t {
     {
         sync::Lock guard{lock_};
         watch = find(id);
-        if (!watch) return STATUS_STALE;
-        if (watch->state != Watch::State::Live) return STATUS_CLOSED;
+        if (!watch) return {STATUS_STALE};
+        if (watch->state != Watch::State::Live) return {STATUS_CLOSED};
         grant = watch->attachment.acquire();
         source = watch->source.source();
         pin = source->retain();
@@ -143,8 +143,9 @@ auto Port::arm(u64 id, u64 seen) noexcept -> status_t {
         bound = watch->bound;
         condition.seen = seen;
     }
-    if (!grant) return STATUS_CLOSED;
-    return source->arm(watch->source, condition, [&](auto&& commit) noexcept {
+    if (!grant) return {STATUS_CLOSED};
+    WaitResult observed;
+    const auto status = source->arm(watch->source, condition, [&](auto&& commit) noexcept {
         std::optional<sync::Lock<sync::Spin>> structure;
         if (bound.scope) {
             structure.emplace(object::Control::lock);
@@ -153,7 +154,8 @@ auto Port::arm(u64 id, u64 seen) noexcept -> status_t {
         sync::Lock guard{lock_};
         if (closing_ || watch->event.watch_gen != id || watch->state != Watch::State::Live) return STATUS_STALE;
         commit(); return STATUS_OK;
-    });
+    }, &observed);
+    return status == STATUS_OK ? observed : WaitResult{status};
 }
 
 auto Port::emit(Watch& watch, WaitResult result) noexcept -> bool {
@@ -179,7 +181,7 @@ auto Port::emit(Watch& watch, WaitResult result) noexcept -> bool {
         changed(); watch.pending = version_;
         if (!watch.queue.is_linked()) {
             if (queue_.size() < config_.queue) queue_.push_back(watch);
-            else overflow_ = true;
+            else { overflow_ = true; lost_ = version_; }
         }
         publication = update();
     }
@@ -269,12 +271,13 @@ auto Port::take(PortEvent& event) noexcept -> status_t {
     }
     return STATUS_OK;
 }
-auto Port::records(u64 epoch, u64 last, PortRecords& result) const noexcept -> status_t {
+auto Port::records(u64 epoch, u64 last, u64 limit, PortRecords& result) const noexcept -> status_t {
     sync::Lock guard{lock_};
-    if (version_ == UINT64_MAX || (epoch && epoch != version_)) return STATUS_STALE;
-    result = {.version = 1, .size = sizeof(PortRecords), .epoch = version_, .next = last, .count = 0, .more = 0, .events = {}};
-    auto* watch = last == UINT64_MAX ? nullptr : index_.lower_bound(last + 1);
-    for (usize step = 0; watch && step < PORT_RECORDS; ++step) {
+    if (version_ == UINT64_MAX || epoch > version_) return STATUS_STALE;
+    if (!epoch) { epoch = version_; const auto* end = index_.maximum(); limit = end ? end->event.watch_gen : 0; }
+    result = {.version = 2, .size = sizeof(PortRecords), .epoch = epoch, .next = last, .limit = limit, .count = 0, .more = 0, .events = {}};
+    auto* watch = last < limit ? index_.lower_bound(last + 1) : nullptr;
+    for (usize step = 0; watch && watch->event.watch_gen <= limit && step < PORT_RECORDS; ++step) {
         result.next = watch->event.watch_gen;
         if (watch->state != Watch::State::Prepared) {
             auto event = watch->event;
@@ -283,16 +286,16 @@ auto Port::records(u64 epoch, u64 last, PortRecords& result) const noexcept -> s
         }
         watch = index_.next(*watch);
     }
-    result.more = watch != nullptr;
+    result.more = watch && watch->event.watch_gen <= limit;
     return STATUS_OK;
 }
 auto Port::resync(u64 epoch) noexcept -> status_t {
     Source::Publication publication;
     {
         sync::Lock guard{lock_};
-        if (version_ == UINT64_MAX || epoch != version_) return STATUS_STALE;
-        overflow_ = false;
-        acknowledged_ = epoch;
+        if (!epoch || version_ == UINT64_MAX || epoch > version_) return STATUS_STALE;
+        acknowledged_ = std::max(acknowledged_, epoch);
+        overflow_ = lost_ > acknowledged_;
         changed();
         publication = update();
     }

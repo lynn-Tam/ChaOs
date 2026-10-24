@@ -3,7 +3,7 @@
 #include <mm/mem.hpp>
 #include <object/ref.hpp>
 #include <syscall/call.hpp>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <cpu/cpu.hpp>
 #include <libk/checked_arithmetic.hpp>
 #include <limits>
@@ -22,7 +22,7 @@
 #include <mm/vspace.hpp>
 #include <variant>
 #include <sched/dispatcher.hpp>
-#include <sched/sc.hpp>
+#include <sched/sched.hpp>
 
 namespace syscall {
 
@@ -692,13 +692,13 @@ template<usize op>
     if (!quota) return returned(cap_status(quota.error()));
     const auto view = quota->view();
     const auto& limit = std::get<cap::QuotaLimit>(view.data);
-    const resource::Budget target{inv.trap.arg(1), inv.trap.arg(2)};
+    const resource::Capacity target{inv.trap.arg(1), inv.trap.arg(2)};
     if (!limit.budget.contains(target)) return returned(STATUS_DENIED);
     auto self = quota->reference();
     if (!self) return returned(STATUS_BUSY);
     std::optional<cap::Resolved<resource::Quota>> source;
     object::ref<> source_ref;
-    resource::Budget ceiling;
+    resource::Capacity ceiling;
     std::array<const cap::GrantPin*, 2> grants{&quota->pin(), nullptr};
     if (inv.trap.arg(3)) {
         auto resolved = inv.cspace.resolve<resource::Quota>(handle_of(inv.trap.arg(3)), cap::Rights::of(cap::Right::Split));
@@ -907,6 +907,20 @@ auto pg_call(Call& inv) noexcept -> Result {
         return pg_supply(inv);
     }
     return irq_call<op>(inv);
+}
+
+template<usize op>
+auto vm_exec(Call& inv) noexcept -> Result {
+    auto vm = inv.cspace.resolve<mm::VSpace>(handle_of(inv.trap.arg(0)), cap::Rights::of(
+        op == SYS_VSPACE_STOP ? cap::Right::Control : cap::Right::Observe));
+    if (!vm) return returned(cap_status(vm.error()));
+    const auto view = vm->view();
+    const auto* limit = std::get_if<cap::VmLimit>(&view.data);
+    if (!limit || !vm->object().can_destroy_object(*limit)) return returned(STATUS_DENIED);
+    if constexpr (op == SYS_VSPACE_STOP) { vm->object().stop_exec(); return returned(STATUS_OK); }
+    const auto info = vm->object().exec_info();
+    auto* ipc = inv.target->ipc_buffer();
+    return returned(ipc && ipc->write(inv.trap.arg(1), std::span{reinterpret_cast<const byte*>(&info), sizeof(info)}) ? STATUS_OK : STATUS_BAD_ARGS);
 }
 
 template<usize op>

@@ -410,7 +410,7 @@ inline void yield() noexcept {
     return call(SYS_PORT_TAKE, port, offset);
 }
 [[nodiscard]] inline auto port_records(cap_t port, word_t offset = 0, word_t epoch = 0,
-    word_t last = 0) noexcept -> SysResult { return call(SYS_PORT_RECORDS, port, offset, epoch, last); }
+    word_t last = 0, word_t limit = 0) noexcept -> SysResult { return call(SYS_PORT_RECORDS, port, offset, epoch, last, limit); }
 [[nodiscard]] inline auto port_resync(cap_t port, word_t epoch) noexcept -> SysResult {
     return call(SYS_PORT_RESYNC, port, epoch);
 }
@@ -435,6 +435,12 @@ inline void yield() noexcept {
 
 [[nodiscard]] inline auto channel_call(cap_t endpoint, cap_t reply) noexcept -> SysResult {
     return call(SYS_CHANNEL_CALL, endpoint, reply);
+}
+[[nodiscard]] inline auto vspace_stop(cap_t vm) noexcept -> SysResult { return call(SYS_VSPACE_STOP, vm); }
+[[nodiscard]] inline auto vspace_exit(cap_t vm, word_t offset = 0) noexcept -> SysResult { return call(SYS_VSPACE_EXIT, vm, offset); }
+
+[[nodiscard]] inline auto channel_drop(cap_t receiver, word_t sequence) noexcept -> SysResult {
+    return call(SYS_CHANNEL_DROP, receiver, sequence);
 }
 [[nodiscard]] inline auto channel_cancel(cap_t receiver, word_t token, bool discard = false) noexcept -> SysResult {
     return call(SYS_CHANNEL_CANCEL, receiver, token, discard ? CHANNEL_DISCARD : 0);

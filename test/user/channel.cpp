@@ -119,6 +119,13 @@ static void replies(const rt_env& env) {
     expect(send(sender.selector(), 3, false, {}, response.ends[1].selector()).status);
     auto abandoned = receive(); expect(abandoned.close());
     check(ch_recv(response.ends[0].selector(), packet, false).status == STATUS_PEER_FAULT);
+    expect(send(sender.selector(), 4, false, {&business, 1}, response.ends[1].selector()).status);
+    const auto rejected = ch_recv(request.ends[1].selector(), packet, false, 0);
+    check(rejected.status == STATUS_NO_MEMORY && rejected.value == 2 && rejected.value2);
+    check(sys::channel_drop(request.ends[1].selector(), rejected.value2 + 1).status == STATUS_STALE);
+    expect(sys::channel_drop(request.ends[1].selector(), rejected.value2).status);
+    check(ch_recv(response.ends[0].selector(), packet, false).status == STATUS_PEER_FAULT);
+    check(ch_recv(request.ends[1].selector(), packet, false).status == STATUS_WOULD_BLOCK);
     expect(sys::object_destroy(event.selector()).status);
 }
 static void reassign_memory(const rt_env& env) {
@@ -295,7 +302,7 @@ static void port_events(const rt_env& env) {
     check((records.events[0].flags & PORT_EVENT_PENDING) && (records.events[1].flags & PORT_EVENT_PENDING));
     expect(sys::port_take(port.selector()).status);
     check(reinterpret_cast<const PortEvent*>(rt_current().ipc)->key == 11 || reinterpret_cast<const PortEvent*>(rt_current().ipc)->key == 22);
-    check(sys::port_resync(port.selector(), records.epoch).status == STATUS_STALE);
+    expect(sys::port_resync(port.selector(), records.epoch).status);
     expect(sys::port_records(port.selector()).status);
     records = *reinterpret_cast<const PortRecords*>(rt_current().ipc);
     expect(sys::port_resync(port.selector(), records.epoch).status);
@@ -372,7 +379,7 @@ int main(int argc, char** argv) {
     for (size_t count = 0; count < children.size() * 512; ++count) {
         ch_packet packet;
         for (;;) {
-            const auto status = input.receive(packet);
+            const auto status = input.receive(packet).status;
             if (status == STATUS_OK) break;
             check(status == STATUS_WOULD_BLOCK);
             const auto received = environment.poll();

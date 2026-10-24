@@ -1,3 +1,5 @@
+#include <io.hpp>
+#include <vector>
 #include <ubus/ubus.hpp>
 #include <libk/fmt.hpp>
 #include <source_location>
@@ -50,7 +52,142 @@ static auto running(ubus_conn& owner, std::string_view name, uint64_t previous =
         }
     }
 }
-int main() {
+static int backend() {
+    ubus_conn parent; check(parent.bind(rt_startup().environment) == STATUS_OK);
+    ubus_msg setup; check(parent.invoke("Receive", {}, setup) == STATUS_OK);
+    const auto payload = setup.data["message"];
+    const auto pause = [&] {
+        check(sys::notification_signal(setup.capability(payload["ready"])).status == STATUS_OK);
+        check(sys::wait_one(setup.capability(payload["release"]), SOURCE_READY).status == STATUS_OK);
+    };
+    uint64_t listed{}, synced{};
+    ubus_object files{"io.files"};
+    check(files.add("List", {{"path", ubus_type::String}}, {{"epoch", ubus_type::U64}, {"items", ubus_type::Array}},
+        [&](auto&, auto& r) { ++listed; r.data.put("epoch", uint64_t{1}).put("items", ubus_data{ubus_type::Array}); return STATUS_OK; }) == STATUS_OK);
+    check(files.add("Sync", {}, {}, [&](auto&, auto&) { ++synced; return STATUS_OK; }) == STATUS_OK);
+    check(files.add("Stats", {}, {{"listed", ubus_type::U64}, {"synced", ubus_type::U64}},
+        [&](auto&, auto& r) { r.data.put("listed", listed).put("synced", synced); return STATUS_OK; }) == STATUS_OK);
+    check(files.open() == STATUS_OK);
+    if (!payload["bound"].as<bool>().value_or(false)) pause();
+    auto connector = files.connector(); check(bool(connector));
+    ubus_msg q, r; const auto cap = q.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE); check(bool(cap));
+    q.data.put("name", "files").cap("connector", *cap).put("interface", "io.files").put("version", uint64_t{1});
+    check(parent.invoke("Publish", std::move(q), r) == STATUS_OK);
+    if (payload["bound"].as<bool>().value_or(false)) pause();
+    for (;;) {
+        const auto status = files.poll(); check(status == STATUS_OK || status == STATUS_WOULD_BLOCK);
+        if (status == STATUS_WOULD_BLOCK) check(ev_wait(rt_events()).status == STATUS_OK);
+    }
+}
+static void vfs(ubus_conn& owner) {
+    std::array<cap_owner, 2> ready, release;
+    const auto get = [&](std::string_view name, ubus_conn& connection) {
+        ubus_msg q, r; q.deadline = *rt_after_ms(3000); q.data.put("name", name);
+        check(owner.invoke("Get", std::move(q), r) == STATUS_OK);
+        check(connection.bind(r.capability(r.data["connector"]), "io.files", 1, 1) == STATUS_OK);
+    };
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto a = sys::notification_create(rt_startup().alloc(), 1), b = sys::notification_create(rt_startup().alloc(), 1);
+        check(a.status == STATUS_OK && b.status == STATUS_OK); ready[i] = cap_owner{a.value}; release[i] = cap_owner{b.value};
+        ubus_msg q, r; ubus_data args{ubus_type::Array}, exports{ubus_type::Array}, setup, resources;
+        args.push("backend"); exports.push("files"); resources.put("bytes", uint64_t{1024 * 1024}).put("caps", uint64_t{128});
+        const auto signal = q.attach(ready[i].selector(), RIGHT_SIGNAL | RIGHT_DUPLICATE);
+        const auto gate = q.attach(release[i].selector(), RIGHT_RECEIVE | RIGHT_DUPLICATE); check(signal && gate);
+        setup.cap("ready", *signal).cap("release", *gate).put("bound", bool(i));
+        q.data.put("name", i ? "vfs-bind" : "vfs-get").put("program", "/boot/control-test.elf").put("argv", args)
+            .put("exports", exports).put("setup", setup).put("resources", resources).put("start", true);
+        check(owner.invoke("Configure", std::move(q), r) == STATUS_OK);
+        check(sys::wait_one(ready[i].selector(), SOURCE_READY, 0, *rt_after_ms(3000)).status == STATUS_OK);
+    }
+    ubus_msg q, r; ubus_data routes, local, mounts{ubus_type::Array}, setup, exports{ubus_type::Array}, resources;
+    local.put("local", true); routes.put("*", local); exports.push("*");
+    for (const auto& [path, service, ro] : std::array{std::tuple{"/boot", "boot/files", true},
+        std::tuple{"/get", "vfs-get/files", false}, std::tuple{"/bind", "vfs-bind/files", false}}) {
+        ubus_data mount; mount.put("path", path).put("service", service).put("read_only", ro); mounts.push(mount);
+    }
+    setup.put("mounts", mounts); resources.put("bytes", uint64_t{2 * 1024 * 1024}).put("caps", uint64_t{128});
+    q.data.put("name", "vfs-probe").put("program", "/boot/vfs.elf").put("routes", routes).put("exports", exports)
+        .put("setup", setup).put("resources", resources).put("start", true);
+    check(owner.invoke("Configure", std::move(q), r) == STATUS_OK);
+    ubus_conn files, admin; get("vfs-probe/files", files); get("vfs-probe/admin", admin);
+    std::array<ubus_call, 2> slow;
+    for (unsigned i = 0; i < 2; ++i) {
+        ubus_msg request; request.tag = *files.token("List"); request.deadline = *rt_after_ms(3000);
+        request.data.put("path", i ? "/bind" : "/get"); check(slow[i].begin(files.endpoint(), std::move(request)) == STATUS_OK);
+    }
+    q = {}; q.data.put("path", "/boot"); q.deadline = *rt_after_ms(3000);
+    check(files.invoke("List", std::move(q), r) == STATUS_OK && r.data["items"].type() == ubus_type::Array);
+    q = {}; q.data.put("path", "/get");
+    check(admin.invoke("Unmount", std::move(q), r) == STATUS_OK);
+    for (auto& gate : release) check(sys::notification_signal(gate.selector()).status == STATUS_OK);
+    for (auto& call : slow) check(call.wait(r) == STATUS_OK && r.status == STATUS_STALE);
+    q = {}; q.data.put("path", "/get").put("service", "vfs-get/files").put("read_only", false);
+    check(admin.invoke("Mount", std::move(q), r) == STATUS_OK);
+    check(files.invoke("Sync", {}, r) == STATUS_OK);
+    for (const auto name : {"vfs-get", "vfs-bind"}) {
+        ubus_conn connection; get(std::string{name} + "/files", connection);
+        check(connection.invoke("Stats", {}, r) == STATUS_OK);
+        check(r.data["listed"].as<uint64_t>() == 1 && r.data["synced"].as<uint64_t>() == 1);
+    }
+    for (const auto name : {"vfs-probe", "vfs-get", "vfs-bind"}) {
+        const auto row = find(owner, name); q = {}; q.data.put("child_id", row["child_id"]).put("run_id", row["run_id"])
+            .put("version", row["config"]).put("action", "remove");
+        check(owner.invoke("Action", std::move(q), r) == STATUS_OK);
+    }
+    for (auto& cap : ready) check(sys::object_destroy(cap.selector()).status == STATUS_OK);
+    for (auto& cap : release) check(sys::object_destroy(cap.selector()).status == STATUS_OK);
+    constexpr std::string_view marker{"[vfs] delayed Get/Bind, independent mount progress, pinned targets and Sync fanout ok\n"};
+    ct_output{}.write(marker.data(), marker.size());
+}
+static void devices(ubus_conn& owner) {
+    ubus_msg query, reply; query.data.put("name", "devices");
+    check(owner.invoke("Lookup", std::move(query), reply) == STATUS_OK);
+    ubus_conn device_owner; check(device_owner.bind(reply.capability(reply.data["connector"])) == STATUS_OK);
+    query = {}; query.data.put("facet", "children");
+    check(device_owner.invoke("Inspect", std::move(query), reply) == STATUS_OK);
+    ubus_conn drivers; check(drivers.bind(reply.capability(reply.data["connector"])) == STATUS_OK);
+    const auto memory = sys::memory_create(rt_startup().alloc(), io_limit + 4096, VM_READ | VM_WRITE);
+    check(memory.status == STATUS_OK); cap_owner buffer{memory.value};
+    std::vector<std::byte> bytes(io_limit);
+    const auto transfer = [&](std::string_view name, std::byte pattern, bool write) {
+        ubus_msg request, response; request.deadline = *rt_after_ms(3000); request.data.put("name", std::string{name} + "/block");
+        check(drivers.invoke("Get", std::move(request), response) == STATUS_OK);
+        ubus_conn block; check(block.bind(response.capability(response.data["connector"]), "io.block", 1, 1) == STATUS_OK);
+        check(block.invoke("Open", {}, response) == STATUS_OK);
+        ubus_conn session; check(session.adopt(response.take(response.data["handle"])) == STATUS_OK);
+        check(session.invoke("Stat", {}, response) == STATUS_OK);
+        check(response.data["limit"].as<uint64_t>() == io_limit);
+        auto id = *response.data["sequence"].as<uint64_t>();
+        const auto command = [&](std::string_view method) {
+            ubus_msg q, r; q.data.put("id", ++id);
+            if (method != "Flush") {
+                const auto cap = q.attach(buffer.selector(), RIGHT_MAP | RIGHT_DUPLICATE); check(bool(cap));
+                q.data.put("offset", uint64_t{0}).put("buffer", ubus_buffer{*cap, 4093, io_limit});
+            }
+            check(session.invoke(method, std::move(q), r) == STATUS_OK);
+            check(r.data["bytes"].as<uint64_t>() == (method == "Flush" ? 0 : io_limit));
+        };
+        if (write) {
+            std::ranges::fill(bytes, pattern); check(mem_write(buffer.selector(), 4093, bytes) == STATUS_OK);
+            command("Write"); command("Flush");
+        }
+        std::ranges::fill(bytes, std::byte{}); check(mem_write(buffer.selector(), 4093, bytes) == STATUS_OK);
+        command("Read"); check(mem_read(buffer.selector(), 4093, bytes) == STATUS_OK);
+        check(std::ranges::all_of(bytes, [&](auto byte) { return byte == pattern; }));
+        check(session.invoke("Close", {}, response) == STATUS_OK);
+    };
+    transfer("block-8", std::byte{0xa5}, true); transfer("block-10", std::byte{0x5a}, true);
+    const auto second = find(drivers, "block-10");
+    check(action(drivers, second.view(), "stop") == STATUS_OK); stopped(drivers, "block-10");
+    transfer("block-8", std::byte{0xa5}, false);
+    check(action(drivers, second.view(), "start") == STATUS_OK); (void)running(drivers, "block-10", *second["run_id"].as<uint64_t>());
+    transfer("block-10", std::byte{0x5a}, false);
+    check(sys::object_destroy(buffer.selector()).status == STATUS_OK);
+    constexpr std::string_view marker{"[devices] independent DMA, cross-page 64KiB I/O and driver retirement ok\n"};
+    ct_output{}.write(marker.data(), marker.size());
+}
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view{argv[1]} == "backend") return backend();
     const auto& env = rt_startup();
     ubus_conn bus, owner;
     check(bus.bind(env.environment) == STATUS_OK);
@@ -58,6 +195,8 @@ int main() {
     output_cap = initial.capability(initial.data["message"]["stdout"]);
     const auto control = initial.capability(initial.data["message"]["control"]);
     check(owner.bind(control) == STATUS_OK);
+    if (argc == 2 && std::string_view{argv[1]} == "devices") { devices(owner); return 0; }
+    if (argc == 2 && std::string_view{argv[1]} == "vfs") { vfs(owner); return 0; }
     ubus_conn readonly, creator;
     check(readonly.bind(initial.capability(initial.data["message"]["observe"])) == STATUS_OK);
     check(creator.bind(initial.capability(initial.data["message"]["create"])) == STATUS_OK);
@@ -112,8 +251,14 @@ int main() {
     }
     hidden = {}; hidden.data.put("rights", uint64_t{9});
     check(readonly.invoke("Delegate", std::move(hidden), denied) == STATUS_DENIED);
+    // Scope churn can invalidate a sample; a published sample pairs each
+    // execution Thread ID with its runtime, including runtime-owned threads.
     const auto cpu = shell["cpu"].vector<uint64_t>();
-    check(cpu && cpu->size() == 2 && (*cpu)[0] != 0);
+    check(bool(cpu) == shell["sampled"].as<uint64_t>().has_value());
+    if (cpu) {
+        check(cpu->size() % 2 == 0);
+        for (size_t i = 0; i < cpu->size(); i += 2) check((*cpu)[i] != 0);
+    }
 
     check(shell["runtime"].as<uint64_t>().has_value());
     check(shell["committed"].as<uint64_t>().value_or(0) > 0);

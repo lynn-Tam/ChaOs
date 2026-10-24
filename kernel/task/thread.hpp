@@ -35,20 +35,21 @@ class Thread final : private libk::noncopyable_nonmovable {
   public:
     class Exit final : private libk::noncopyable_nonmovable {
         mutable sync::Spin lock_;
-        std::optional<status_t> status_;
+        std::optional<ThreadExit> result_;
         Src<SOURCE_READY> events_;
     public:
         explicit Exit(Source::Drained drained = {}) noexcept : events_(drained) {}
-        auto read() const noexcept -> std::optional<status_t> { sync::Lock guard{lock_}; return status_; }
+        auto read() const noexcept -> std::optional<status_t> { sync::Lock guard{lock_}; return result_ ? std::optional{result_->status} : std::nullopt; }
         auto published() const noexcept -> bool { return read().has_value(); }
         auto events() noexcept -> Source& { return events_; }
+        auto claim(ThreadExit result) noexcept -> Source::Publication {
+            sync::Lock guard{lock_};
+            if (result_) return {};
+            result_ = result;
+            return events_.prepare(SOURCE_READY, true);
+        }
         auto claim(status_t status) noexcept -> bool {
-            Source::Publication publication;
-            { sync::Lock guard{lock_};
-              if (status_) return false;
-              status_ = status; publication = events_.prepare(SOURCE_READY, true);
-            }
-            return true;
+            return bool(claim(ThreadExit{.origin=EXIT_NORMAL, .kind=0, .status=status, .reserved=0, .pc=0, .address=0}));
         }
     };
     enum class State : u8 { Prepared, Ready, Running, Throttled, Blocked, Exited };
@@ -71,7 +72,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     Thread(mm::Stack&& home_stack, Env&& roots, KernelStart start,
            Kind kind = Kind::Normal) noexcept;
     Thread(Env&& roots, UserStart start) noexcept;
-    Thread(Env&& roots, KernelStart step, sched::Domain* quota = nullptr) noexcept;
+    Thread(Env&& roots, KernelStart step) noexcept;
     ~Thread() noexcept;
 
     [[nodiscard]] auto state() const noexcept -> State { sync::Lock guard{lock_}; return state_; }
@@ -85,6 +86,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     auto transient() const noexcept -> bool { return user() || kind_ == Kind::Worker; }
     auto user() const noexcept -> bool { return std::holds_alternative<arch::TrapFrame>(run_); }
     auto frame() noexcept -> arch::TrapFrame& { return std::get<arch::TrapFrame>(run_); }
+    void report(ThreadExit) noexcept;
     void return_user() noexcept;
     [[nodiscard]] auto exit() noexcept -> Exit& { return exit_; }
     [[nodiscard]] auto exit() const noexcept -> const Exit& { return exit_; }
@@ -145,7 +147,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     void block() noexcept;
     void stop() noexcept;
     void retire(object::cleanup&&) noexcept;
-    void bind_work(WorkQueue& work, object::Key owner) noexcept { work_ = &work; finalizer_.bind(owner); roots_.bind(owner); interest_.bind(owner); events_.bind_work(work, owner); exit_.events().bind_work(work, owner); }
+    void bind_work(WorkQueue& work, object::Key owner) noexcept { work_ = &work; finalizer_.bind(owner); roots_.bind(owner); interest_.bind(owner); events_.bind_work(work, owner); exit_.events().bind_work(work, owner); if (!env_.bind_exec(exec_, owner, Source::Action::bind<&Thread::stop>(*this))) stop(); }
 
   private:
     friend class Wait;
@@ -157,11 +159,11 @@ class Thread final : private libk::noncopyable_nonmovable {
 
     [[noreturn]] static void start(void* argument) noexcept;
     void request_stop() noexcept;
-    void finish(status_t status) noexcept;
+    void finish(status_t status, u32 origin = EXIT_NORMAL) noexcept;
     void finalize() noexcept;
     WorkQueue* work_{};
     Work finalizer_{Work::Fn::bind<&Thread::finalize>(*this)};
-    status_t exit_status_{};
+    mm::Exec exec_;
 
     void post_finalize() noexcept { if (work_) work_->post(finalizer_); else finalize(); }
     void sources_drained() noexcept { post_finalize(); }
@@ -195,7 +197,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     Env env_;
     State state_{State::Prepared};
     sched::Sc* sc_{};
-    object::ref<sched::Sc> resource_{}, pending_sc_{};
+    object::ref<sched::Sc> sc_ref_{}, pending_sc_{};
     bool detach_sc_{};
     std::atomic<sched::Dispatcher*> home_{};
     sched::Dispatcher* destination_{};
@@ -226,7 +228,6 @@ class Thread final : private libk::noncopyable_nonmovable {
     object::cleanup cleanup_{};
     Exit exit_{Source::Drained::bind<&Thread::sources_drained>(*this)};
     Kind kind_{Kind::Normal};
-    sched::Domain* work_domain_{};
     Wait wait_{};
     bool in_kernel_{}, return_wait_{};
     u64 user_syscalls_{};

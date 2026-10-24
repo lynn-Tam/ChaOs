@@ -1,3 +1,4 @@
+#include <libk/path.hpp>
 #include <vm.hpp>
 #include <util.hpp>
 #include <string_view>
@@ -11,24 +12,15 @@
 #include <expected>
 #include <memory>
 #include <new>
+#include <deque>
+#include <vector>
 
-static auto st_path(std::string_view path, std::string_view base = "/") -> std::string {
-    std::string result = path.starts_with('/') ? std::string{path} : std::string{base} + "/" + std::string{path};
-    size_t size{}, cursor{};
-    while (cursor < result.size()) {
-        const auto begin = cursor; while (cursor < result.size() && result[cursor] != '/') ++cursor;
-        const std::string_view part{result.data() + begin, cursor - begin};
-        if (part == "..") { while (size && result[size - 1] != '/') --size; if (size) --size; }
-        else if (!part.empty() && part != ".") { if (size) result[size++] = '/'; ::memmove(result.data() + size, part.data(), part.size()); size += part.size(); }
-        ++cursor;
-    }
-    result.resize(size); result.insert(0, "/"); return result;
-}
 
 static ubus_object directory{"io.files"};
 static uint64_t epoch{1};
 static st_device backend;
 static st_vol volume;
+static std::array<uint8_t, io_limit> scratch;
 static cap_t events;
 static CreateAuth store_memory;
 static cap_desc descriptor;
@@ -62,10 +54,7 @@ static auto writeback(inode& node) noexcept -> status_t {
     if (node.state.flags & LFS_F_ERRED)
         return STATUS_BACKING_FAILED;
     if (node.state.flags & (LFS_F_DIRTY | LFS_F_WRITING)) ++epoch;
-    const auto status = volume.error(lfs_file_sync(volume.fs(), &node.state));
-    if (volume.failed())
-        sys::exit(status);
-    return status;
+    return volume.error(lfs_file_sync(volume.fs(), &node.state));
 }
 
 static void reap() noexcept {
@@ -111,15 +100,15 @@ static auto find(const entry& entry) -> inode* {
 [[nodiscard]] static auto open_file(inode& file, const char* path, uint64_t flags) noexcept -> status_t {
     file.config = {};
     file.config.buffer = file.cache;
-    const bool write = (flags & st_write) != 0;
-    int mode = (flags & (st_read | st_write)) == (st_read | st_write) ? LFS_O_RDWR
+    const bool write = (flags & io_write) != 0;
+    int mode = (flags & (io_read | io_write)) == (io_read | io_write) ? LFS_O_RDWR
                : write                                                ? LFS_O_WRONLY
                                                                       : LFS_O_RDONLY;
-    if (flags & st_create)
+    if (flags & io_create)
         mode |= LFS_O_CREAT;
-    if (flags & st_truncate)
+    if (flags & io_truncate)
         mode |= LFS_O_TRUNC;
-    if (flags & st_exclusive)
+    if (flags & io_exclusive)
         mode |= LFS_O_EXCL;
     const int result = lfs_file_opencfg(volume.fs(), &file.state, path, mode, &file.config);
     if (result < 0)
@@ -166,12 +155,14 @@ struct st_open final {
     vm_ptr<st_open> next;
     inode* file{};
     ubus_object object;
-    ubus_queue<st_cmd, st_depth> queue;
-    std::optional<ubus_request> closing;
-    bool stopped{}, failed{};
+    ubus_queue<st_cmd, io_depth + 1> queue; // One control credit beyond the negotiated data depth.
+    bool stopped{}, failed{}, closing{};
     void abort() { stopped = failed = true; queue.stop(); }
     auto finish(ubus_ticket ticket, status_t status, uint64_t count) -> bool {
-        ubus_msg response; response.status = status; response.data.put("bytes", count);
+        ubus_msg response; response.status = status;
+        const auto kind = queue.request(ticket)->operation;
+        if (kind == st_op::Read || kind == st_op::Write) response.data.put("bytes", count);
+        else if (kind == st_op::Stat) response.data.put("size", count).put("sequence", queue.sequence()).put("limit", uint64_t{io_limit}).put("depth", uint64_t{io_depth});
         return queue.finish(ticket, std::move(response));
     }
     uint64_t offset{};
@@ -183,8 +174,8 @@ struct st_open final {
     ~st_open() { if (file) --file->users; }
 
     [[nodiscard]] auto create(uint64_t flags, const char* path, ubus_msg& reply, cap_t budget) -> status_t {
-        readable = flags & st_read; writable = flags & st_write; append = flags & st_append;
-        status_t status = object.open(st_depth, budget);
+        readable = flags & io_read; writable = flags & io_write; append = flags & io_append;
+        status_t status = object.open(io_depth, budget);
         if (status == STATUS_OK) {
             const auto entry = lookup(path);
             if (!entry && entry.error() != LFS_ERR_NOENT)
@@ -193,9 +184,9 @@ struct st_open final {
                 file = find(*entry);
             if (file) {
                 ++file->users;
-                if ((flags & st_exclusive) && (flags & st_create))
-                    status = st_exists;
-                else if (flags & st_truncate) {
+                if ((flags & io_exclusive) && (flags & io_create))
+                    status = io_exists;
+                else if (flags & io_truncate) {
                     const auto result = lfs_file_truncate(volume.fs(), &file->state, 0);
                     status = volume.error(result);
                 }
@@ -203,7 +194,7 @@ struct st_open final {
                 auto node = std::unique_ptr<inode>{new (std::nothrow) inode};
                 if (!node)
                     return STATUS_NO_MEMORY;
-                const auto mode = (flags & ~(st_read | st_write)) | st_read | st_write;
+                const auto mode = (flags & ~(io_read | io_write)) | io_read | io_write;
                 status = open_file(*node, path, mode);
                 if (status == STATUS_OK) {
                     file = node.get();
@@ -215,25 +206,26 @@ struct st_open final {
         }
         if (status != STATUS_OK)
             return status;
-        status = object.add("Stat", {}, {{"size", ubus_type::U64}, {"sequence", ubus_type::U64}}, [this](auto& request, auto& result) {
-            drain_reads();
-            if (const auto rc = rt_admit(request.deadline); rc != STATUS_OK) return rc;
-            const auto size = lfs_file_size(volume.fs(), &file->state);
-            if (size < 0) return volume.error(size);
-            result.data.put("size", uint64_t(size)).put("sequence", queue.sequence()); return STATUS_OK;
-        });
-        if (status == STATUS_OK) status = object.add("Sync", {}, {}, [this](auto& request, auto&) {
-            drain_reads();
-            if (const auto rc = rt_admit(request.deadline); rc != STATUS_OK) return rc;
-            const auto rc = writeback(*file);
-            return rc == STATUS_OK ? backend.flush() : rc;
-        });
+        for (const auto& [name, kind] : std::array<std::pair<std::string_view, st_op>, 3>{{
+            {"Stat", st_op::Stat}, {"Sync", st_op::Sync}, {"Close", st_op::Close}}}) {
+            const auto output = kind == st_op::Stat ? ubus_schema{{"size", ubus_type::U64}, {"sequence", ubus_type::U64}, {"limit", ubus_type::U64}, {"depth", ubus_type::U64}} : ubus_schema{};
+            if (status == STATUS_OK) status = object.add(std::string{name}, {{"id", ubus_type::U64, true}}, output,
+                [this, kind](auto& q, auto&) {
+                    if (stopped || closing) return STATUS_CLOSED;
+                    if (queue.sequence() == UINT64_MAX) return STATUS_EXHAUSTED;
+                    const auto id = q.data["id"].template as<uint64_t>().value_or(queue.sequence() + 1);
+                    const auto result = queue.accept(id, {.id=id, .operation=kind, .deadline=q.deadline}, q);
+                    if (kind == st_op::Close && result == STATUS_PENDING) closing = true;
+                    return result;
+                });
+        }
         for (const auto& [name, kind] : std::array<std::pair<std::string_view, st_op>, 2>{{{"Read", st_op::Read}, {"Write", st_op::Write}}}) {
             if ((kind == st_op::Read && !readable) || (kind == st_op::Write && !writable)) continue;
             if (status == STATUS_OK) status = object.add(std::string{name},
                 {{"id", ubus_type::U64}, {"offset", ubus_type::U64, true}, {"buffer", ubus_type::Buffer}}, {{"bytes", ubus_type::U64}},
                 [this, kind](auto& q, auto&) {
-                    if (stopped) return STATUS_CLOSED;
+                    if (stopped || closing) return STATUS_CLOSED;
+                    if (queue.active() >= io_depth) return STATUS_BUSY;
                     const auto buffer = *q.data["buffer"].template as<ubus_buffer>();
                     const auto offset = q.data["offset"].template as<uint64_t>();
                     st_cmd command{.id=*q.data["id"].template as<uint64_t>(), .operation=kind, .offset=offset.value_or(0),
@@ -243,13 +235,16 @@ struct st_open final {
                 });
         }
         if (status == STATUS_OK && !document.empty() && writable) status = object.add("Save", {{"buffer", ubus_type::Buffer}}, {},
-            [this](auto& q, auto&) { return save(q); });
+            [this](auto& q, auto&) {
+                if (stopped || closing) return STATUS_CLOSED;
+                if (queue.sequence() == UINT64_MAX) return STATUS_EXHAUSTED;
+                const auto buffer = *q.data["buffer"].template as<ubus_buffer>();
+                if (buffer.size > LFS_FILE_MAX || buffer.offset > UINT64_MAX - buffer.size) return STATUS_BAD_ARGS;
+                const auto id = queue.sequence() + 1;
+                return queue.accept(id, {.id=id, .operation=st_op::Save, .deadline=q.deadline}, q);
+            });
         if (status == STATUS_OK) status = object.add("Cancel", {{"id", ubus_type::U64}}, {}, [this](auto& q, auto&) {
             return queue.cancel(*q.data["id"].template as<uint64_t>());
-        });
-        if (status == STATUS_OK) status = object.add("Close", {}, {}, [this](auto& q, auto&) {
-            if (stopped) return STATUS_CLOSED;
-            stopped = true; queue.stop(); closing.emplace(std::move(q)); return STATUS_PENDING;
         });
         if (status != STATUS_OK) return status;
         auto handle = object.handle(0, RIGHT_SEND);
@@ -261,13 +256,22 @@ struct st_open final {
     }
 
     static auto valid(const st_cmd& request) noexcept -> bool {
-        return request.length && request.length <= st_limit && request.buffer_offset <= UINT64_MAX - request.length;
+        return request.length && request.length <= io_limit && request.buffer_offset <= UINT64_MAX - request.length;
     }
     auto transfer(ubus_ticket ticket) noexcept -> st_done {
         const auto& request = *queue.request(ticket);
+        if (request.operation == st_op::Save) return {request.id, save(*queue.call(ticket))};
+        if (request.operation == st_op::Stat) {
+            const auto size = lfs_file_size(volume.fs(), &file->state);
+            return {request.id, volume.error(size < 0 ? size : 0), size < 0 ? 0 : uint64_t(size)};
+        }
+        if (request.operation == st_op::Sync || request.operation == st_op::Close) {
+            const auto status = writeback(*file);
+            return {request.id, status == STATUS_OK ? backend.flush() : status};
+        }
         auto* call = queue.call(ticket);
         const auto memory = call->capability(call->data["buffer"]);
-        std::array<uint8_t, st_limit> bytes;
+        auto& bytes = scratch;
         if (request.operation == st_op::Write) {
             const auto status = mem_read(memory, request.buffer_offset, std::as_writable_bytes(std::span{bytes}.first(request.length)));
             if (status != STATUS_OK) return {request.id, status};
@@ -280,6 +284,10 @@ struct st_open final {
     }
 };
 static vm_ptr<st_open> opens;
+static std::deque<ubus_request> syncs;
+static st_open* sync_head;
+static std::vector<std::pair<st_open*, uint64_t>> sync_targets;
+static bool sync_captured;
 
 // The ticket retains its endpoint and inode until the device stops accessing
 // the payload. Filesystem mutation is serialized behind these physical reads.
@@ -297,9 +305,9 @@ struct pending {
     st_open* open{};
     ubus_ticket ticket{};
     read_job read{};
-    std::array<uint8_t, st_limit> payload;
+    std::array<uint8_t, io_limit> payload;
 };
-static std::array<pending, st_depth> reads;
+static std::array<pending, io_depth> reads;
 static auto map_read(const read_job& read) noexcept -> std::expected<st_extent, status_t> {
     auto& node = *reinterpret_cast<inode*>(read.object);
     return volume.extent(node.state, read.offset + read.done, read.size - read.done);
@@ -315,7 +323,7 @@ class st_reader final {
         uint64_t id{}, buffer{};
         st_extent extent{};
     };
-    std::array<flight, st_depth - 1> flights_{};
+    std::array<flight, io_depth - 1> flights_{};
 
     static auto cancelled(const read_job& read) noexcept -> bool {
         return read.cancelled && read.cancelled(read);
@@ -479,8 +487,6 @@ static void drain_reads() noexcept {
 // other open descriptions; an external rename/replacement invalidates this one.
 auto st_open::save(ubus_request& request) -> status_t {
     drain_reads();
-    if (stopped) return STATUS_CLOSED;
-    if (const auto status = rt_admit(request.deadline); status != STATUS_OK) return status;
     const auto selected = lookup(document.c_str());
     if (!selected) return STATUS_STALE;
     if (find(*selected) != file) return STATUS_STALE;
@@ -493,10 +499,10 @@ auto st_open::save(ubus_request& request) -> status_t {
     status_t status;
     do {
         temporary = document.substr(0, slash + 1) + ".edit-" + std::to_string(++serial);
-        status = open_file(*replacement, temporary.c_str(), st_read | st_write | st_create | st_exclusive);
-    } while (status == st_exists);
+        status = open_file(*replacement, temporary.c_str(), io_read | io_write | io_create | io_exclusive);
+    } while (status == io_exists);
     if (status != STATUS_OK) return status;
-    std::array<std::byte, st_limit> bytes;
+    auto bytes = std::as_writable_bytes(std::span{scratch});
     for (uint64_t at = 0; at < buffer.size && status == STATUS_OK;) {
         const auto count = std::min<uint64_t>(bytes.size(), buffer.size - at);
         status = mem_read(request.capability(request.data["buffer"]), buffer.offset + at, std::span{bytes}.first(count));
@@ -559,7 +565,7 @@ static auto snapshot(const char* path, word_t perms, ubus_msg& response) -> stat
         if (!temporary)
             return STATUS_NO_MEMORY;
         source = temporary.get();
-        const auto status = open_file(*source, path, st_read);
+        const auto status = open_file(*source, path, io_read);
         if (status != STATUS_OK)
             return status;
     }
@@ -625,24 +631,24 @@ static auto control(std::string_view method, ubus_request& request, ubus_msg& re
     }
     if (!volume.mounted()) return STATUS_BACKING_FAILED;
     if (method == "Sync") {
-        for (auto* node = nodes.get(); node; node = node->next.get())
-            if (const auto status = writeback(*node); status != STATUS_OK) return status;
-        return backend.flush();
+        if (syncs.size() >= io_depth) return STATUS_BUSY;
+        if (syncs.empty()) sync_head = opens.get();
+        syncs.push_back(std::move(request)); return STATUS_PENDING;
     }
     const auto raw = request.data[method == "Rename" ? "from" : "path"].as<std::string_view>();
     if (!raw || raw->find(char{}) != std::string_view::npos) return STATUS_BAD_ARGS;
-    const auto path = st_path(*raw);
+    const auto path = libk::path_normal(*raw);
     if (method == "Map") {
         const auto perms = *request.data["perms"].as<word_t>();
-        if ((perms & VM_EXECUTE) && !(request.facet() & st_execute)) return STATUS_DENIED;
+        if ((perms & VM_EXECUTE) && !(request.facet() & io_execute)) return STATUS_DENIED;
         return snapshot(path.c_str(), perms, response);
     }
     if (method == "Open" || method == "Document") {
-        const auto flags = method == "Document" ? uint64_t(st_read | ((request.facet() & st_modify) && request.data["writable"].as<bool>().value_or(false) ? st_write | st_create : 0))
+        const auto flags = method == "Document" ? uint64_t(io_read | ((request.facet() & io_modify) && request.data["writable"].as<bool>().value_or(false) ? io_write | io_create : 0))
             : *request.data["flags"].as<uint64_t>();
-        if (!(flags & (st_read | st_write)) || flags & ~(st_read | st_write | st_create | st_truncate | st_exclusive | st_append)
-            || ((flags & ~(st_read | st_write)) && !(flags & st_write))) return STATUS_BAD_ARGS;
-        if ((flags & st_write) && !(request.facet() & st_modify)) return STATUS_DENIED;
+        if (!(flags & (io_read | io_write)) || flags & ~(io_read | io_write | io_create | io_truncate | io_exclusive | io_append)
+            || ((flags & ~(io_read | io_write)) && !(flags & io_write))) return STATUS_BAD_ARGS;
+        if ((flags & io_write) && !(request.facet() & io_modify)) return STATUS_DENIED;
         const auto budget = request.capability(request.data["budget"]);
         auto storage = vm_new<st_open>({budget ? budget : rt_startup().quota, rt_startup().scope});
         if (!storage) return storage.error();
@@ -650,7 +656,7 @@ static auto control(std::string_view method, ubus_request& request, ubus_msg& re
         if (method == "Document") opened->document = path;
         const auto status = opened->create(flags, path.c_str(), response, request.capability(request.data["budget"]));
         if (status != STATUS_OK) return status;
-        if (flags & (st_create | st_truncate)) ++epoch;
+        if (flags & (io_create | io_truncate)) ++epoch;
         opened->next = std::move(opens); opens = std::move(opened);
         return STATUS_OK;
     }
@@ -693,7 +699,7 @@ static auto control(std::string_view method, ubus_request& request, ubus_msg& re
     else if (method == "Rename") {
         const auto target = *request.data["to"].as<std::string_view>();
         if (target.find(char{}) != std::string_view::npos) return STATUS_BAD_ARGS;
-        const auto to = st_path(target);
+        const auto to = libk::path_normal(target);
         const auto source = lookup(path.c_str());
         auto moved = source ? find(*source) : nullptr;
         if (!source && source.error() != LFS_ERR_ISDIR) result = source.error();
@@ -745,18 +751,18 @@ int main(int argc, char** argv) {
     }
     struct method { std::string_view name; ubus_schema input, output; word_t rights; };
     for (auto& item : std::array<method, 12>{{
-        {"Map", {{"path", ubus_type::String}, {"perms", ubus_type::U64}}, {{"buffer", ubus_type::Buffer}}, st_lookup},
-        {"Document", {{"path", ubus_type::String}, {"writable", ubus_type::Bool, true}, {"budget", ubus_type::Cap, true}}, {{"handle", ubus_type::Cap}}, st_lookup},
-        {"Open", {{"path", ubus_type::String}, {"flags", ubus_type::U64}, {"budget", ubus_type::Cap, true}}, {{"handle", ubus_type::Cap}}, st_lookup},
-        {"List", {{"path", ubus_type::String}, {"cursor", ubus_type::Record, true}}, {{"epoch", ubus_type::U64}, {"items", ubus_type::Array}, {"cursor", ubus_type::Record, true}}, st_lookup},
-        {"Remove", {{"path", ubus_type::String}}, {}, st_modify},
-        {"Mkdir", {{"path", ubus_type::String}}, {}, st_modify},
-        {"Rename", {{"from", ubus_type::String}, {"to", ubus_type::String}}, {}, st_modify},
-        {"Sync", {}, {}, st_modify},
-        {"DeviceId", {}, {{"id", ubus_type::Bytes}}, st_lookup},
-        {"VolumeId", {}, {{"id", ubus_type::Bytes}}, st_lookup},
-        {"Format", {{"id", ubus_type::Bytes, true}}, {}, st_admin},
-        {"Capacity", {}, {{"bytes", ubus_type::U64}}, st_lookup}
+        {"Map", {{"path", ubus_type::String}, {"perms", ubus_type::U64}}, {{"buffer", ubus_type::Buffer}}, io_lookup},
+        {"Document", {{"path", ubus_type::String}, {"writable", ubus_type::Bool, true}, {"budget", ubus_type::Cap, true}}, {{"handle", ubus_type::Cap}}, io_lookup},
+        {"Open", {{"path", ubus_type::String}, {"flags", ubus_type::U64}, {"budget", ubus_type::Cap, true}}, {{"handle", ubus_type::Cap}}, io_lookup},
+        {"List", {{"path", ubus_type::String}, {"cursor", ubus_type::Record, true}}, {{"epoch", ubus_type::U64}, {"items", ubus_type::Array}, {"cursor", ubus_type::Record, true}}, io_lookup},
+        {"Remove", {{"path", ubus_type::String}}, {}, io_modify},
+        {"Mkdir", {{"path", ubus_type::String}}, {}, io_modify},
+        {"Rename", {{"from", ubus_type::String}, {"to", ubus_type::String}}, {}, io_modify},
+        {"Sync", {}, {}, io_modify},
+        {"DeviceId", {}, {{"id", ubus_type::Bytes}}, io_lookup},
+        {"VolumeId", {}, {{"id", ubus_type::Bytes}}, io_lookup},
+        {"Format", {{"id", ubus_type::Bytes, true}}, {}, io_admin},
+        {"Capacity", {}, {{"bytes", ubus_type::U64}}, io_lookup}
     }}) {
         const auto name = item.name;
         status = directory.add(std::string{name}, std::move(item.input), std::move(item.output),
@@ -770,7 +776,7 @@ int main(int argc, char** argv) {
     }
     if ((status = directory.open()) != STATUS_OK) return status;
     for (const auto& [name, rights] : std::array<std::pair<std::string_view, word_t>, 2>{{
-        {"files", st_lookup | st_modify | st_execute}, {"admin", st_admin}}}) {
+        {"files", io_lookup | io_modify | io_execute}, {"admin", io_admin}}}) {
         auto connector = directory.connector(rights); if (!connector) return connector.error();
         ubus_msg request, response;
         const auto peer_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
@@ -780,26 +786,37 @@ int main(int argc, char** argv) {
         status = bus.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
     }
     for (;;) {
+        // Report the failed barrier before retiring the poisoned filesystem.
+        // Its metadata/cache must never serve a later operation after I/O EIO.
+        if (volume.failed()) sys::exit(volume.error(0));
         if (const auto status = backend.error(); status != STATUS_OK) sys::exit(status);
         bool again = pump_reads();
-        for (size_t count = 0; count < st_depth; ++count) {
+        for (size_t count = 0; count < io_depth; ++count) {
             const auto status = directory.poll();
             if (status == STATUS_WOULD_BLOCK) break;
             if (status != STATUS_OK) return status;
             again = true;
         }
         for (auto* opened = opens.get(); opened; opened = opened->next.get())
-            for (size_t n = 0; n < st_depth; ++n) {
+            for (size_t n = 0; n < io_depth; ++n) {
                 const auto status = opened->object.poll(); if (status == STATUS_WOULD_BLOCK) break;
                 if (status == STATUS_CLOSED || status == STATUS_PEER_CLOSED) { opened->abort(); break; }
                 if (status != STATUS_OK) return status;
                 again = true;
             }
+        if (!syncs.empty() && !sync_captured) {
+            // Each endpoint has at most io_depth native queued requests. The
+            // preceding receive round covered every request older than Sync;
+            // later arrivals can extend the cut, never starve it.
+            for (auto* opened = sync_head; opened; opened = opened->next.get())
+                sync_targets.emplace_back(opened, opened->queue.sequence());
+            sync_captured = true;
+        }
         for (auto* owner = opens.get(); owner; owner = owner->next.get()) {
             auto& opened = *owner;
             auto* queue = &opened.queue;
             if (opened.stopped) continue;
-            for (size_t row = 0; row < st_depth && !opened.busy; ++row) {
+            for (size_t row = 0; row < io_depth && !opened.busy; ++row) {
                 auto* pending = slot();
                 if (!pending) break;
                 ubus_ticket ticket{};
@@ -814,22 +831,29 @@ int main(int argc, char** argv) {
                 status = queue->cancelled(ticket) ? STATUS_CANCELED : rt_admit(queue->request(ticket)->deadline);
                 if (status == STATUS_OK && !queue->commit(ticket)) status = STATUS_CANCELED;
                 const auto completion = status == STATUS_OK ? opened.transfer(ticket) : st_done{ticket.id, status};
+                if (queue->request(ticket)->operation == st_op::Close) opened.stopped = true;
                 if (!opened.finish(ticket, completion.status, completion.bytes)) return STATUS_INTERNAL;
                 again = true;
             }
         }
         again |= pump_reads();
+        if (sync_captured && std::ranges::none_of(sync_targets, [](const auto& cut) { return cut.first->queue.pending(cut.second); })) {
+            auto status = STATUS_OK;
+            for (auto* node = nodes.get(); node && status == STATUS_OK; node = node->next.get()) status = writeback(*node);
+            if (status == STATUS_OK) status = backend.flush();
+            ubus_msg response; response.status = status;
+            if (const auto sent = syncs.front().respond(std::move(response)); sent != STATUS_OK) return sent;
+            syncs.pop_front(); sync_targets.clear(); sync_captured = false; sync_head = opens.get(); again = true;
+        }
         for (auto* link = &opens; *link;) {
             auto& opened = **link;
-            auto status = STATUS_OK;
-            if (opened.stopped && !opened.queue.active() && opened.file->users == 1) {
+            if (opened.failed && !opened.queue.active() && opened.file->users == 1) {
                 drain_reads();
                 auto& file = *opened.file;
                 if (file.state.m.pair[0] != UINT32_MAX && file.state.m.pair[1] != UINT32_MAX
-                    && (file.state.flags & (LFS_F_DIRTY | LFS_F_WRITING))) status = writeback(file);
+                    && (file.state.flags & (LFS_F_DIRTY | LFS_F_WRITING))) (void)writeback(file);
             }
-            if (opened.stopped && !opened.queue.active()) {
-                if (opened.closing) { ubus_msg response; response.status = status; (void)opened.closing->respond(std::move(response)); }
+            if (opened.stopped && !opened.queue.active() && syncs.empty()) {
                 again = true;
                 auto retired = std::move(*link); *link = std::move(retired->next);
             } else link = &opened.next;

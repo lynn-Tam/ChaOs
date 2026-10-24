@@ -520,6 +520,13 @@ auto Pmm::group() noexcept -> PageGroup {
     return PageGroup{*this, next_group_id()};
 }
 
+auto Pmm::descriptor(usize id) noexcept -> Desc& {
+    const auto page = page_from(id);
+    auto* arena = find_arena(page);
+    libk_assert(arena);
+    return descriptor_at(*arena, index_of(*arena, page));
+}
+
 auto Pmm::allocate_page_into(PageGroup& group) noexcept -> GroupAllocateResult {
     sync::Lock guard{lock_};
     libk_assert(group.owner_.get() == this);
@@ -535,6 +542,7 @@ auto Pmm::allocate_page_into(PageGroup& group) noexcept -> GroupAllocateResult {
         const uint32_t generation = descriptor.gen;
         const Page page = page_at(arena, index);
         descriptor = Desc::group(group.id_, group.head_, generation);
+        if (group.head_ != Nil) this->descriptor(group.head_).prev = global_frame_id_of(page);
         group.head_ = global_frame_id_of(page);
         ++group.page_count_;
         ++outstanding_pages_;
@@ -546,8 +554,18 @@ auto Pmm::allocate_page_into(PageGroup& group) noexcept -> GroupAllocateResult {
 }
 
 auto Pmm::grow(PageGroup& group, usize n) noexcept -> bool {
-    sync::Lock guard{lock_};
     libk_assert(group.owner_.get() == this);
+    if (n > 8) {
+        if (n > free_page_count()) return false;
+        auto pending = this->group();
+        while (n) {
+            const auto count = std::min(n, usize{8});
+            if (!grow(pending, count)) return false;
+            n -= count;
+        }
+        append(group, pending); return true;
+    }
+    sync::Lock guard{lock_};
     usize available{};
     for (const auto& arena : arenas_) available += arena.free_count;
     if (n > available) return false;
@@ -558,6 +576,7 @@ auto Pmm::grow(PageGroup& group, usize n) noexcept -> bool {
             auto& desc = descriptor_at(arena, index);
             const auto page = page_at(arena, index);
             desc = Desc::group(group.id_, group.head_, desc.gen);
+            if (group.head_ != Nil) descriptor(group.head_).prev = global_frame_id_of(page);
             group.head_ = global_frame_id_of(page);
         }
         group.page_count_ += count; outstanding_pages_ += count; outstanding_group_pages_ += count;
@@ -568,25 +587,24 @@ auto Pmm::grow(PageGroup& group, usize n) noexcept -> bool {
 }
 
 void Pmm::append(PageGroup& dst, PageGroup& src) noexcept {
-    sync::Lock guard{lock_};
-    libk_assert(dst.owner_.get() == this && src.owner_.get() == this);
-    usize index = src.head_;
-    while (index != Nil) {
-        const Page page = page_from(index);
-        Arena* const arena = find_arena(page);
-        libk_assert(arena != nullptr);
-        Desc& d = descriptor_at(*arena, index_of(*arena, page));
-        libk_assert(d.state() == State::Group && d.owner() == src.id_);
-        d.relabel(dst.id_);
-        const usize next = d.next;
-        if (next == Nil) d.next = dst.head_;
-        index = next;
+    libk_assert(dst.owner_.get() == this && src.owner_.get() == this && &dst != &src);
+    // Both chains are exclusively owned. Relabel their allocated descriptors
+    // without excluding unrelated PMM allocation/retirement for O(n) pages.
+    usize tail = Nil;
+    for (usize index = src.head_; index != Nil;) {
+        auto& d = descriptor(index);
+        libk_assert(d.owns(src.id_)); d.relabel(dst.id_);
+        tail = index; index = d.next;
     }
-    if (src.head_ != Nil) dst.head_ = src.head_;
+    sync::Lock guard{lock_};
+    if (tail != Nil) {
+        descriptor(tail).next = dst.head_;
+        if (dst.head_ != Nil) descriptor(dst.head_).prev = tail;
+        dst.head_ = src.head_;
+    }
     dst.page_count_ += src.page_count_;
     libk_assert(outstanding_groups_ != 0);
-    --outstanding_groups_;
-    src.disarm();
+    --outstanding_groups_; src.disarm();
 }
 
 auto Pmm::detach_page(PageGroup& group, Page page) noexcept -> std::optional<OwnedPage> {
@@ -594,41 +612,18 @@ auto Pmm::detach_page(PageGroup& group, Page page) noexcept -> std::optional<Own
     libk_assert(group.owner_.get() == this);
     libk_assert((group.id_ != Nil));
 
-    usize previous{Nil};
-    usize current = group.head_;
-    while ((current != Nil)) {
-        const Page current_page = page_from(current);
-        Arena* const arena = find_arena(current_page);
-        libk_assert(arena != nullptr);
-        Desc& descriptor = descriptor_at(*arena, index_of(*arena, current_page));
-        libk_assert(descriptor.state() == State::Group);
-        libk_assert(descriptor.owner() == group.id_);
-
-        if (current_page == page) {
-            const usize next = descriptor.next;
-            uint32_t generation = descriptor.gen + 1;
-            if (generation == 0) {
-                ++generation;
-            }
-            if ((previous == Nil)) {
-                group.head_ = next;
-            } else {
-                const Page previous_page = page_from(previous);
-                Arena* const previous_arena = find_arena(previous_page);
-                libk_assert(previous_arena != nullptr);
-                Desc& previous_descriptor =
-                    descriptor_at(*previous_arena, index_of(*previous_arena, previous_page));
-                previous_descriptor.next = next;
-            }
-            descriptor = Desc::individual(generation);
-            --group.page_count_;
-            --outstanding_group_pages_;
-            return std::optional<OwnedPage>{OwnedPage{*this, page, generation}};
-        }
-        previous = current;
-        current = descriptor.next;
-    }
-    return std::nullopt;
+    auto* arena = find_arena(page);
+    if (!arena) return std::nullopt;
+    auto& d = descriptor_at(*arena, index_of(*arena, page));
+    if (!d.owns(group.id_)) return std::nullopt;
+    if (d.prev == Nil) group.head_ = d.next;
+    else descriptor(d.prev).next = d.next;
+    if (d.next != Nil) descriptor(d.next).prev = d.prev;
+    auto generation = d.gen + 1;
+    if (!generation) ++generation;
+    d = Desc::individual(generation);
+    --group.page_count_; --outstanding_group_pages_;
+    return OwnedPage{*this, page, generation};
 }
 
 auto Pmm::detach_group_head(PageGroup& group) noexcept -> std::optional<OwnedPage> {
@@ -654,6 +649,7 @@ auto Pmm::detach_group_head(PageGroup& group) noexcept -> std::optional<OwnedPag
     }
     descriptor = Desc::individual(generation);
     group.head_ = next;
+    if (next != Nil) this->descriptor(next).prev = Nil;
     libk_assert(group.page_count_ != 0);
     --group.page_count_;
     libk_assert(outstanding_group_pages_ != 0);
@@ -679,6 +675,7 @@ auto Pmm::attach_page(PageGroup& group, OwnedPage& page) noexcept -> bool {
     }
 
     descriptor = Desc::group(group.id_, group.head_, page.h_.get().gen);
+    if (group.head_ != Nil) this->descriptor(group.head_).prev = global_frame_id_of(page.h_.get().page);
     group.head_ = global_frame_id_of(page.h_.get().page);
     ++group.page_count_;
     ++outstanding_group_pages_;
@@ -733,6 +730,7 @@ auto Pmm::release_group_head(PageGroup& group) noexcept -> void {
     descriptor = Desc::free(generation);
     push_free(*arena, index);
     group.head_ = next;
+    if (next != Nil) this->descriptor(next).prev = Nil;
     --group.page_count_;
     --outstanding_pages_;
     --outstanding_group_pages_;
@@ -856,6 +854,7 @@ auto Pmm::adopt(BootPages&& reservation) noexcept -> AdoptResult {
         Desc& descriptor = descriptor_at(arena, index_of(arena, page));
         const uint32_t generation = descriptor.gen;
         descriptor = Desc::group(group_id, pages.head_, generation);
+        if (pages.head_ != Nil) this->descriptor(pages.head_).prev = global_frame_id_of(page);
         pages.head_ = global_frame_id_of(page);
         ++pages.page_count_;
         ++outstanding_pages_;

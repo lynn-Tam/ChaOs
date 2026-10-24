@@ -10,7 +10,7 @@
 #include <libk/checked_arithmetic.hpp>
 
 proc_task::~proc_task() {
-    (void)stop();
+    if (scope_) (void)sys::scope_close(scope());
     if (quota_) (void)sys::quota_close(quota());
 }
 auto proc_task::open(const proc_auth& auth, const proc_quota& q) noexcept -> status_t {
@@ -28,36 +28,7 @@ auto proc_task::open(const proc_auth& auth, const proc_quota& q) noexcept -> sta
     if (vm.status != STATUS_OK) return vm.status;
     const auto cs = sys::cspace_create(alloc(), q.slots, q.pages); cs_ = cap_owner{cs.value};
     if (cs.status != STATUS_OK) return cs.status;
-    thread_limit_ = q.threads;
-    return lifecycle_.open(alloc(), 4, 2, 3);
-}
-auto proc_task::supervise(cap_owner cap, word_t role, bool reap) -> status_t {
-    if (!reap && threads_.size() >= thread_limit_) return STATUS_EXHAUSTED;
-    auto status = sys::object_info(cap.selector()).status;
-    if (status != STATUS_OK) return status;
-    const auto object = *reinterpret_cast<const ObjectInfo*>(rt_current().ipc);
-    if (object.kind != ObjThread) return STATUS_BAD_ARGS;
-    const auto found = std::ranges::find_if(threads_, [&](const auto& t) { return t.id == object.object_id; });
-    if (reap) {
-        const auto ended = sys::exit_query(cap.selector());
-        if (ended.status != STATUS_OK) return ended.status;
-        if (!ended.value) return STATUS_WOULD_BLOCK;
-        if (ended.value2) return static_cast<status_t>(ended.value2);
-        if (found != threads_.end()) {
-            if (found->id == initial_id_) { (void)thread_.close(); (void)sc_.close(); }
-            threads_.erase(found);
-        }
-        return STATUS_OK;
-    }
-    if (found != threads_.end()) return STATUS_BAD_ARGS;
-    status = sys::scope_query(scope(), object.object_id, SCOPE_LINKS).status;
-    if (status != STATUS_OK) return status;
-    const auto links = *reinterpret_cast<const LinkRecords*>(rt_current().ipc);
-    if (std::ranges::none_of(std::span{links.records, links.count}, [&](const auto& r) { return r.kind == LINK_ROOT && r.object_id == vm_id_; })) return STATUS_DENIED;
-    observer record{.thread=std::move(cap), .exit={}, .id=object.object_id, .role=role};
-    if (events_) status = record.exit.open(events_, record.thread.selector(), SOURCE_READY, 0, 0, SOURCE_EXIT);
-    if (status == STATUS_OK) threads_.push_back(std::move(record));
-    return status;
+    return lifecycle_.open(alloc(), 4, 0, 2);
 }
 auto proc_task::prepare(cap_t desc, cap_t events, uint32_t cpu) noexcept -> status_t {
     if (thread_) return STATUS_BUSY;
@@ -68,29 +39,25 @@ auto proc_task::prepare(cap_t desc, cap_t events, uint32_t cpu) noexcept -> stat
     auto status = sys::sc_bind(sc_.selector(), thread_.selector()).status;
     if (status != STATUS_OK) return status;
     events_ = events;
-    status = sys::object_info(vspace()).status;
-    if (status != STATUS_OK) return status;
-    vm_id_ = reinterpret_cast<const ObjectInfo*>(rt_current().ipc)->object_id;
-    const auto copy = sys::cap_duplicate(thread_.selector(), rt_startup().cspace, RIGHT_OBSERVE | RIGHT_INSPECT);
-    if (copy.status != STATUS_OK) return copy.status;
-    status = supervise(cap_owner{copy.value}, 2);
-    if (status != STATUS_OK) return status;
-    initial_id_ = threads_.back().id;
-    if (events_) {
-        const std::array<cap_t, 4> sources{domain(), lifecycle_.ends[0].selector(), scope(), quota()};
-        for (size_t i = 0; i < sources.size(); ++i) {
-            status = watches_[i].open(events_, sources[i], i == 0 ? 0 : i == 1 ? SOURCE_READY | SOURCE_TERMINAL : STATE_DRAINED,
-                0, i == 0 ? WATCH_CHANGED : 0, i == 1 ? SOURCE_READ : SOURCE_STATE);
-            if (status != STATUS_OK) return status;
-        }
+    if (!events) return STATUS_OK;
+    const std::array<cap_t, Watches> sources{domain(), lifecycle_.ends[0].selector(), vspace(), scope(), quota()};
+    for (size_t i = 0; i < sources.size(); ++i) {
+        const auto mask = (i == Cpu || i == Exec) ? 0 : i == Life ? SOURCE_READY | SOURCE_TERMINAL
+            : i == Exec ? EXEC_FAILED | EXEC_STOPPED : STATE_DRAINED;
+        status = watches_[i].open(events, sources[i], mask, 0, (i == Cpu || i == Exec) ? WATCH_CHANGED : 0,
+            i == Life ? SOURCE_READ : i == Exec ? SOURCE_EXIT : SOURCE_STATE);
+        if (status != STATUS_OK) return status;
+        if (i == Scope || i == Quota) watches_[i].ack(); // Creation proved these lifecycle sources are open.
     }
     return STATUS_OK;
 }
 auto proc_task::start() noexcept -> status_t {
     if (!thread_ || state_ != state::New) return STATUS_BAD_ARGS;
     const auto status = sys::execution_set(thread_.selector(), true).status;
-    if (status == STATUS_OK) state_ = state::Running;
-    return status;
+    if (status != STATUS_OK) return status;
+    state_ = state::Running;
+    if (const auto rc = thread_.close(); rc != STATUS_OK) return rc;
+    return sc_.close();
 }
 auto proc_task::execution_info() const noexcept -> std::expected<DomainInfo, status_t> {
     const auto status = sys::domain_info(domain()).status;
@@ -107,89 +74,114 @@ auto proc_task::resource_info() const noexcept -> std::expected<QuotaInfo, statu
     if (status != STATUS_OK) return std::unexpected(status);
     return *reinterpret_cast<const QuotaInfo*>(rt_current().ipc);
 }
-auto proc_task::observe() noexcept -> sys::SysResult {
-    if (state_ == state::Consumed) return {.status=STATUS_INVALID_CAP};
-    if (state_ == state::Closing) return {.status=STATUS_OK, .value=1, .value2=static_cast<word_t>(status_)};
-    if (state_ != state::Running) return {.status=STATUS_WOULD_BLOCK};
-    for (;;) {
-        ch_packet packet;
-        const auto received = ch_recv(lifecycle_.ends[0].selector(), packet, false).status;
-        if (received == STATUS_WOULD_BLOCK) break;
-        if (received != STATUS_OK) return {.status=STATUS_OK, .value=1, .value2=word_t(STATUS_PEER_FAULT)};
-        if (packet.word_count != 3 || packet.words[0] != rt_life_version) return {.status=STATUS_OK, .value=1, .value2=word_t(STATUS_PEER_FAULT)};
-        if (packet.words[1] == rt_life_exit && !packet.called && !packet.count)
-            return {.status=STATUS_OK, .value=1, .value2=packet.words[2]};
-        status_t status = STATUS_BAD_ARGS;
-        if ((packet.words[1] == rt_life_register || packet.words[1] == rt_life_reap) && packet.called && packet.count == 2 && packet.words[2] <= 1)
-            status = supervise(std::move(packet.capabilities[1]), packet.words[2], packet.words[1] == rt_life_reap);
-        if (packet.called && packet.count) {
-            const word_t reply[] = {word_t(status)};
-            const auto sent = ch_send(packet.capabilities[0].selector(), reply, false).status;
-            if (sent != STATUS_OK && sent != STATUS_STALE && sent != STATUS_CLOSED && sent != STATUS_PEER_CLOSED) return {.status=sent};
-        }
+auto proc_task::quiesce(int reason) noexcept -> status_t {
+    if (state_ >= state::Stopping) return STATUS_OK;
+    if (vm_) {
+        const auto status = sys::vspace_stop(vspace()).status;
+        if (status != STATUS_OK) return status;
     }
-    if (events_) {
-        const auto status = watches_[1].arm().status;
-        if (status != STATUS_OK) return {.status=status};
-    }
-    for (auto it = threads_.begin(); it != threads_.end();) {
-        const auto exited = sys::exit_query(it->thread.selector());
-        if (exited.status != STATUS_OK) return {.status=STATUS_OK, .value=1, .value2=word_t(STATUS_PEER_FAULT)};
-        if (exited.value) {
-            if (exited.value2 || it->role == 1) return {.status=STATUS_OK, .value=1, .value2=exited.value2 ? exited.value2 : word_t(STATUS_INTERNAL)};
-            if (it->id == initial_id_) { (void)thread_.close(); (void)sc_.close(); }
-            it = threads_.erase(it);
-        } else {
-            if (events_) { const auto status = it->exit.arm().status; if (status != STATUS_OK) return {.status=status}; }
-            ++it;
-        }
-    }
-    return {.status=STATUS_OK};
+    result_.code = reason;
+    result_.exit.origin = reason == STATUS_CANCELED ? EXIT_STOP : EXIT_NORMAL;
+    state_ = state::Stopping; dirty_ = true;
+    if (const auto status = watches_[Life].close(); status != STATUS_OK) return status;
+    return STATUS_OK;
 }
-auto proc_task::stop(status_t reason) noexcept -> status_t {
-    if (state_ == state::Consumed) return STATUS_INVALID_CAP;
-    if (state_ == state::Closing) return STATUS_OK;
-    state_ = state::Closing; status_ = reason;
-    const auto watch = watches_[1].close(); if (watch != STATUS_OK) return watch;
-    const auto life = lifecycle_.close(); if (life != STATUS_OK) return life;
-    threads_.clear();
-    for (auto* cap : {&thread_, &sc_}) { const auto status = cap->close(); if (status != STATUS_OK) return status; }
-    return scope_ ? sys::scope_close(scope()).status : STATUS_OK;
+auto proc_task::retire(int reason) noexcept -> status_t {
+    const auto status = quiesce(reason);
+    if (status != STATUS_OK) return status;
+    retiring_ = true;
+    if (state_ == state::Exited) {
+        const auto closed = close();
+        if (closed != STATUS_WOULD_BLOCK) return closed;
+    }
+    return STATUS_OK;
 }
 auto proc_task::close() noexcept -> status_t {
-    if (!quota_) return STATUS_OK;
-    if (!closing_) {
+    if (state_ == state::Exited) {
+        for (auto i : {Cpu, Life, Exec}) { const auto status = watches_[i].close(); if (status != STATUS_OK) return status; }
+        const auto life = lifecycle_.close(); if (life != STATUS_OK) return life;
+        for (auto* cap : {&thread_, &sc_}) { const auto status = cap->close(); if (status != STATUS_OK) return status; }
+        if (scope_) { const auto status = sys::scope_close(scope()).status; if (status != STATUS_OK) return status; }
         for (auto* cap : {&cs_, &vm_, &domain_}) { const auto status = cap->close(); if (status != STATUS_OK) return status; }
-        closing_ = true;
+        state_ = state::Closing;
     }
     if (scope_) {
         const auto facts = sys::source_info(scope());
         if (facts.status != STATUS_OK) return facts.status;
         if (!(facts.value & STATE_DRAINED)) return STATUS_WOULD_BLOCK;
-        const auto closed = scope_.close(); if (closed != STATUS_OK) return closed;
+        if (const auto status = watches_[Scope].close(); status != STATUS_OK) return status;
+        if (const auto status = scope_.close(); status != STATUS_OK) return status;
     }
-    const auto facts = sys::source_info(quota());
-    if (facts.status != STATUS_OK) return facts.status;
-    if (facts.value & STATE_OPEN) { const auto status = sys::quota_close(quota()).status; return status == STATUS_OK ? STATUS_WOULD_BLOCK : status; }
-    if (!(facts.value & STATE_DRAINED)) return STATUS_WOULD_BLOCK;
-    const auto destroyed = sys::object_destroy(quota()).status; if (destroyed != STATUS_OK) return destroyed;
-    for (auto& watch : watches_) { const auto status = watch.close(); if (status != STATUS_OK) return status; }
-    return quota_.close();
-}
-auto proc_task::poll() noexcept -> status_t {
-    if (state_ == state::Consumed) return STATUS_INVALID_CAP;
-    if (state_ != state::Closing) {
-        const auto ended = observe();
-        if (ended.status != STATUS_OK) return ended.status;
-        if (!ended.value) return STATUS_WOULD_BLOCK;
-        const auto status = stop(static_cast<status_t>(ended.value2)); if (status != STATUS_OK) return status;
+    if (quota_) {
+        const auto facts = sys::source_info(quota());
+        if (facts.status != STATUS_OK) return facts.status;
+        if (facts.value & STATE_OPEN) {
+            const auto status = sys::quota_close(quota()).status;
+            if (status != STATUS_OK) return status;
+            return STATUS_WOULD_BLOCK;
+        }
+        if (!(facts.value & STATE_DRAINED)) return STATUS_WOULD_BLOCK;
+        if (const auto status = watches_[Quota].close(); status != STATUS_OK) return status;
+        const auto destroyed = sys::object_destroy(quota()).status; if (destroyed != STATUS_OK) return destroyed;
+        if (const auto status = quota_.close(); status != STATUS_OK) return status;
     }
-    return close();
+    state_ = state::Drained;
+    return STATUS_OK;
 }
-auto proc_task::collect() noexcept -> sys::SysResult {
-    const auto status = poll(); if (status != STATUS_OK) return {.status=status};
-    state_ = state::Consumed;
-    return {.status=STATUS_OK, .value=static_cast<word_t>(status_)};
+auto proc_task::step() noexcept -> std::expected<bool, status_t> {
+    if (state_ == state::Drained) return true;
+    if (state_ == state::New) return false;
+    if (state_ == state::Running) {
+        for (size_t n = 0; n < 8; ++n) {
+            ch_packet packet;
+            const auto received = ch_recv(lifecycle_.ends[0].selector(), packet, false, 0).status;
+            if (received == STATUS_WOULD_BLOCK) break;
+            if (received != STATUS_OK) return std::unexpected(received);
+            const auto valid = packet.word_count == 2 && packet.words[0] == rt_life_version && !packet.called && !packet.count;
+            const auto status = quiesce(valid ? static_cast<int>(packet.words[1]) : STATUS_PEER_FAULT);
+            if (status != STATUS_OK) return std::unexpected(status);
+            break;
+        }
+        if (state_ == state::Running && watches_[Life]) {
+            const auto status = watches_[Life].arm().status;
+            if (status != STATUS_OK) return std::unexpected(status);
+        }
+    }
+    if (state_ <= state::Stopping) {
+        ExecInfo info{};
+        if (vm_) {
+            const auto status = sys::vspace_exit(vspace()).status;
+            if (status != STATUS_OK) return std::unexpected(status);
+            ::memcpy(&info, reinterpret_cast<const void*>(rt_current().ipc), sizeof(info));
+        } else info.flags = EXEC_STOPPED;
+        if (info.flags & EXEC_FAILED) {
+            if (state_ == state::Running) {
+                const auto status = quiesce(info.failure.status);
+                if (status != STATUS_OK) return std::unexpected(status);
+            }
+            result_.code = info.failure.status; result_.thread = info.thread; result_.exit = info.failure;
+        }
+        if (state_ == state::Stopping) {
+            if (domain_) { const auto status = sys::domain_close(domain()).status; if (status != STATUS_OK) return std::unexpected(status); }
+            if (info.flags & EXEC_STOPPED) state_ = state::Exited;
+        }
+        if (state_ <= state::Stopping && watches_[Exec]) {
+            const auto status = watches_[Exec].arm(info.sequence).status;
+            if (status != STATUS_OK) return std::unexpected(status);
+        }
+        if (domain_ && watches_[Cpu]) {
+            const auto fact = sys::source_info(domain());
+            if (fact.status != STATUS_OK) return std::unexpected(fact.status);
+            const auto status = watches_[Cpu].arm(fact.value2).status;
+            if (status != STATUS_OK) return std::unexpected(status);
+        }
+    }
+    if (retiring_ && state_ >= state::Exited) {
+        const auto status = close();
+        if (status != STATUS_OK && status != STATUS_WOULD_BLOCK) return std::unexpected(status);
+    }
+    dirty_ = false;
+    return state_ == state::Drained;
 }
 
 static constexpr word_t page_size = 4096;
@@ -387,7 +379,7 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
                         std::tuple{AT_SYS_SCOPE, r.scope(), word_t{RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE}},
                         std::tuple{AT_SYS_VSPACE, r.vspace(),
                                    word_t{RIGHT_MANAGE | RIGHT_DELEGATE | RIGHT_MAP | RIGHT_PROTECT | RIGHT_UNMAP |
-                                          RIGHT_DESTROY | RIGHT_INSPECT}},
+                                          RIGHT_INSPECT}},
                         std::tuple{AT_SYS_CSPACE, r.cspace(), word_t{RIGHT_MANAGE | RIGHT_INSPECT}},
                         std::tuple{AT_SYS_EVENTS, events->selector(),
                                    word_t{RIGHT_MANAGE | RIGHT_RECEIVE | RIGHT_DUPLICATE | RIGHT_DESTROY}}}) {
@@ -458,7 +450,7 @@ auto proc_spawn(proc_task& r, const proc_auth& auth, const proc_image& image, co
     };
     const auto status = build();
     if (status != STATUS_OK) {
-        const auto stopped = r.stop(status);
+        const auto stopped = r.retire(status);
         if (stopped != STATUS_OK)
             return stopped;
     }
@@ -484,11 +476,11 @@ auto proc_archive::image(std::string_view name) const -> std::expected<proc_imag
 // Samples execution threads, not the scheduling descendants funded by them.
 // Native membership/version checks bound the snapshot; the caller discards an
 // interval when the actual thread set changes. Quotaing remains native.
-auto proc_task::cpu_info() const -> std::expected<std::pair<uint64_t, std::vector<uint64_t>>, status_t> {
+auto proc_task::cpu_info(word_t interval) const -> std::expected<std::pair<uint64_t, std::vector<uint64_t>>, status_t> {
     const auto now = sys::clock_now().value;
     // Coalesce observers into one sample per second. The timestamp travels with
     // the data; a cached sample is never relabeled with a newer clock value.
-    if (cpu_at_ && now - cpu_at_ < sys::clock_frequency().value) {
+    if (cpu_at_ && now - cpu_at_ < interval) {
         if (cpu_status_ != STATUS_OK) return std::unexpected(cpu_status_);
         return cpu_;
     }
@@ -500,8 +492,7 @@ auto proc_task::cpu_info() const -> std::expected<std::pair<uint64_t, std::vecto
         const auto vm = reinterpret_cast<const ObjectInfo*>(ipc)->object_id;
         std::vector<std::array<uint64_t, 2>> threads;
         ScopeCursor cursor{};
-        for (size_t pages = 0;; ++pages) {
-            if (pages == 128) return std::unexpected(STATUS_EXHAUSTED);
+        for (;;) {
             const auto scan = sys::scope_members(scope(), cursor);
             if (scan.status != STATUS_OK) return std::unexpected(scan.status);
             ScopeMembers page; ::memcpy(&page, ipc, sizeof(page));

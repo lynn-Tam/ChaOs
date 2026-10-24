@@ -1,3 +1,4 @@
+#include <io.hpp>
 #include <start.hpp>
 #include <ubus/ubus.hpp>
 #include <vm.hpp>
@@ -13,6 +14,7 @@
 class ed_terminal {
     cap_t port_{};
     ubus_conn control_;
+    io_tx output_;
     ch_pair subscription_;
     ubus_rx events_, input_;
     uint64_t focus_{};
@@ -38,12 +40,12 @@ public:
     }
     auto write(const char* data, size_t size) -> status_t {
         while (size) {
-            const auto count = std::min(size, size_t{56});
-            ubus_msg frame;
-            frame.data.put("focus", focus_).put("data", std::as_bytes(std::span{data, count}));
-            const auto status = control_.notify("Frame", std::move(frame));
+            io_frame frame; frame.size = std::min(size, io_stream_limit);
+            ::memcpy(frame.data, data, frame.size);
+            const auto status = output_.send(control_.endpoint(), frame, true, *control_.token("Frame"), focus_);
+            if (status == STATUS_STALE) { focused_ = false; return STATUS_OK; }
             if (status != STATUS_OK) { status_ = status; return status; }
-            data += count; size -= count;
+            data += frame.size; size -= frame.size;
         }
         return STATUS_OK;
     }
@@ -74,13 +76,12 @@ public:
             if (status != STATUS_WOULD_BLOCK) return status;
             if (focused_) {
                 if (!bytes_.empty()) { const auto byte = bytes_.front(); bytes_.pop_front(); return byte; }
-                ubus_msg message;
-                const auto received = input_.receive(message);
+                io_frame message;
+                const auto received = io_recv(input_, message);
                 if (received == STATUS_OK) {
-                    const auto bytes = message.data["data"].as<std::span<const std::byte>>();
                     if (message.status != STATUS_OK) return message.status;
-                    if (!bytes || bytes->empty()) return STATUS_CANCELED;
-                    for (const auto byte : *bytes) bytes_.push_back(uint8_t(byte));
+                    if (!message.size) return STATUS_CANCELED;
+                    for (size_t i = 0; i < message.size; ++i) bytes_.push_back(uint8_t(message.data[i]));
                     continue;
                 }
                 if (received != STATUS_WOULD_BLOCK) return received;

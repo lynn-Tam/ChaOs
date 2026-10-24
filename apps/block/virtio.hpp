@@ -1,6 +1,7 @@
+#pragma once
+#include <io.hpp>
 #include <libk/noncopyable.hpp>
 #include <vm.hpp>
-#pragma once
 #include <string.h>
 
 #include <utility>
@@ -23,9 +24,9 @@ inline void blk_fence() noexcept { asm volatile("fence iorw, iorw" ::: "memory")
 // before submitting another request in that slot. IOSpace owns device drain.
 class blk_dev final : private libk::noncopyable_nonmovable {
 public:
-    static constexpr size_t Depth = 32;
+    static constexpr size_t Depth = io_depth;
     static constexpr size_t BlockSize = 512;
-    static constexpr size_t MaxTransfer = 4096;
+    static constexpr size_t MaxTransfer = io_limit;
     struct Completion final {
         ubus_ticket ticket{};
         status_t status{};
@@ -42,9 +43,9 @@ public:
             RIGHT_MAP | RIGHT_UNMAP | RIGHT_INSPECT | RIGHT_OBSERVE | RIGHT_CLOSE);
         if (space.status != STATUS_OK) return space.status;
         space_ = cap_owner{space.value};
-        const auto watched = sys::port_watch(rt_events(), space.value, 0, 0, 0, WATCH_CHANGED);
-        if (watched.status != STATUS_OK) return watched.status;
-        events_ = rt_events(); space_watch_ = watched.value;
+        const auto watched = space_watch_.open(rt_events(), space.value, 0, 0, WATCH_CHANGED);
+        if (watched != STATUS_OK) return watched;
+        events_ = rt_events();
         for (size_t i = 0; i < std::size(regs_); ++i) {
             const auto name = i == 6 ? std::string{"pci.config"} : "bar" + std::to_string(i);
             const auto [cap, value] = resource(name);
@@ -64,9 +65,8 @@ public:
         interrupt_ = cap_owner{interrupt.value};
         const auto bound = sys::irq_set(interrupt.value, true);
         if (bound.status != STATUS_OK) return bound.status;
-        const auto interrupt_watch = sys::port_watch(events_, interrupt.value, SOURCE_READY | SOURCE_TERMINAL, 0, 0, 0, SOURCE_READ);
-        if (interrupt_watch.status != STATUS_OK) return interrupt_watch.status;
-        irq_watch_ = interrupt_watch.value;
+        const auto interrupt_watch = irq_watch_.open(events_, interrupt.value, SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_READ);
+        if (interrupt_watch != STATUS_OK) return interrupt_watch;
         return configure(info);
     }
 
@@ -170,18 +170,18 @@ public:
         if (state.value != IO_SPACE_READY) return STATUS_BACKING_FAILED;
         const auto fact = sys::source_info(space_.selector());
         if (fact.status != STATUS_OK) return fact.status;
-        if (const auto status = sys::port_arm(events_, space_watch_, fact.value2).status; status != STATUS_OK) return status;
+        if (const auto status = space_watch_.arm(fact.value2).status; status != STATUS_OK) return status;
         const auto delivered = sys::irq_observe(interrupt_.selector());
-        if (delivered.status == STATUS_BUSY) return sys::port_arm(events_, irq_watch_).status;
+        if (delivered.status == STATUS_BUSY) return irq_watch_.arm().status;
         if (delivered.status != STATUS_OK) return delivered.status;
         (void)read<uint8_t>(isr_); // clear the device's level before unmasking PLIC
         const auto result = sys::irq_ack(interrupt_.selector(), delivered.value2, delivered.value);
-        return result.status == STATUS_OK ? sys::port_arm(events_, irq_watch_).status : result.status;
+        return result.status == STATUS_OK ? irq_watch_.arm().status : result.status;
     }
 
 private:
     cap_t events_{};
-    word_t irq_watch_{}, space_watch_{};
+    ev_watch irq_watch_, space_watch_;
     size_t depth_{}, available_offset_{}, used_offset_{}, headers_{}, data_{};
     uint16_t queue_size_{};
     uint64_t iova_{};

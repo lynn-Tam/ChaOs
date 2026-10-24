@@ -45,7 +45,7 @@ constexpr Rights memory_rights = Rights::of(
 constexpr Rights vspace_rights = Rights::of(
     Right::Duplicate,
     Right::Delegate,
-    Right::Inspect,
+    Right::Inspect, Right::Observe, Right::Control,
     Right::Reserve,
     Right::Map,
     Right::Unmap,
@@ -432,7 +432,7 @@ auto make_attenuation_ceiling(
         return (View{
             child_rights,
             QuotaLimit{
-                resource::Budget{
+                resource::Capacity{
                     descriptor.words[0], descriptor.words[1]},
                 descriptor.words[2]}});
     }

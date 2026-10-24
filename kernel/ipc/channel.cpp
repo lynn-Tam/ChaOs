@@ -5,7 +5,7 @@
 #include <optional>
 #include <cap/grant.hpp>
 #include <object/ref.hpp>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <ipc/channel.hpp>
 
 #include <libk/assert.hpp>
@@ -473,7 +473,7 @@ auto Channel::receive(
         }
         auto& message = current.queue.front();
         count = message.escrows.size();
-        result.received_count = count;
+        result.received_count = count; result.sequence = message.sequence;
         if (count > result.receive_limit) return std::unexpected(ChannelError::ResourceExhausted);
         if (!count) {
             copy(message, result);
@@ -527,6 +527,27 @@ auto Channel::receive(
     release_message(*consumed);
     if (!transferred) return std::unexpected(ChannelError::TransferFailed);
     return {};
+}
+
+auto Channel::drop(cap::Resolved<Channel>& cap, u64 sequence) noexcept -> status_t {
+    const auto receiver = side_for(cap, cap::Right::Receive);
+    if (!receiver) return STATUS_DENIED;
+    Flight flight{*this};
+    auto& current = side(*receiver);
+    Message* message;
+    Source::Publication publications[2];
+    {
+        sync::Lock guard{current.lock};
+        if (!opened_ || closing_) return STATUS_CLOSED;
+        if (current.queue.empty() || current.queue.front().sequence != sequence) return STATUS_STALE;
+        message = &current.queue.pop_front();
+        if (current.call == message) { current.call = nullptr; current.call_done = false; }
+        readiness_locked(current, publications);
+    }
+    for (auto& publication : publications) publication.publish();
+    discard_message(*message);
+    release_message(*message);
+    return STATUS_OK;
 }
 
 auto Channel::close(ChannelSide value) noexcept -> bool {

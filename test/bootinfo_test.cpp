@@ -175,16 +175,16 @@ bool test_inventory_needs_ram(const TestContext&) noexcept {
 }
 
 bool test_inventory_rejects_conflicting_ownership(const TestContext&) noexcept {
-    mm::RegionList conflict{region(100, 8), region(102, 1, Kind::Mmio)};
-    const auto a = mm::normalize(conflict);
-    mm::RegionList outside{region(100, 8), region(200, 1, Kind::Kernel)};
-    const auto b = mm::normalize(outside);
-    mm::RegionList valid{region(100, 8), region(200, 2, Kind::Mmio), region(300, 4, Kind::Firmware)};
-    return !a && a.error() == mm::PmmInitError::OverlappingRegions
-        && !b && b.error() == mm::PmmInitError::InvalidRegion
-        && mm::normalize(valid) && valid.size() == 2
-        && valid[0].range == mm::Pages{mm::Page{100}, 8}
-        && valid[1].kind == Kind::Mmio;
+    mm::RegionList map{region(100, 8), region(102, 1, Kind::Mmio)};
+    const auto conflict = mm::normalize(map);
+    if (conflict || conflict.error() != mm::PmmInitError::OverlappingRegions) return false;
+    map = mm::RegionList{region(100, 8), region(200, 1, Kind::Kernel)};
+    const auto outside = mm::normalize(map);
+    if (outside || outside.error() != mm::PmmInitError::InvalidRegion) return false;
+    map = mm::RegionList{region(100, 8), region(200, 2, Kind::Mmio), region(300, 4, Kind::Firmware)};
+    return mm::normalize(map) && map.size() == 2
+        && map[0].range == mm::Pages{mm::Page{100}, 8}
+        && map[1].kind == Kind::Mmio;
 }
 
 bool test_byte_ranges_have_explicit_page_rounding(const TestContext&) noexcept {

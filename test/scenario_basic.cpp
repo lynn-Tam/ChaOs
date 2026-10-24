@@ -9,7 +9,7 @@
 #include <trace.hpp>
 #include <console.hpp>
 #include <mm/kspace.hpp>
-#include <sched/sc.hpp>
+#include <sched/sched.hpp>
 #include <sched/dispatcher.hpp>
 #include <task/thread.hpp>
 

@@ -16,6 +16,7 @@
 #define SOURCE_OP 6U
 #define SOURCE_READY 1U
 #define SOURCE_TERMINAL 2U
+// ARM returns value=condition currently matched, value2=atomic observation sequence.
 #define WATCH_CHANGED 1U
 #define PORT_READABLE 1U
 #define PORT_OVERFLOW 2U
@@ -29,7 +30,7 @@ struct PortEvent {
 };
 struct PortRecords {
     uint32_t version, size;
-    uint64_t epoch, next;
+    uint64_t epoch, next, limit;
     uint32_t count, more;
     struct PortEvent events[PORT_RECORDS];
 };
@@ -69,7 +70,8 @@ static_assert(sizeof(CapXfer) == 24);
 // CANCEL races reply at the reserved result cell; DISCARD releases that result.
 // Call tokens select generations within an authorized transport, never authority.
 // Request and reply may share a Channel, but must use opposite directions.
-// Receive NO_MEMORY preserves the head message and returns its cap count in value.
+// Receive NO_MEMORY preserves the head; value=required caps, value2=head sequence.
+// DROP discards that sequence without importing caps; stale heads remain untouched.
 // Try-send capacity prechecks are conservative hints: WOULD_BLOCK accepts no
 // request. Wait/arm checks Source facts again before parking.
 // Queue storage is prepaid at creation; depth is a 32-bit configuration value.

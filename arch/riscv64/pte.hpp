@@ -9,6 +9,8 @@ inline constexpr int PtLevels = 3, PtBits = 9;
 inline constexpr usize Ptes = usize{1} << PtBits;
 inline constexpr usize PtUserBegin = RISCV64_LOW_GUARD_END;
 inline constexpr usize PtUserEnd = usize{1} << (12 + PtBits * PtLevels - 1);
+inline constexpr usize IoBegin = 4096; // Zero selects automatic IOVA placement.
+inline constexpr usize IoEnd = usize{1} << (12 + PtBits * PtLevels);
 inline constexpr usize PtKernelBegin = ~(PtUserEnd - 1);
 constexpr bool pt_canonical(usize addr) noexcept {
     return addr < PtUserEnd || addr >= PtKernelBegin;
@@ -18,6 +20,7 @@ void load_root(usize satp) noexcept;
 auto asid_mask() noexcept -> usize;
 auto tagged_root(usize satp, usize asid) noexcept -> usize;
 void flush_tlb(usize asid) noexcept;
+void flush_tlb_page(usize address, usize asid) noexcept;
 bool flush_remote(usize hart) noexcept;
 bool root_active(usize satp) noexcept;
 void flush_tlb_all() noexcept;

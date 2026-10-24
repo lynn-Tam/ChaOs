@@ -8,7 +8,7 @@
 #include <console.hpp>
 #include <utility>
 #include <mm/kspace.hpp>
-#include <sched/sc.hpp>
+#include <sched/sched.hpp>
 #include <sched/dispatcher.hpp>
 #include <task/thread.hpp>
 

@@ -60,10 +60,10 @@ public:
     auto events() noexcept -> Source& { return ready_; }
     auto watch(cap::Resolved<Port>&, const cap::GrantPin&, Source&, u32 facet, u64 key,
                Source::Condition, Bound) noexcept -> std::expected<u64, status_t>;
-    auto arm(u64 id, u64 seen) noexcept -> status_t;
+    auto arm(u64 id, u64 seen) noexcept -> WaitResult;
     auto unwatch(u64 id) noexcept -> status_t;
     auto take(PortEvent&) noexcept -> status_t;
-    auto records(u64 epoch, u64 last, PortRecords&) const noexcept -> status_t;
+    auto records(u64 epoch, u64 last, u64 limit, PortRecords&) const noexcept -> status_t;
     auto resync(u64 epoch) noexcept -> status_t;
     void retire(object::cleanup&&) noexcept;
 private:
@@ -91,7 +91,7 @@ private:
     libk::intrusive_tree<Watch, &Watch::index, Compare> index_;
     mutable sync::Spin lock_;
     Src<PORT_READABLE | PORT_OVERFLOW> ready_{Source::Drained::bind<&Port::complete>(*this)};
-    u64 version_{1}, acknowledged_{}, scan_{}, readiness_{};
+    u64 version_{1}, acknowledged_{}, lost_{}, scan_{}, readiness_{};
     usize calls_{};
     bool advancing_{};
     bool opened_{}, closing_{}, overflow_{}, scanned_{};

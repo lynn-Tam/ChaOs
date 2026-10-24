@@ -54,15 +54,18 @@ arch_sources = files(
   'arch/riscv64/boot.S',
   'arch/riscv64/cpu.cpp', 'arch/riscv64/cpu.S', 'arch/riscv64/sbi.cpp',
   'arch/riscv64/trap.S', 'arch/riscv64/trap.cpp',
+  'arch/riscv64/io.cpp',
 )
 core_kernel_sources = files(
-  'kernel/io/space.cpp', 'kernel/mm/table.cpp', 'kernel/boot/fdt.cpp',
+  'kernel/io/space.cpp', 'arch/riscv64/sv39.cpp',
+  'kernel/boot/fdt.cpp',
   'kernel/boot/root.cpp',
   'kernel/cap/view.cpp',  'kernel/cap/grant.cpp',
   'kernel/cap/cspace.cpp', 'kernel/ipc/port.cpp', 'kernel/ipc/channel.cpp', 'kernel/mm/pager.cpp',
   'kernel/irq/irq.cpp',
   'kernel/object/scope.cpp', 'kernel/resource/quota.cpp',
-  'kernel/sched/sc.cpp',
+  'kernel/sched/sched.cpp',
+  'kernel/op.cpp',
   'kernel/sched/dispatcher.cpp',
   'kernel/task/thread.cpp',
   'kernel/wait.cpp',
@@ -158,6 +161,10 @@ foreach layer, directories : {'base': ['uapi', 'libk'], 'ubus': ['ubus'], 'mgr':
   endforeach
 endforeach
 user_exports = join_paths(meson.current_build_dir(), 'include')
+app_exports = join_paths(user_exports, 'apps')
+run_command('mkdir', '-p', app_exports, check: true)
+run_command('ln', '-sfn', join_paths(root, 'apps/io.hpp'), join_paths(app_exports, 'io.hpp'), check: true)
+io_dep = declare_dependency(compile_args: ['-I' + app_exports])
 user_common_args = [
   '-Wall', '-Wextra', '-Werror', '-O2', '-g3', '-ffunction-sections', '-fdata-sections',
   '-march=rv64imac_zicsr_zifencei', '-mabi=lp64', '-mcmodel=medany', '-msmall-data-limit=0', '-I' + join_paths(user_exports, 'base'), '-I' + join_paths(root, 'lib/rt'),
@@ -189,7 +196,7 @@ mgr = static_library('mgr', files('mgr/mgr.cpp'), dependencies: [proc_dep, ubus_
 mgr_dep = declare_dependency(link_with: mgr, dependencies: [proc_dep, ubus_dep],
   compile_args: ['-I' + join_paths(user_exports, 'mgr')])
 posix = static_library(
-  'posix', files('apps/posix/io.cpp', 'apps/posix/pthread.cpp'), dependencies: [ubus_dep],
+  'posix', files('apps/posix/io.cpp', 'apps/posix/pthread.cpp'), dependencies: [ubus_dep, io_dep],
   cpp_args: user_cpp_args + ['-I' + join_paths(root, 'apps/posix/include')],
   pic: false, implicit_include_directories: false, build_by_default: false,
 )
@@ -216,7 +223,7 @@ math_runtime = static_library('math-runtime', files(
   'third_party/musl/powf_data.c',
 ), c_args: user_c_args + ['-ffunction-sections', '-fdata-sections', '-Wno-unused-but-set-variable'],
   pic: false, implicit_include_directories: false, build_by_default: false)
-tui = static_library('tui', files('apps/tasks/terminal.cpp'), dependencies: [ubus_dep],
+tui = static_library('tui', files('apps/tasks/terminal.cpp'), dependencies: [ubus_dep, io_dep],
   include_directories: ftxui_inc, cpp_args: user_cpp_args,
   pic: false, implicit_include_directories: false, build_by_default: false)
 bins = {}
@@ -248,7 +255,7 @@ foreach name, spec : {
   'sleep': [files('apps/sleep.cpp'), false],
 }
   binary = executable(name + '.elf', spec[0],
-    dependencies: [ubus_dep] + (name == 'thread-test' ? [proc_dep] : []) + (['init','mgr','devices','shell','supervisor'].contains(name) ? [mgr_dep] : []),
+    dependencies: [ubus_dep, io_dep] + (name == 'thread-test' ? [proc_dep] : []) + (['init','mgr','devices','shell','supervisor'].contains(name) ? [mgr_dep] : []),
     c_args: user_c_args, include_directories: name == 'tasks' ? ftxui_inc : [],
     cpp_args: user_cpp_args + (spec[1] ? ['-I' + join_paths(root, 'apps/posix/include')] : []),
     link_whole: [crt, user_entry] + (spec[1] ? [posix] : []),
@@ -264,7 +271,7 @@ endforeach
 
 store_user = executable(
   'store.elf', files('apps/store/main.cpp', 'apps/store/lfs.c',
-    'third_party/littlefs/lfs_util.c'), dependencies: [ubus_dep],
+    'third_party/littlefs/lfs_util.c'), dependencies: [ubus_dep, io_dep],
   include_directories: include_directories('third_party/littlefs'),
   c_args: user_c_args + ['-DLFS_NO_MALLOC', '-DLFS_NO_DEBUG', '-DLFS_NO_WARN',
     '-DLFS_NO_ERROR', '-UNDEBUG'],
@@ -275,12 +282,12 @@ store_user = executable(
 )
 
 fdcheck_user = executable(
-  'fdcheck.elf', files('test/user/fd/main.cpp'), dependencies: [ubus_dep], c_args: user_c_args,
+  'fdcheck.elf', files('test/user/fd/main.cpp'), dependencies: [ubus_dep, io_dep], c_args: user_c_args,
   cpp_args: user_cpp_args + ['-I' + join_paths(root, 'apps/posix/include')],
   link_with: [ubus, cxx_runtime], link_whole: [crt, user_entry, posix], link_args: user_link_args, link_language: 'c', implicit_include_directories: false, build_by_default: false,
 )
 demand_user = executable(
-  'demand-test.elf', files('test/user/demand/main.cpp'), dependencies: [ubus_dep], c_args: user_c_args, cpp_args: user_cpp_args + ['-I' + join_paths(root, 'apps/posix/include')],
+  'demand-test.elf', files('test/user/demand/main.cpp'), dependencies: [ubus_dep, io_dep], c_args: user_c_args, cpp_args: user_cpp_args + ['-I' + join_paths(root, 'apps/posix/include')],
   link_with: [ubus, cxx_runtime], link_whole: [crt, user_entry, posix], link_args: user_link_args + ['-Wl,--gc-sections'], link_language: 'c', implicit_include_directories: false, build_by_default: false,
 )
 
@@ -329,7 +336,7 @@ ubus_test = executable('ubus-test.elf', files('test/user/ubus.cpp'),
   link_args: user_link_args + ['-Wl,--gc-sections'], link_language: 'c', implicit_include_directories: false, build_by_default: false)
 
 exec_test = executable('exec-test.elf', files('test/user/exec.cpp'),
-  dependencies: [ubus_dep], c_args: user_c_args, cpp_args: user_cpp_args + ['-I' + join_paths(root, 'apps/posix/include')],
+  dependencies: [ubus_dep, io_dep], c_args: user_c_args, cpp_args: user_cpp_args + ['-I' + join_paths(root, 'apps/posix/include')],
   link_with: [ubus, cxx_runtime], link_whole: [crt, user_entry, posix], link_args: user_link_args + ['-Wl,--gc-sections'], link_language: 'c', implicit_include_directories: false, build_by_default: false)
 
 # Debug ELF stays beside the objects; deployment consumes ordinary stripped ELF.
@@ -464,10 +471,10 @@ run_target('run-channel-matrix', command: [find_program('python3'), files('tools
   '[channel] native capacity, MCMP payloads, Reply cancellation, Port facts and reassigning ok'],
   depends: [kernel_debug, channel_test_bundle])
 
+run_target('run-vfs-matrix', command: [find_program('python3'),
+  files('tools/build/run-console.py'), qemu, kernel, storage_test_bundle, '1,2,4', 'vfs'])
 run_target('run-io-dual-console-matrix', command: [find_program('python3'),
-  files('tools/build/run-io-platform.py'), qemu, kernel, '1,2,4',
-  '--bundle', boot_bundle, '--second-disk', '--timeout', '18', '/ > '],
-  depends: [kernel, boot_bundle])
+  files('tools/build/run-console.py'), qemu, kernel, storage_test_bundle, '1,2,4', 'devices'])
 run_target('run-test-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'timeout', '--exact-failed-zero', 'cpu: online=' + smp])
 if get_option('panic_probe') == 1
   run_target('run-panic-smp', command: [sh, run_qemu, qemu, timeout, smp, kernel_debug, 'shutdown', '--forbid', 'no acknowledgement', '--count-regex', 'cpu [0-9]+: stopped pc=', (get_option('qemu_smp') - 1).to_string(), 'KERNEL PANIC', 'context: call-site', 'expression: false'])

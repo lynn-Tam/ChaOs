@@ -9,7 +9,7 @@
 #include <task/thread.hpp>
 #include <uapi/abi.h>
 #include <utility>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <sched/dispatcher.hpp>
 #include <uapi/ipc.h>
 #include <cap/cspace.hpp>
@@ -131,12 +131,18 @@ template<usize op>
     // One admitted view spans dequeue, cap publication and the result copy.
     const auto received = cap.value()->receive(*cap, inv.cspace, wire);
     if (!received) return returned(status(received.error()),
-        received.error() == ipc::ChannelError::ResourceExhausted ? wire.received_count : 0);
+        received.error() == ipc::ChannelError::ResourceExhausted ? wire.received_count : 0,
+        received.error() == ipc::ChannelError::ResourceExhausted ? wire.sequence : 0);
     wire.received_reserved = 0;
     libk_assert(access->write(0, {reinterpret_cast<const byte*>(&wire), offsetof(ChanMsg, words) + wire.word_count * sizeof(word_t)}));
     libk_assert(access->write(offsetof(ChanMsg, received), {reinterpret_cast<const byte*>(wire.received), wire.received_count * sizeof(cap_t)}));
     libk_assert(access->write(offsetof(ChanMsg, received_count), {reinterpret_cast<const byte*>(&wire.received_count), sizeof(ChanMsg) - offsetof(ChanMsg, received_count)}));
     return returned(STATUS_OK, wire.sequence);
+}
+
+template<usize op> auto channel_drop(Call& inv) noexcept -> Result {
+    auto cap = channel(inv, cap::Right::Receive);
+    return cap ? returned(cap->object().drop(*cap, inv.trap.arg(1))) : returned(cap_status(cap.error()));
 }
 
 template<usize op> auto channel_cancel(Call& inv) noexcept -> Result {
@@ -205,6 +211,13 @@ static auto source(cap::Resolved<void>& cap, u64 facet, u64 mask) noexcept -> So
             && !(mask & ~(THREAD_ENABLED | THREAD_APPLIED | THREAD_BOUND | THREAD_STOPPING | THREAD_STOPPED)))
             return &thread.events();
         return nullptr;
+    }
+    if (reference->kind() == ObjVSpace && facet == SOURCE_EXIT && cap.rights().contains(cap::Right::Observe)
+        && !(mask & ~(EXEC_FAILED | EXEC_STOPPING | EXEC_STOPPED))) {
+        const auto view = cap.view();
+        const auto* limit = std::get_if<cap::VmLimit>(&view.data);
+        auto& vm = *static_cast<mm::VSpace*>(reference->get());
+        return limit && vm.can_destroy_object(*limit) ? &vm.exec_events() : nullptr;
     }
     if (reference->kind() == ObjDomain && facet == SOURCE_STATE && cap.rights().contains(cap::Right::Inspect)
         && !(mask & ~(DOMAIN_CLOSING | DOMAIN_DRAINED | DOMAIN_CONFIGURING)))
@@ -290,7 +303,8 @@ template<usize op> auto port_call(Call& inv) noexcept -> Result {
         cap::Rights::of(op == SYS_PORT_ARM || op == SYS_PORT_UNWATCH ? cap::Right::Manage : cap::Right::Receive));
     if (!port) return returned(cap_status(port.error()));
     if constexpr (op == SYS_PORT_ARM) {
-        return returned(port->object().arm(inv.trap.arg(1), inv.trap.arg(2)));
+        const auto observed = port->object().arm(inv.trap.arg(1), inv.trap.arg(2));
+        return returned(observed.status, observed.value, observed.sequence);
     }
     if constexpr (op == SYS_PORT_UNWATCH) return returned(port->object().unwatch(inv.trap.arg(1)));
     if constexpr (op == SYS_PORT_RESYNC) return returned(port->object().resync(inv.trap.arg(1)));
@@ -308,7 +322,7 @@ template<usize op> auto port_call(Call& inv) noexcept -> Result {
     }
     if constexpr (op == SYS_PORT_RECORDS) {
         PortRecords records;
-        const auto status = port->object().records(inv.trap.arg(2), inv.trap.arg(3), records);
+        const auto status = port->object().records(inv.trap.arg(2), inv.trap.arg(3), inv.trap.arg(4), records);
         if (status != STATUS_OK) return returned(status);
         return returned(access->write(inv.trap.arg(1), std::span<const byte>{reinterpret_cast<const byte*>(&records), sizeof(records)}) ? STATUS_OK : STATUS_BAD_ARGS);
     }

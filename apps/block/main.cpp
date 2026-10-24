@@ -1,6 +1,7 @@
 #include "virtio.hpp"
 
 static blk_dev device;
+static std::array<uint8_t, io_limit> scratch;
 static ubus_object directory{"io.block"};
 struct blk_cmd { blk_op kind; uint64_t offset{}; ubus_buffer buffer{}; uint64_t deadline{}; };
 struct blk_client {
@@ -37,16 +38,15 @@ static auto open(ubus_request& request, ubus_msg& response) -> status_t {
                 blk_cmd command{.kind=kind, .offset=q.data["offset"].template as<uint64_t>().value_or(0), .deadline=q.deadline};
                 if (kind != blk_op::Flush) {
                     command.buffer = *q.data["buffer"].template as<ubus_buffer>();
-                    // One bounded native copy directly into/from the IPC aperture.
-                    if (command.buffer.size > blk_dev::MaxTransfer || command.buffer.offset % 4096 + command.buffer.size > 4096) return STATUS_BAD_ARGS;
+                    if (command.buffer.size > blk_dev::MaxTransfer || command.buffer.offset > UINT64_MAX - command.buffer.size) return STATUS_BAD_ARGS;
                 }
                 return state->queue.accept(*q.data["id"].template as<uint64_t>(), command, q);
             });
         if (status != STATUS_OK) return status;
     }
     for (const auto status : {
-        object.add("Stat", {}, {{"size", ubus_type::U64}, {"sequence", ubus_type::U64}}, [state=client.get()](auto&, auto& r) {
-            r.data.put("size", device.capacity()).put("sequence", state->queue.sequence()); return STATUS_OK;
+        object.add("Stat", {}, {{"size", ubus_type::U64}, {"sequence", ubus_type::U64}, {"limit", ubus_type::U64}, {"depth", ubus_type::U64}}, [state=client.get()](auto&, auto& r) {
+            r.data.put("size", device.capacity()).put("sequence", state->queue.sequence()).put("limit", uint64_t{io_limit}).put("depth", uint64_t{io_depth}); return STATUS_OK;
         }),
         object.add("Cancel", {{"id", ubus_type::U64}}, {}, [state=client.get()](auto& q, auto&) { return state->queue.cancel(*q.data["id"].template as<uint64_t>()); }),
         object.add("Close", {}, {}, [state=client.get()](auto& q, auto&) {
@@ -118,9 +118,9 @@ int main() {
             if (client.failed || client.queue.cancelled(operation.ticket)) status = STATUS_CANCELED;
             if (status == STATUS_OK && (command->kind == blk_op::Read || command->kind == blk_op::Identify)) {
                 if (completion.size > command->buffer.size) return STATUS_INTERNAL;
-                ::memcpy(reinterpret_cast<void*>(rt_current().ipc), completion.data, completion.size);
                 auto* call = client.queue.call(operation.ticket);
-                status = sys::memory_write(call->capability(call->data["buffer"]), command->buffer.offset, 0, completion.size).status;
+                status = mem_write(call->capability(call->data["buffer"]), command->buffer.offset,
+                    std::as_bytes(std::span{completion.data, completion.size}));
             }
             client.finish(operation.ticket, status, status == STATUS_OK ? completion.size : 0);
             if (flush.client == operation.client && flush.submitted && flush.ticket.id == operation.ticket.id) flush = {};
@@ -154,10 +154,11 @@ int main() {
                 if (status == STATUS_OK && !client->queue.commit(ticket)) status = STATUS_CANCELED;
                 if (status == STATUS_OK && command.kind == blk_op::Write) {
                     auto* call = client->queue.call(ticket);
-                    status = sys::memory_read(call->capability(call->data["buffer"]), command.buffer.offset, 0, command.buffer.size).status;
+                    status = mem_read(call->capability(call->data["buffer"]), command.buffer.offset,
+                        std::as_writable_bytes(std::span{scratch}.first(command.buffer.size)));
                 }
                 if (status == STATUS_OK) status = device.submit({index, ++operation.gen}, command.kind,
-                    command.offset, command.buffer.size, command.kind == blk_op::Write ? reinterpret_cast<const uint8_t*>(rt_current().ipc) : nullptr);
+                    command.offset, command.buffer.size, command.kind == blk_op::Write ? scratch.data() : nullptr);
                 if (status == STATUS_OK) { operation.client = client; operation.ticket = ticket; }
                 else client->finish(ticket, status);
                 again = true;

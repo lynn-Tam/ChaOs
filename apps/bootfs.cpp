@@ -1,3 +1,4 @@
+#include <io.hpp>
 #include <ubus/ubus.hpp>
 #include <vm.hpp>
 #include <libk/cpio.hpp>
@@ -51,7 +52,7 @@ static auto open(ubus_request& request, ubus_msg& response) -> status_t {
             if (state->closed) return STATUS_CLOSED;
             const auto buffer = *q.data["buffer"].template as<ubus_buffer>();
             const auto id = *q.data["id"].template as<uint64_t>();
-            if (buffer.size > 65536 || id <= state->sequence) return STATUS_BAD_ARGS;
+            if (buffer.size > io_limit || id <= state->sequence) return STATUS_BAD_ARGS;
             const auto explicit_offset = q.data["offset"].template as<uint64_t>();
             const auto offset = explicit_offset.value_or(state->offset);
             const auto count = offset >= state->file->bytes.size() ? size_t{0}
@@ -61,12 +62,12 @@ static auto open(ubus_request& request, ubus_msg& response) -> status_t {
             state->sequence = id; if (!explicit_offset) state->offset += count;
             r.data.put("bytes", count); return STATUS_OK;
         });
-    if (status == STATUS_OK) status = object.add("Stat", {}, {{"size", ubus_type::U64}, {"sequence", ubus_type::U64}}, [state=opened.get()](auto&, auto& r) {
-        r.data.put("size", state->file->bytes.size()).put("sequence", state->sequence); return STATUS_OK;
+    if (status == STATUS_OK) status = object.add("Stat", {{"id", ubus_type::U64, true}}, {{"size", ubus_type::U64}, {"sequence", ubus_type::U64}, {"limit", ubus_type::U64}, {"depth", ubus_type::U64}}, [state=opened.get()](auto&, auto& r) {
+        r.data.put("size", state->file->bytes.size()).put("sequence", state->sequence).put("limit", uint64_t{io_limit}).put("depth", uint64_t{io_depth}); return STATUS_OK;
     });
-    if (status == STATUS_OK) status = object.add("Sync", {}, {}, [](auto&, auto&) { return STATUS_OK; });
-    if (status == STATUS_OK) status = object.add("Close", {}, {}, [state=opened.get()](auto&, auto&) { state->closed = true; return STATUS_OK; });
-    if (status == STATUS_OK) status = object.open(32, request.capability(request.data["budget"]));
+    if (status == STATUS_OK) status = object.add("Sync", {{"id", ubus_type::U64, true}}, {}, [](auto&, auto&) { return STATUS_OK; });
+    if (status == STATUS_OK) status = object.add("Close", {{"id", ubus_type::U64, true}}, {}, [state=opened.get()](auto&, auto&) { state->closed = true; return STATUS_OK; });
+    if (status == STATUS_OK) status = object.open(io_depth, request.capability(request.data["budget"]));
     if (status != STATUS_OK) return status;
     auto handle = object.handle(0, RIGHT_SEND); if (!handle) return handle.error();
     const auto handle_idx = response.give(std::move(*handle));

@@ -1,3 +1,4 @@
+#include <libk/path.hpp>
 #include <cerrno>
 #include <posix.hpp>
 #include <start.hpp>
@@ -12,18 +13,6 @@
 
 
 enum : status_t { fs_exists = -256 };
-static auto fs_path(std::string_view path, std::string_view base = "/") -> std::string {
-    std::string result = path.starts_with('/') ? std::string{path} : std::string{base} + "/" + std::string{path};
-    size_t size{}, cursor{};
-    while (cursor < result.size()) {
-        const auto begin = cursor; while (cursor < result.size() && result[cursor] != '/') ++cursor;
-        const std::string_view part{result.data() + begin, cursor - begin};
-        if (part == "..") { while (size && result[size - 1] != '/') --size; if (size) --size; }
-        else if (!part.empty() && part != ".") { if (size) result[size++] = '/'; ::memmove(result.data() + size, part.data(), part.size()); size += part.size(); }
-        ++cursor;
-    }
-    result.resize(size); result.insert(0, "/"); return result;
-}
 
 struct output {
     int fd{STDOUT_FILENO};
@@ -34,11 +23,11 @@ static int print(std::string_view text) {
     return count < 0 ? count : count == static_cast<int64_t>(text.size()) ? 0 : 1;
 }
 static int transfer(int source, int target) {
-    char bytes[4096];
+    std::vector<char> bytes(io_limit);
     for (;;) {
-        const auto size = read(source, bytes, sizeof(bytes));
+        const auto size = read(source, bytes.data(), bytes.size());
         if (size <= 0) return size;
-        const auto sent = write(target, bytes, size);
+        const auto sent = write(target, bytes.data(), size);
         if (sent != size) return sent < 0 ? sent : 1;
     }
 }
@@ -64,7 +53,8 @@ static int remove_path(std::string_view path, bool recursive, bool force) {
     const auto name = path.substr(path.find_last_of('/') + 1);
     auto* base = getcwd(nullptr, 0);
     if (!base) return -errno;
-    const auto absolute = fs_path(path, base);
+    const auto absolute = libk::path_normal(path, base);
+    if (absolute.empty()) return -EINVAL;
     free(base);
     if (recursive && (absolute == "/" || name == "." || name == "..")) return -EINVAL;
     struct entry { std::string path; bool visited{}; };

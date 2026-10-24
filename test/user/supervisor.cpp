@@ -35,15 +35,18 @@ int main(int argc, char**) {
     status = owner.open(); if (status != STATUS_OK) return status;
     ev_notice ready;
     status = ready.open(env.alloc(), rt_events()); if (status != STATUS_OK) return status;
-    auto& child = owner.add("descendant", "self", {.bytes=1024 * 1024, .caps=96, .slots=96, .pages=16});
-    child.args.push_back("hold");
-    const auto proof_idx = child.setup.give(setup.take(message["proof"]));
+    auto recipe = mgr_recipe("descendant", "self", {.bytes=1024 * 1024, .caps=96, .slots=96, .pages=16});
+    ubus_data args{ubus_type::Array}; args.push("hold"); recipe.data.put("argv", args);
+    ubus_data payload;
+    const auto proof_idx = recipe.give(setup.take(message["proof"]));
     if (!proof_idx) return proof_idx.error();
-    const auto ready_idx = child.setup.attach(ready.selector(), RIGHT_SIGNAL);
+    const auto ready_idx = recipe.attach(ready.selector(), RIGHT_SIGNAL);
     if (!ready_idx) return ready_idx.error();
-    child.setup.data.cap("proof", *proof_idx)
+    payload.cap("proof", *proof_idx)
         .cap("ready", *ready_idx);
-    status = owner.start(child); if (status != STATUS_OK) return status;
+    recipe.data.put("setup", payload);
+    const auto child = owner.configure(std::move(recipe)); if (!child) return child.error();
+    status = owner.start(**child); if (status != STATUS_OK) return status;
     const auto crash = setup.capability(message["crash"]);
     ev_watch crashed;
     status = crashed.open(rt_events(), crash, SOURCE_READY); if (status != STATUS_OK) return status;

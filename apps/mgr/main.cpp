@@ -86,14 +86,14 @@ int main() {
     };
     mgr* self{};
     mgr owner{[&](mgr_child& child) -> std::expected<proc_image, status_t> {
-        if (auto image = archive.image(child.image)) return image;
+        if (auto image = archive.image(child.program())) return image;
         auto state = std::make_shared<loading>();
         auto connector = self->object().connector(mgr_observe | mgr_control);
         if (!connector) return std::unexpected(connector.error());
         state->connector = std::move(*connector);
         child.loading = [&, state]() -> std::expected<proc_image, status_t> {
             auto& load = *state;
-            const auto& program = child.image;
+            const auto& program = child.program();
             const auto fail = [](status_t status) -> std::expected<proc_image, status_t> { return std::unexpected(status); };
             for (;;) {
                 const bool binding = load.step == loading::LocalBind || load.step == loading::ParentBind || load.step == loading::FilesBind;
@@ -182,6 +182,7 @@ int main() {
             if (status != STATUS_OK) return std::unexpected(status);
         }
         if (!recipe.data["routes"] && config["routes"]) recipe.data.put("routes", config["routes"]);
+        recipe.data.put("$package", child["name"]);
         return recipe;
     };
     status = owner.recover([&](ubus_msg snapshot) -> std::expected<ubus_msg, status_t> {
@@ -196,17 +197,13 @@ int main() {
     if (status != STATUS_OK) return status;
     for (const auto child : config["children"].values()) {
         const auto name = child["name"].as<std::string_view>().value_or("");
-        if (auto installed = owner.find(name)) {
-            if (installed->recipe["$package"]) installed->origin.put("name", name).put("program", installed->image).put("$package", name);
-            continue;
-        }
+        if (owner.find(name)) continue;
         if (owner.known(name)) continue;
         const auto program = child["program"].as<std::string_view>();
         if (!program) return STATUS_BAD_ARGS;
         if (child["optional"].as<bool>().value_or(false) && !archive.image(*program)) continue;
         auto recipe = recipe_for(child); if (!recipe) return recipe.error();
         const auto installed = owner.configure(std::move(*recipe)); if (!installed) return installed.error();
-        (*installed)->origin.put("name", name).put("program", *program).put("$package", name);
     }
     status = owner.attach(parent); if (status != STATUS_OK) return status;
     for (;;) {

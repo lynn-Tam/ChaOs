@@ -159,32 +159,100 @@ static void file_writes() {
     char end[3]; check(pread(fd, end, 3, data.size()) == 3 && !memcmp(end, "end", 3));
     check(!close(fd) && !unlink("thread-data"));
 }
+static void file_barriers() {
+    const int fd = open("thread-barrier", O_RDWR | O_CREAT | O_TRUNC, 0); check(fd >= 0);
+    std::atomic<bool> submitted{}, release{};
+    std::thread worker([&] {
+        char data[]{"ordered"}; io_request request{fd, IO_WRITE, data, sizeof(data), 0}; request_id id{};
+        check(!px_submit(&request, &id)); submitted.store(true); submitted.notify_one();
+        release.wait(false); io_completion result{};
+        check(px_completion(&result, IO_WAIT) == 1 && result.id == id && result.result == sizeof(data));
+    });
+    submitted.wait(false);
+    check(!fsync(fd) && !close(fd)); // No completion polling by the submitting thread.
+    release.store(true); release.notify_one(); worker.join();
+    const int saved = open("thread-barrier", O_RDONLY); check(saved >= 0);
+    char data[8]{}; check(read(saved, data, sizeof(data)) == sizeof(data) && !memcmp(data, "ordered", 8));
+    check(!close(saved) && !unlink("thread-barrier"));
+}
+// This entry deliberately has no CRT/TLS registration or rt_thread record.
+[[noreturn]] static void raw_entry(word_t ready, word_t failure) {
+    (void)sys::notification_signal(ready);
+    if (failure == 1) sys::exit(STATUS_INTERNAL);
+    if (failure == 2) asm volatile(".word 0");
+    for (;;) sys::yield();
+}
+[[noreturn]] static void raw_child(std::string_view mode) {
+    const auto& env = rt_startup();
+    rpc_op request; const word_t words[]{42};
+    check(request.begin(env.environment, env.alloc(), rt_events(), words) == STATUS_OK);
+    ch_packet reply; check(request.poll(reply) == STATUS_WOULD_BLOCK || reply.count == 1);
+    while (request.active()) { const auto status = request.poll(reply); if (status == STATUS_OK) break; check(status == STATUS_WOULD_BLOCK); sys::yield(); }
+    check(reply.count == 1);
+    const auto scope = sys::scope_create(env.alloc()); check(scope.status == STATUS_OK); cap_owner nested{scope.value};
+    auto stack = vm_area::create(env.alloc(), rt_vm(), 0, 16 * 1024); check(bool(stack));
+    auto ipc = vm_area::create(env.alloc(), rt_vm(), 0, 4096); check(bool(ipc));
+    check(sys::memory_populate(ipc->memory.selector(), 0).status == STATUS_OK);
+    const auto descriptor = sys::memory_create(env.alloc(), 4096, VM_READ | VM_WRITE); check(descriptor.status == STATUS_OK);
+    cap_owner start{descriptor.value};
+    const auto ready = sys::notification_create(env.alloc(), 1); check(ready.status == STATUS_OK); cap_owner notice{ready.value};
+    ThreadInit init{.version=THREAD_START_VERSION, .flags=0, .entry=reinterpret_cast<word_t>(&raw_entry),
+        .stack=stack->address + stack->size - 16,
+        .arguments={notice.selector(), mode == "raw-fault" ? word_t{1} : mode == "raw-trap" ? word_t{2} : word_t{0}},
+        .ipc={.memory=ipc->memory.selector(), .page=0, .address=ipc->address, .pages=1}};
+    check(mem_write(start.selector(), 0, std::as_bytes(std::span{&init, 1})) == STATUS_OK);
+    const auto made = sys::thread_create({env.quota, nested.selector()}, env.vspace, env.cspace, start.selector(), 0, 0);
+    check(made.status == STATUS_OK); cap_owner thread{made.value};
+    check(sys::sc_bind(reply.capabilities[0].selector(), thread.selector()).status == STATUS_OK);
+    check(sys::execution_set(thread.selector(), true).status == STATUS_OK);
+    check(sys::wait_one(notice.selector(), SOURCE_READY).status == STATUS_OK);
+    const word_t ready_words[]{4}; check(ch_send(env.environment, ready_words).status == STATUS_OK);
+    for (;;) sys::yield();
+}
 static void execution_domain() {
     const int fd = open("/boot/thread-test.elf", O_RDONLY); check(fd >= 0);
     uint64_t bytes{}; check(!px_size(fd, &bytes));
     std::vector<std::byte> image(bytes); check(read(fd, image.data(), bytes) == ssize_t(bytes) && !close(fd));
-    for (bool limited : {false, true}) {
-        ch_pair signal; check(signal.open(rt_startup().alloc(), 4, 0, 1) == STATUS_OK);
+    for (const std::string_view mode : {"child", "limit", "raw", "raw-fault", "raw-trap"}) {
+        const bool limited = mode == "limit", raw = mode.starts_with("raw"), failure = mode == "raw-fault" || mode == "raw-trap";
+        const auto expected = mode == "raw-fault" ? STATUS_INTERNAL : mode == "raw-trap" ? STATUS_PEER_FAULT : limited ? STATUS_OK : STATUS_CANCELED;
+        cap_owner external;
+        if (raw) {
+            const auto sc = sys::sc_create(rt_startup().alloc(), rt_startup().domain, 0, 0, 1024, (rt_startup().cpus >= 64 ? ~word_t{} : (word_t{1} << rt_startup().cpus) - 1));
+            check(sc.status == STATUS_OK); external = cap_owner{sc.value};
+        }
+        ch_pair signal; check(signal.open(rt_startup().alloc(), 4, 2, 1) == STATUS_OK);
         auto minted = sys::channel_mint(signal.ends[1].selector(), rt_startup().cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
         check(minted.status == STATUS_OK); cap_owner endpoint{minted.value};
         proc_task child;
-        const std::string_view args[]{"thread-test", limited ? "limit" : "child"};
+        const std::string_view args[]{"thread-test", mode};
         proc_opts opts{.argv=args, .environment=endpoint.selector(),
-            .resources={.bytes=4 * 1024 * 1024, .caps=192, .slots=256, .pages=36, .threads=limited ? 2u : 16u}, .events=rt_events()};
+            .resources={.bytes=4 * 1024 * 1024, .caps=192, .slots=256, .pages=36}, .events=rt_events()};
         check(proc_spawn(child, {rt_startup().alloc(), uint32_t(rt_startup().cpus), rt_startup().domain}, {.bytes=image}, opts) == STATUS_OK);
+        const auto slice = sys::vm_slice(child.vspace(), 0x100000000, 4096, VM_READ, RIGHT_CONTROL | RIGHT_OBSERVE);
+        check(slice.status == STATUS_OK); cap_owner restricted{slice.value};
+        check(sys::vspace_stop(restricted.selector()).status == STATUS_DENIED);
+        check(sys::vspace_exit(restricted.selector()).status == STATUS_DENIED);
         check(child.start() == STATUS_OK);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         for (;;) {
-            const auto status = child.poll(); check(status == STATUS_OK || status == STATUS_WOULD_BLOCK);
+            const auto progress = child.step(); check(bool(progress));
+            if (child.result()) { check(failure && child.result()->code == expected); break; }
             ch_packet packet;
-            if (ch_recv(signal.ends[0].selector(), packet, false).status == STATUS_OK) { check(packet.words[0] == (limited ? 0u : 4u)); break; }
+            if (ch_recv(signal.ends[0].selector(), packet, false).status == STATUS_OK) {
+                if (packet.called) {
+                    check(raw && packet.count == 1 && packet.words[0] == 42);
+                    const CapXfer cap{external.selector(), RIGHT_ATTACH | RIGHT_INSPECT, CAP_COPY, 0};
+                    check(ch_send(packet.capabilities[0].selector(), {}, true, std::span{&cap, 1}).status == STATUS_OK);
+                } else { check(packet.words[0] == (limited ? 0u : 4u)); break; }
+            }
             check(std::chrono::steady_clock::now() < deadline); sys::yield();
         }
-        if (!limited) {
+        if (!limited && !failure) {
             for (bool enabled : {false, true, false}) {
                 const auto intent = child.execution(enabled); check(intent.status == STATUS_OK);
                 for (;;) {
-                    check(child.poll() == STATUS_WOULD_BLOCK);
+                    check(bool(child.step()) && !child.result());
                     const auto info = child.execution_info(); check(bool(info));
                     if (info->applied == intent.value) { check(info->status == STATUS_OK && bool(info->flags & DOMAIN_ENABLED) == enabled); break; }
                     check(std::chrono::steady_clock::now() < deadline); sys::yield();
@@ -194,20 +262,42 @@ static void execution_domain() {
                 const auto after = child.execution_info()->runtime;
                 check(enabled ? after > before : after == before);
             }
-            check(child.stop() == STATUS_OK);
+            check(child.retire() == STATUS_OK);
         }
         for (;;) {
-            const auto result = child.collect();
-            if (result.status == STATUS_OK) { check(status_t(result.value) == (limited ? STATUS_OK : STATUS_CANCELED)); break; }
-            check(result.status == STATUS_WOULD_BLOCK && std::chrono::steady_clock::now() < deadline); sys::yield();
+            check(bool(child.step()));
+            if (const auto result = child.result()) {
+                check(result->code == expected);
+                if (failure) check(result->thread && result->exit.status == expected
+                    && result->exit.origin == (mode == "raw-trap" ? EXIT_FAULT : EXIT_NORMAL));
+                if (mode == "raw-trap") check(result->exit.pc != 0);
+                check(child.retire(result->code) == STATUS_OK);
+                if (child.drained()) break;
+            }
+            check(std::chrono::steady_clock::now() < deadline); sys::yield();
+        }
+        if (external) {
+            check(sys::sc_info(external.selector()).status == STATUS_OK);
+            check(!reinterpret_cast<const ScInfo*>(rt_current().ipc)->bound);
+            check(sys::object_destroy(external.selector()).status == STATUS_OK);
         }
     }
 }
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view{argv[1]}.starts_with("raw")) raw_child(argv[1]);
     if (argc == 2 && (std::string_view{argv[1]} == "child" || std::string_view{argv[1]} == "limit")) {
         if (std::string_view{argv[1]} == "limit") {
-            auto result = rt_thread_create([](void*) -> void* { sys::exit(STATUS_INTERNAL); }, nullptr);
-            check(!result && result.error() == STATUS_EXHAUSTED);
+            std::atomic<bool> release{};
+            std::vector<rt_thread> threads;
+            for (;;) {
+                auto result = rt_thread_create([](void* gate) -> void* {
+                    static_cast<std::atomic<bool>*>(gate)->wait(false); return nullptr;
+                }, &release, {.stack_size=4 * 1024 * 1024});
+                if (!result) { check(result.error() == STATUS_NO_MEMORY || result.error() == STATUS_EXHAUSTED); break; }
+                threads.push_back(*result);
+            }
+            release.store(true); release.notify_all();
+            for (auto id : threads) check(bool(rt_thread_join(id)));
             const word_t value[]{0}; check(ch_send(rt_startup().environment, value).status == STATUS_OK); return 0;
         }
         for (unsigned i = 0; i < 4; ++i) check(bool(rt_thread_create([](void*) -> void* {
@@ -218,7 +308,7 @@ int main(int argc, char** argv) {
     }
     check(px_init() == STATUS_OK);
     if (argc == 2 && std::string_view{argv[1]} == "write") {
-        file_writes(); say("[threads] sequential writes and parallel explicit offsets ok\n"); return 0;
+        file_writes(); file_barriers(); say("[threads] sequential writes and parallel explicit offsets ok\n"); return 0;
     }
     if (argc == 2 && std::string_view{argv[1]} == "hold") {
         std::jthread cpu([](std::stop_token stop) { while (!stop.stop_requested()) (void)__atomic_add_fetch(&count, 1, __ATOMIC_RELAXED); });

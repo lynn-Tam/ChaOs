@@ -1,5 +1,5 @@
 #include <sched/dispatcher.hpp>
-#include <sched/sc.hpp>
+#include <sched/sched.hpp>
 #include <cpu/ipi.hpp>
 #include <cpu/cpu.hpp>
 #include <trace.hpp>
@@ -88,16 +88,16 @@ void Dispatcher::on_context_enter() noexcept {
 
 
 auto Dispatcher::maintenance(const Thread& t) const noexcept -> bool {
-    return (t.kind_ == Thread::Kind::Worker && !t.work_domain_) || t.stop_requested();
+    return (t.kind_ == Thread::Kind::Worker) || t.stop_requested();
 }
 void Dispatcher::enqueue(Thread& t) noexcept {
     libk_assert(!t.ready_.hook.is_linked() && !t.maintenance_hook_.is_linked());
     t.set_state(Thread::State::Ready);
     if (maintenance(t)) maintenance_ready_.push_back(t);
     else {
-        libk_assert(t.sc_ || t.work_domain_);
+        libk_assert(t.sc_);
         if (t.sc_) { t.sc_->locate(*this); t.ready_.service = t.sc_->service_; }
-        t.ready_.domain = t.work_domain_ ? t.work_domain_ : t.sc_->domain_;
+        t.ready_.domain = t.sc_->domain_;
         t.ready_.parent = &t.ready_.domain->local(id()).node;
         insert(t.ready_);
     }
@@ -128,11 +128,12 @@ void Dispatcher::erase(Node& node) noexcept {
         if (node.parent->hook.is_linked()) erase(*node.parent);
     }
 }
-void Dispatcher::domain_ready(Domain::Local& local) noexcept {
+void Dispatcher::domain_ready(Domain::Local& local, bool resched) noexcept {
     libk_assert(local.cpu == id() && !arch::interrupts_enabled());
     local.waiting.store(false, std::memory_order_release);
     if (!local.owner.accepting() || !local.owner.config_.enabled) {
         if (local.refill.armed()) disarm(local.refill);
+        if (local.work.hook.is_linked()) { erase(local.work); --ready_count_; }
         if (local.node.hook.is_linked()) erase(local.node);
         libk_assert(!local.active);
         if (local.owner.phase_ == DOMAIN_CONFIGURING && local.owner.relocating_) {
@@ -151,11 +152,13 @@ void Dispatcher::domain_ready(Domain::Local& local) noexcept {
         local.node.weight = local.owner.config_.weight;
         const bool allowed = id().raw < 64 && (local.owner.config_.cpus & (u64{1} << id().raw));
         if (!allowed) local.owner.ordinary_.disarm(id());
-        if (!allowed && local.worker.enabled_) static_cast<void>(local.worker.execution(false));
-        if (allowed && !local.owner.ordinary_.arm(id())) local.owner.wake_work(id());
+        if (!allowed && local.work.hook.is_linked()) { erase(local.work); --ready_count_; }
+        if (allowed && !local.work.hook.is_linked() && !local.owner.ordinary_.arm(id())) {
+            insert(local.work); ++ready_count_;
+        }
         if (!local.node.ready.empty() && !local.node.hook.is_linked()) insert(local.node);
     }
-    request_reschedule(DispatchReason::RemoteWake);
+    if (resched) request_reschedule(DispatchReason::RemoteWake);
 }
 void Dispatcher::post(Domain::Local& local) noexcept {
     auto ticket = object::ref<>::retain_alive(local.owner.close_work_.key());
@@ -185,10 +188,8 @@ void Dispatcher::drain_domains() noexcept {
         local->owner.post_close();
     }
 }
-auto Dispatcher::reserve(Thread& candidate, u64 now) noexcept -> bool {
+auto Dispatcher::reserve(Node* branch, Sc* sc, u64 now) noexcept -> bool {
     libk_assert(!current_sc_ && !ticket_count_);
-    auto* sc = maintenance(candidate) ? &maintenance_ : candidate.sc_;
-    auto* branch = maintenance(candidate) ? nullptr : candidate.ready_.parent;
     std::array<Node*, Domain::max_depth> path{};
     usize depth{};
     for (auto* node = branch; node; node = node->parent) path[depth++] = node;
@@ -239,18 +240,40 @@ void Dispatcher::settle(u64 now) noexcept {
         if (ticket.domain->accepting() && available) ticket.domain->notify();
     }
 }
-auto Dispatcher::select(u64 now) noexcept -> Thread* {
+auto Dispatcher::select(u64& now) noexcept -> Thread* {
+    usize steps{};
     for (;;) {
         auto* candidate = ready_.minimum();
         if (!maintenance_ready_.empty()) {
             maintenance_.service_ = std::max(maintenance_.service_, fair_.load());
             if (!candidate || maintenance_.service_ <= candidate->service) {
                 auto& thread = maintenance_ready_.front();
-                libk_assert(reserve(thread, now)); return &thread;
+                libk_assert(reserve(nullptr, &maintenance_, now)); return &thread;
             }
         }
-        while (candidate && !candidate->thread) candidate = candidate->ready.minimum();
+        while (candidate && !candidate->thread && !candidate->work) candidate = candidate->ready.minimum();
         if (!candidate) return nullptr;
+        if (candidate->work) {
+            if (steps++ == 8) { (void)send_ipi(cpu_.hw); return nullptr; }
+            auto& owner = *candidate->domain;
+            auto storage = object::ref<>::retain_alive(owner.close_work_.key());
+            if (!reserve(candidate->parent, nullptr, now)) continue;
+            erase(*candidate); --ready_count_;
+            current_work_ = candidate;
+            for (auto* branch = current_branch_; branch; branch = branch->parent)
+                branch->domain->local(id()).active.store(true, std::memory_order_release);
+            // A finite callback uses the already settled CPU boundary, never a
+            // Domain-owned Thread, stack or a maintenance execution loan.
+            (void)owner.ordinary_.run(1);
+            now = clock_->rd_ticks(); charge_to(now); settle(now);
+            for (auto* branch = current_branch_; branch; branch = branch->parent) {
+                branch->domain->local(id()).active.store(false, std::memory_order_release);
+                branch->domain->post_close();
+            }
+            current_branch_ = current_work_ = nullptr;
+            domain_ready(owner.local(id()), false);
+            continue;
+        }
         auto& thread = *candidate->thread;
         // These execution relations were indexed before close; admission
         // checks precede a finite step and its home owns the eventual ACK.
@@ -262,7 +285,7 @@ auto Dispatcher::select(u64 now) noexcept -> Thread* {
             { sync::Lock guard{thread.lock_}; thread.detach_sc_ = true; }
             refresh(thread); continue;
         }
-        if (reserve(thread, now)) return candidate->thread;
+        if (reserve(maintenance(thread) ? nullptr : thread.ready_.parent, maintenance(thread) ? &maintenance_ : thread.sc_, now)) return candidate->thread;
     }
 }
 void Dispatcher::detach(Thread& t) noexcept {
@@ -271,7 +294,7 @@ void Dispatcher::detach(Thread& t) noexcept {
         sync::Lock guard{t.lock_};
         libk_assert(!current_sc_ || current_sc_ != t.sc_);
         if (t.pending_sc_) resource = std::move(t.pending_sc_);
-        else { resource = std::move(t.resource_); t.sc_ = nullptr; t.association_ = 0; }
+        else { resource = std::move(t.sc_ref_); t.sc_ = nullptr; t.association_ = 0; }
         t.detach_sc_ = false;
         t.association_ = 0;
     }
@@ -297,8 +320,8 @@ void Dispatcher::refresh(Thread& t) noexcept {
         changed = t.applied_ != t.requested_ || t.pending_sc_ || detach_sc || t.transferred_;
         if (t.transferred_) { t.transferred_ = false; t.destination_ = nullptr; }
         if (!detach_sc && t.pending_sc_) {
-            t.resource_ = std::move(t.pending_sc_);
-            t.sc_ = &t.resource_.get();
+            t.sc_ref_ = std::move(t.pending_sc_);
+            t.sc_ = &t.sc_ref_.get();
         }
         t.applied_ = t.requested_;
         t.applied_enabled_ = enabled;
@@ -316,10 +339,9 @@ void Dispatcher::refresh(Thread& t) noexcept {
         }
         enqueue(t); return;
     }
-    if (!enabled || (!t.sc_ && !t.work_domain_) || (t.wait_.attached() && !t.wait_.ready() && !t.wake_credit_)) {
+    if (!enabled || !t.sc_ || (t.wait_.attached() && !t.wait_.ready() && !t.wake_credit_)) {
         t.set_state(Thread::State::Blocked); return;
     }
-    if (t.work_domain_) { enqueue(t); return; }
     auto& sc = *t.sc_;
     sc.charge(clock_->rd_ticks(), 0);
     if (sc.eligible(clock_->rd_ticks())) enqueue(t);
@@ -485,17 +507,17 @@ void Dispatcher::charge_to(u64 now) noexcept {
     if (current_sc_ || current_branch_) {
         if (current_sc_) current_sc_->record(elapsed);
         loan_elapsed_ += elapsed;
-        {
+        if (!current_work_) {
             sync::Lock guard{cpu_.current->lock_};
             cpu_.current->runtime_ += elapsed;
             cpu_.current->recorded_at_ = now;
         }
-        auto* child = &cpu_.current->ready_;
+        auto* child = current_work_ ? current_work_ : &cpu_.current->ready_;
         if (current_sc_) child->service = current_sc_->service_;
         else child->service += elapsed;
         for (auto* branch = current_branch_; branch; branch = branch->parent) {
             branch->domain->runtime_.fetch_add(elapsed, std::memory_order_relaxed);
-            if (cpu_.current->work_domain_) branch->domain->work_runtime_.fetch_add(elapsed, std::memory_order_relaxed);
+            if (current_work_) branch->domain->work_runtime_.fetch_add(elapsed, std::memory_order_relaxed);
             auto minimum = child->service;
             if (const auto* other = branch->ready.minimum()) minimum = std::min(minimum, other->service);
             branch->floor = std::max(branch->floor, minimum);
@@ -699,8 +721,10 @@ void Dispatcher::post_switch() noexcept {
 }
 
 auto Dispatcher::stop(Thread* t) noexcept -> StopDisposition {
-    libk_assert(t->owned_by(*this));
+    // Exit can finish before an already mailed Stop is drained. Finalization
+    // then clears home_; the mailbox still pins storage until complete().
     if (t->state_ == Thread::State::Exited) return StopDisposition::Deferred;
+    libk_assert(t->owned_by(*this));
     if (t->wait_.attached()) static_cast<void>(t->wait_.cancel());
     if (t->draining()) {
         // The fixed Wait must drain before Stop may finish its Thread.
@@ -720,7 +744,7 @@ void Dispatcher::finish_exit(Thread* t, DispatchReason reason, status_t status) 
     libk_assert(t != current() && t->state_ == Thread::State::Exited && !t->draining());
     if (t->refill_.armed()) disarm(t->refill_);
     detach(*t);
-    t->finish(reason == DispatchReason::Stop ? STATUS_CANCELED : status);
+    t->finish(reason == DispatchReason::Stop ? STATUS_CANCELED : status, reason == DispatchReason::Stop ? EXIT_STOP : EXIT_NORMAL);
 }
 void yield() noexcept {
     const bool interrupts = arch::disable_interrupts();

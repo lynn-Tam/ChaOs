@@ -961,8 +961,8 @@ auto Graph::live_count() const noexcept -> usize {
     return storage_.live();
 }
 
-auto Graph::node_usage() noexcept -> resource::Budget {
-    return resource::Budget{.memory = sizeof(Slot)};
+auto Graph::node_usage() noexcept -> resource::Capacity {
+    return resource::Capacity{.memory = sizeof(Slot)};
 }
 
 void Graph::changed(Node& node) noexcept {

@@ -1,6 +1,7 @@
 #pragma once
 #include <mm/slab.hpp>
 #include <uapi/mem.h>
+#include <uapi/task.h>
 #include <work.hpp>
 #include <op.hpp>
 
@@ -44,6 +45,15 @@ namespace mm {
 class VSpace;
 class VmOp;
 class Map;
+
+// Stable, caller-owned execution root relation. Quiesce borrows owner storage
+// only while delivering a stop; the relation itself never owns its caller.
+struct Exec final {
+    libk::intrusive_list_hook hook;
+    object::Key owner;
+    Source::Action stop;
+    bool stopping{};
+};
 
 struct ViewReq final {
     static constexpr usize max_pages = IPC_BUFFER_MAX_PAGES;
@@ -430,7 +440,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
         -> std::expected<Data, VSpaceError>;
     explicit VSpace(Data&&) noexcept;
     ~VSpace() noexcept;
-    void bind_work(WorkQueue& work, object::Key owner) noexcept { job_.bind(owner); settled_.bind_work(work, owner); }
+    void bind_work(WorkQueue& work, object::Key owner) noexcept { job_.bind(owner); settled_.bind_work(work, owner); exec_events_.bind_work(work, owner); }
 
     template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
@@ -452,6 +462,12 @@ class VSpace final : private libk::noncopyable_nonmovable {
             mappings_.charges(visit); binding_pool_.charges(visit); pages_.charges(visit); views_.charges(visit);
         }, [&] { std::swap(quota_, quota); });
     }
+    auto bind_exec(Exec&, object::Key, Source::Action) noexcept -> bool;
+    void unbind_exec(Exec&) noexcept;
+    auto fail_exec(u64 thread, ThreadExit) noexcept -> Source::Publication;
+    void stop_exec() noexcept;
+    auto exec_info() const noexcept -> ExecInfo;
+    auto exec_events() noexcept -> Source& { return exec_events_; }
     [[nodiscard]] auto state() const noexcept -> VSpaceState;
     auto info(u64) const noexcept -> VSpaceInfo;
     auto links(u64 cursor, u64 epoch, LinkRecords&) const noexcept -> status_t;
@@ -610,7 +626,12 @@ class VSpace final : private libk::noncopyable_nonmovable {
     libk::manual_lifetime<object::cleanup> cleanup_{};
     Work job_{};
     VSpaceState state_{VSpaceState::Live};
-    usize bindings_{};
+    usize bindings_{}; // Includes an Env being prepared before its stable Exec is bound.
+    libk::intrusive_list<Exec, &Exec::hook> execs_;
+    u64 exec_flags_{}, failed_thread_{};
+    ThreadExit failure_{};
+    Src<EXEC_FAILED | EXEC_STOPPING | EXEC_STOPPED> exec_events_{Source::Drained::bind<&VSpace::complete_cleanup>(*this)};
+    void advance_exec() noexcept;
     usize ipi_retries_{};
     resource::Usage table_charge_{};
 };

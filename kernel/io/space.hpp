@@ -111,10 +111,9 @@ public:
     auto state() const noexcept -> IoState;
     void bind_work(WorkQueue& work, object::Key owner) noexcept { job_.bind(owner); initialization_.bind(work, owner); bindings_.bind(owner); }
     void retire(object::cleanup&&) noexcept;
+    auto op() noexcept -> Op& { return initialization_; }
 private:
     enum class Phase : u8 { Empty, Prepared, Disabling, Queues, Directory, Ready, Stopping, Unmapping, Closed, Failed };
-    template<class T> auto read(usize) const noexcept -> T;
-    template<class T> void write(usize, T) noexcept;
     auto page() noexcept -> std::expected<mm::Page, status_t>;
     auto context(u32, bool) noexcept -> u64*;
     auto attach(Space&) noexcept -> status_t;

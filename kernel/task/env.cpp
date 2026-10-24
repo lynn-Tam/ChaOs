@@ -24,7 +24,7 @@ Env::User::User(User&& other) noexcept
       cspace_ref(std::move(other.cspace_ref)),
       vspace(std::exchange(other.vspace, nullptr)),
       cspace(std::exchange(other.cspace, nullptr)),
-      ipc(std::move(other.ipc)) {}
+      ipc(std::move(other.ipc)), exec(std::exchange(other.exec, nullptr)) {}
 
 auto Env::User::operator=(User&& other) noexcept
     -> User& {
@@ -34,7 +34,7 @@ auto Env::User::operator=(User&& other) noexcept
         cspace_ref = std::move(other.cspace_ref);
         vspace = std::exchange(other.vspace, nullptr);
         cspace = std::exchange(other.cspace, nullptr);
-        ipc = std::move(other.ipc);
+        ipc = std::move(other.ipc); exec = std::exchange(other.exec, nullptr);
     }
     return *this;
 }
@@ -48,6 +48,7 @@ void Env::User::reset() noexcept {
     mm::VSpace* const address_space = std::exchange(vspace, nullptr);
     cap::CSpace* const capability_space = std::exchange(cspace, nullptr);
     if (address_space != nullptr) {
+        if (exec) { address_space->unbind_exec(*exec); exec = nullptr; }
         address_space->detach_execution();
     }
     if (capability_space != nullptr) {
@@ -102,6 +103,14 @@ auto Env::user(
 
 auto Env::kernel_bound() const noexcept -> bool {
     return std::holds_alternative<Kernel>(roots_);
+}
+
+auto Env::bind_exec(mm::Exec& exec, object::Key owner, Source::Action stop) noexcept -> bool {
+    auto* user = std::get_if<User>(&roots_);
+    if (!user) return true;
+    if (!user->vspace->bind_exec(exec, owner, stop)) return false;
+    user->exec = &exec;
+    return true;
 }
 
 void Env::detach_user() noexcept {

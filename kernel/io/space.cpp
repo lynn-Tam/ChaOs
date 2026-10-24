@@ -1,3 +1,4 @@
+#include <io.hpp>
 #include <io/space.hpp>
 #include <cpu/cpu.hpp>
 #include <ipc/notification.hpp>
@@ -5,21 +6,6 @@
 #include <algorithm>
 
 namespace io {
-static constexpr usize Ddtp = 0x10, Cqb = 0x18, Cqh = 0x20, Cqt = 0x24;
-static constexpr usize Fqb = 0x28, Fqh = 0x30, Fqt = 0x34, Cqcsr = 0x48, Fqcsr = 0x4c, Ipsr = 0x54;
-static constexpr u32 On = 1 << 16, Busy = 1 << 17, CqErrors = 7 << 8, FqErrors = 3 << 8;
-
-template<class T> auto Iommu::read(usize offset) const noexcept -> T {
-    arch::io_fence();
-    const auto value = *reinterpret_cast<volatile const T*>(mapping_.address() + offset);
-    arch::io_fence();
-    return value;
-}
-template<class T> void Iommu::write(usize offset, T value) noexcept {
-    arch::io_fence();
-    *reinterpret_cast<volatile T*>(mapping_.address() + offset) = value;
-    arch::io_fence();
-}
 Iommu::Iommu(mm::Pmm& pmm, mm::KSpace& vm, Cpus& cpus, WorkQueue& work, const time::Clock& clock,
          object::ref<> quota, mm::Phys::Claim&& claim, object::ref<irq::Ctl> irq_owner,
          irq::Line line, IommuConfig config) noexcept
@@ -46,32 +32,28 @@ auto Iommu::page() noexcept -> std::expected<mm::Page, status_t> {
 }
 auto Iommu::context(u32 did, bool create) noexcept -> u64* {
     // Extended contexts: 6 DID bits per leaf, 9 per directory level.
-    const unsigned levels = config_.device_bits <= 6 ? 0 : config_.device_bits <= 15 ? 1 : 2;
+    const auto levels = arch::iommu_levels(config_.device_bits);
     auto page = directory_;
     for (unsigned level = levels; level; --level) {
-        auto* entry = reinterpret_cast<u64*>(storage_.bytes(page)) + ((did >> (6 + 9 * (level - 1))) & 511);
+        auto* entry = reinterpret_cast<u64*>(storage_.bytes(page)) + arch::iommu_index(did, level);
         auto value = __atomic_load_n(entry, __ATOMIC_ACQUIRE);
         if (!value) {
             if (!create) return nullptr;
             auto child = this->page();
             if (!child) return nullptr;
-            value = (child->raw() << 10) | 1;
+            value = arch::iommu_link(child->raw());
             __atomic_store_n(entry, value, __ATOMIC_RELEASE);
         }
-        page = mm::Page{value >> 10};
+        page = mm::Page{arch::iommu_page(value)};
     }
-    return reinterpret_cast<u64*>(storage_.bytes(page)) + (did & 63) * 8;
+    return reinterpret_cast<u64*>(storage_.bytes(page)) + arch::iommu_index(did, 0);
 }
 auto Iommu::open(object::ref<> cpu) noexcept -> status_t {
     const auto range = mm::Pages::from_aligned_bytes(mm::pa_t{config_.address}, 4096);
     if (!range || !claim_.covers(*range)) return STATUS_BAD_ARGS;
     if (!vm_.map(mapping_, *range, cpus_, current_cpu().id)) return STATUS_NO_MEMORY;
     mapped_ = true;
-    const auto caps = read<u64>(0);
-    // Coherent little-endian Sv39, extended contexts, wired interrupts.
-    if ((caps & 0xf0) != 0x10 || !(caps & (u64{1} << 9)) || !(caps & (u64{1} << 22)) ||
-        ((caps >> 28) & 3) == 0 || ((caps >> 28) & 3) == 3 || (read<u32>(8) & 5))
-        return STATUS_INVALID_OP;
+    if (!arch::iommu_caps(mapping_.address())) return STATUS_INVALID_OP;
     mm::Page* slots[]{&directory_, &commands_, &faults_};
     for (auto* slot : slots) {
         auto allocated = page();
@@ -93,9 +75,7 @@ auto Iommu::activate() noexcept -> status_t {
         if (!irq_.connect()) { status = STATUS_BUSY; return; }
         phase_ = Phase::Disabling;
         deadline_ = clock_.rd_ticks() + clock_.rd_freq();
-        write<u64>(Ddtp, 0);
-        write<u32>(Cqcsr, 0);
-        write<u32>(Fqcsr, 0);
+        arch::iommu_off(mapping_.address());
         status = STATUS_OK;
     };
     static_cast<void>(bindings_.publish(Source::Action::bind(commit)));
@@ -144,9 +124,10 @@ auto Iommu::sync(IoOp::Receipt& receipt, bool enable) noexcept -> status_t {
     sync::Lock lock{lock_};
     if (reassigning_) return STATUS_PENDING;
     if (phase_ != Phase::Ready) return STATUS_BACKING_FAILED;
-    if (read<u32>(Cqcsr) & CqErrors) { fail(); return STATUS_BACKING_FAILED; }
+    const auto polled = arch::iommu_poll(mapping_.address(), inflight_ ? inflight_->tail : tail_);
+    if (polled == arch::IoStep::Failed) { fail(); return STATUS_BACKING_FAILED; }
     if (inflight_) {
-        if (read<u32>(Cqh) != inflight_->tail) {
+        if (polled == arch::IoStep::Pending) {
             if (clock_.rd_ticks() >= deadline_) { fail(); return STATUS_BACKING_FAILED; }
             return STATUS_PENDING;
         }
@@ -157,24 +138,13 @@ auto Iommu::sync(IoOp::Receipt& receipt, bool enable) noexcept -> status_t {
     }
     auto* dc = context(domain.requester_, false);
     libk_assert(dc);
-    __atomic_store_n(&dc[0], u64{0}, __ATOMIC_RELEASE);
-    dc[1] = 0;
-    dc[2] = u64{domain.pscid_} << 12; // unique translation tag per live domain
-    dc[3] = enable ? (u64{8} << 60) | domain.root_->page().raw() : 0;
-    if (enable) __atomic_store_n(&dc[0], u64{1}, __ATOMIC_RELEASE);
-    auto* commands = reinterpret_cast<u64*>(storage_.bytes(commands_));
-    const u64 batch[]{u64{3} | (u64{1} << 33) | (u64{domain.requester_} << 40),
-                      u64{1}, u64{2} | (u64{1} << 12) | (u64{1} << 13)};
-    for (const auto command : batch) {
-        commands[tail_ * 2] = command;
-        commands[tail_ * 2 + 1] = 0;
-        tail_ = (tail_ + 1) & 255;
-    }
+    arch::iommu_context(dc, domain.pscid_, domain.root_->page().raw(), enable);
+    arch::iommu_commands(reinterpret_cast<u64*>(storage_.bytes(commands_)), tail_, domain.requester_);
     receipt.tail = tail_;
     receipt.submitted = true;
     inflight_ = &receipt;
     deadline_ = clock_.rd_ticks() + clock_.rd_freq();
-    write<u32>(Cqt, tail_);
+    arch::iommu_tail(mapping_.address(), tail_);
     return STATUS_PENDING;
 }
 void Iommu::fail() noexcept {
@@ -239,19 +209,17 @@ void Iommu::advance() noexcept {
         if (disconnected_.load(std::memory_order_acquire) || initialization_.canceled()) close();
         if (phase_ == Phase::Failed) return;
         if (phase_ == Phase::Ready && irq_pending_.exchange(false, std::memory_order_acq_rel)) {
-            write<u32>(Ipsr, 3);
-            const auto tail = read<u32>(Fqt), status = read<u32>(Fqcsr);
-            if (tail >= 128 || (status & FqErrors)) { fail(); return; }
+            const auto tail = arch::iommu_faults(mapping_.address());
+            if (tail == UINT32_MAX) { fail(); return; }
             while (fault_head_ != tail) {
-                const auto* record = reinterpret_cast<volatile const u64*>(storage_.bytes(faults_)) + fault_head_ * 4;
-                const auto did = static_cast<u32>(record[0] >> 40);
+                const auto did = arch::iommu_fault(storage_.bytes(faults_), fault_head_);
                 for (auto* d = domains_; d; d = d->next_) if (d->requester_ == did) {
                     d->closing_.store(true, std::memory_order_release);
                     work_.post(d->job_);
                 }
-                fault_head_ = (fault_head_ + 1) & 127;
+                fault_head_ = (fault_head_ + 1) & (arch::IoFaults - 1);
             }
-            write<u32>(Fqh, fault_head_);
+            arch::iommu_fault_head(mapping_.address(), fault_head_);
             rearm = true;
         }
         if (phase_ == Phase::Prepared) {
@@ -260,56 +228,47 @@ void Iommu::advance() noexcept {
         }
         if (closing_ && domains_) return;
         if (closing_ && phase_ != Phase::Empty && phase_ != Phase::Stopping && phase_ != Phase::Unmapping) {
-            write<u64>(Ddtp, 0);
-            write<u32>(Cqcsr, 0);
-            write<u32>(Fqcsr, 0);
+            arch::iommu_off(mapping_.address());
             deadline_ = clock_.rd_ticks() + clock_.rd_freq();
             phase_ = Phase::Stopping;
         }
         switch (phase_) {
         case Phase::Empty: phase_ = Phase::Unmapping; break;
-        case Phase::Disabling:
-            if ((read<u64>(Ddtp) & 16) || (read<u32>(Cqcsr) & (On | Busy)) || (read<u32>(Fqcsr) & (On | Busy))) break;
-            if (read<u64>(Ddtp) & 15) { fail(); return; }
-            write<u32>(8, 2);
-            if ((read<u32>(8) & 7) != 2) { fail(); return; }
-            write<u64>(0x2f8, read<u64>(0x2f8) & ~u64{0xff});
-            write<u64>(Cqb, (commands_.raw() << 10) | 7);
-            write<u64>(Fqb, (faults_.raw() << 10) | 6);
-            write<u32>(Cqt, 0);
-            write<u32>(Fqh, 0);
-            write<u32>(Cqcsr, 1);
-            write<u32>(Fqcsr, 1);
+        case Phase::Disabling: {
+            const auto status = arch::iommu_idle(mapping_.address());
+            if (status == arch::IoStep::Pending) break;
+            if (status == arch::IoStep::Failed) { fail(); return; }
+            if (!arch::iommu_queues(mapping_.address(), commands_.raw(), faults_.raw())) { fail(); return; }
             phase_ = Phase::Queues;
             break;
+        }
         case Phase::Queues: {
-            const auto cq = read<u32>(Cqcsr), fq = read<u32>(Fqcsr);
-            if ((cq & CqErrors) || (fq & FqErrors)) { fail(); return; }
-            if ((cq | fq) & Busy) break;
-            if (!(cq & On) || !(fq & On)) { fail(); return; }
+            const auto status = arch::iommu_queued(mapping_.address());
+            if (status == arch::IoStep::Pending) break;
+            if (status == arch::IoStep::Failed) { fail(); return; }
             if (!initialization_.commit()) { close(); work_.post(job_); return; }
-            const u64 mode = config_.device_bits <= 6 ? 2 : config_.device_bits <= 15 ? 3 : 4;
             auto commit = [&]() noexcept {
-                write<u64>(Ddtp, (directory_.raw() << 10) | mode);
+                arch::iommu_root(mapping_.address(), directory_.raw(), config_.device_bits);
                 phase_ = Phase::Directory;
             };
             if (!bindings_.publish(Source::Action::bind(commit))) { close(); post(); return; }
             break;
         }
-        case Phase::Directory:
-            if (read<u64>(Ddtp) & 16) break;
-            if (read<u64>(Ddtp) != ((directory_.raw() << 10) | (config_.device_bits <= 6 ? 2 : config_.device_bits <= 15 ? 3 : 4))) {
-                fail(); return;
-            }
-            write<u32>(Ipsr, 3);
-            write<u32>(Fqcsr, 3);
+        case Phase::Directory: {
+            const auto status = arch::iommu_active(mapping_.address(), directory_.raw(), config_.device_bits);
+            if (status == arch::IoStep::Pending) break;
+            if (status == arch::IoStep::Failed) { fail(); return; }
+            arch::iommu_irq_enable(mapping_.address());
             phase_ = Phase::Ready;
             break;
-        case Phase::Stopping:
-            if ((read<u64>(Ddtp) & 16) || (read<u32>(Cqcsr) & (On | Busy)) || (read<u32>(Fqcsr) & (On | Busy))) break;
-            if (read<u64>(Ddtp) & 15) { fail(); return; }
+        }
+        case Phase::Stopping: {
+            const auto status = arch::iommu_idle(mapping_.address());
+            if (status == arch::IoStep::Pending) break;
+            if (status == arch::IoStep::Failed) { fail(); return; }
             phase_ = Phase::Unmapping;
             break;
+        }
         default: break;
         }
         if (phase_ != Phase::Ready && phase_ != Phase::Unmapping && clock_.rd_ticks() >= deadline_) { fail(); return; }
@@ -355,6 +314,8 @@ void Iommu::complete() noexcept {
     work_.close(job_);
     cleanup.complete();
 }
+
+
 
 IoOp::IoOp(object::ref<> provider) noexcept
     : owner_(static_cast<Space*>(provider.get())), state_(std::move(provider), Source::Action::bind<&Space::post>(*owner_), Source::Action::bind<&Space::advance>(*owner_)),
@@ -474,7 +435,7 @@ auto Space::map(Op::Submission ctx, cap::Resolved<mm::Mem>& source, mm::ObjectRa
     if (!range.valid() || !range.within(source->page_count()) || !authorized || !authorized->range.contains(range) ||
         !authorized->perms.contains(perms) || !mm::valid_perms(perms) || perms.contains(mm::Perm::Execute) ||
         !perms.contains(mm::Perm::Read) || source->kind() != mm::BackingKind::Anonymous ||
-        iova % mm::page_size || iova >= mm::UserEnd || range.size() > (mm::UserEnd - (iova ? iova : mm::UserBegin)) / mm::page_size)
+        iova % mm::page_size || iova >= arch::IoEnd || range.size() > (arch::IoEnd - (iova ? iova : arch::IoBegin)) / mm::page_size)
         return std::unexpected(STATUS_BAD_ARGS);
     IoOp* op;
     {
@@ -488,7 +449,7 @@ auto Space::map(Op::Submission ctx, cap::Resolved<mm::Mem>& source, mm::ObjectRa
     }
     // Only these fixed preparations need the caller's Resolved capability.
     // Everything that may yield belongs to the accepted operation.
-    auto made = maps_.create(quota_, pmm_, *this, iova ? iova : mm::UserBegin, range.size());
+    auto made = maps_.create(quota_, pmm_, *this, iova ? iova : arch::IoBegin, range.size());
     status_t result = made ? STATUS_OK : STATUS_NO_MEMORY;
     if (made) {
         op->edit_->mapping = *made;
@@ -512,7 +473,7 @@ auto Space::map(Op::Submission ctx, cap::Resolved<mm::Mem>& source, mm::ObjectRa
 }
 
 auto Space::unmap(Op::Submission ctx, usize first, usize count) noexcept -> status_t {
-    if (!count || first < mm::UserBegin || first % mm::page_size || first >= mm::UserEnd || count > (mm::UserEnd - first) / mm::page_size)
+    if (!count || first < arch::IoBegin || first % mm::page_size || first >= arch::IoEnd || count > (arch::IoEnd - first) / mm::page_size)
         return STATUS_BAD_ARGS;
     sync::Lock lock{lock_};
     if (phase_ != Phase::Ready || active_ || preparing_ || closing_.load()) return STATUS_BUSY;
@@ -554,7 +515,7 @@ void Space::advance_edit(IoOp& op) noexcept {
             if (current && current->first < map->first + map->count * mm::page_size) {
                 if (!edit.automatic) { fail(STATUS_BUSY); return; }
                 map->first = current->first + current->count * mm::page_size;
-                if (map->first >= mm::UserEnd || map->count > (mm::UserEnd - map->first) / mm::page_size) {
+                if (map->first >= arch::IoEnd || map->count > (arch::IoEnd - map->first) / mm::page_size) {
                     fail(STATUS_NO_MEMORY); return;
                 }
             } else edit.phase = E::Pin;
@@ -619,7 +580,7 @@ auto Space::links(u64 cursor, u64 epoch, LinkRecords& out) const noexcept -> sta
     sync::Lock guard{lock_};
     if (map_epoch_ == std::numeric_limits<u64>::max() || (epoch && epoch != map_epoch_)) return STATUS_STALE;
     out = {}; out.version = 1; out.size = sizeof(out); out.epoch = map_epoch_;
-    auto* map = mappings_.lower_bound(cursor ? cursor : mm::UserBegin);
+    auto* map = mappings_.lower_bound(cursor ? cursor : arch::IoBegin);
     while (map && out.count < LINK_RECORD_PAGE) {
         out.records[out.count++] = {map->mem_link.id(), map->memory.id().value, map->grant.id().value,
             map->first, map->count * mm::page_size, map->offset,

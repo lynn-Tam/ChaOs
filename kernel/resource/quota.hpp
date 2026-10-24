@@ -1,7 +1,7 @@
 #pragma once
 
 #include <libk/types.hpp>
-#include <resource/budget.hpp>
+#include <resource/capacity.hpp>
 #include <expected>
 #include <array>
 #include <libk/scope_guard.hpp>
@@ -20,7 +20,7 @@ class Usage;
 
 // An empty quota denotes internal storage without quota usage. A nonempty quota must
 // name an open Quota; the returned usage owns its own structural reference.
-[[nodiscard]] auto acquire(const object::ref<>& quota, Budget amount) noexcept
+[[nodiscard]] auto acquire(const object::ref<>& quota, Capacity amount) noexcept
     -> std::expected<Usage, errc>;
 
 // A reservation of capacity before commit. It also owns the structural reference that
@@ -36,7 +36,7 @@ public:
         return owner_ != nullptr;
     }
 
-    [[nodiscard]] auto usage() const noexcept -> Budget { return usage_; }
+    [[nodiscard]] auto usage() const noexcept -> Capacity { return usage_; }
     [[nodiscard]] auto quota() const noexcept -> const object::ref<>& { return ref_; }
     // Commits this deduction without registering a new object allocation. The
     // returned token must follow the concrete reusable resource (a page,
@@ -51,7 +51,7 @@ private:
 
     Quota* owner_{};
     object::ref<> ref_{};
-    Budget usage_{};
+    Capacity usage_{};
 };
 
 // Deferred release token. Allocation is detached before its object storage slot
@@ -75,7 +75,7 @@ private:
     friend class Quota;
     Quota* owner_{};
     object::ref<> ref_{};
-    Budget usage_{};
+    Capacity usage_{};
 };
 
 // A movable claim for capacity already deducted from a Quota.  Usage
@@ -92,10 +92,10 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept {
         return owner_ != nullptr;
     }
-    [[nodiscard]] auto amount() const noexcept -> Budget { return amount_; }
+    [[nodiscard]] auto amount() const noexcept -> Capacity { return amount_; }
     auto quota() const noexcept -> const object::ref<>& { return ref_; }
 
-    [[nodiscard]] auto split(Budget part) noexcept -> Usage;
+    [[nodiscard]] auto split(Capacity part) noexcept -> Usage;
     void merge(Usage&& other) noexcept;
     // The destination quota has reserved all of the paused owner's usage. Publication
     // swaps only prepared refs; Allocation transfers the aggregate commitment.
@@ -113,7 +113,7 @@ private:
     friend class object::Control;
     Quota* owner_{};
     object::ref<> ref_{};
-    Budget amount_{};
+    Capacity amount_{};
 };
 
 // Object storage usage only; lifecycle membership is independent.
@@ -128,17 +128,17 @@ public:
         return owner_ != nullptr;
     }
 
-    [[nodiscard]] auto usage() const noexcept -> Budget { return usage_; }
+    [[nodiscard]] auto usage() const noexcept -> Capacity { return usage_; }
     [[nodiscard]] auto quota() const noexcept -> const object::ref<>& { return ref_; }
     // Mints a child usage from the same canonical pool. The returned
     // reservation owns a new structural hold; this attachment remains the
     // lineage fact but is not borrowed by the child allocation.
-    [[nodiscard]] auto reserve(Budget usage) const noexcept
+    [[nodiscard]] auto reserve(Capacity usage) const noexcept
         -> std::expected<Reservation, errc>;
     // Creates independently movable resource usage.  Unlike Allocation, 
     // Usage is not a new allocation root; it follows physical ownership and
     // keeps the source quota alive until its resource is really reusable.
-    [[nodiscard]] auto acquire(Budget usage) const noexcept
+    [[nodiscard]] auto acquire(Capacity usage) const noexcept
         -> std::expected<Usage, errc>;
     void commit(Reservation&& reservation) noexcept;
     void bind_control(object::Control&) noexcept;
@@ -154,7 +154,7 @@ private:
     friend class Quota;
     Quota* owner_{};
     object::ref<> ref_{};
-    Budget usage_{};
+    Capacity usage_{};
     object::Control* control_{};
     u64 epoch_{1};
     bool reassigning_{};
@@ -164,7 +164,7 @@ private:
 class Quota final : private libk::noncopyable_nonmovable {
 public:
     enum class Phase : u8 { Open = OBJECT_OPEN, Closing = OBJECT_CLOSING, Drained = OBJECT_DRAINED };
-    explicit Quota(Budget limit, Usage delegation = {}) noexcept;
+    explicit Quota(Capacity limit, Usage delegation = {}) noexcept;
     auto control() noexcept -> object::Control& { return control_; }
     template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
@@ -182,12 +182,12 @@ public:
         return transaction([&](auto&& visit) { visit(delegation_); }, [] {});
     }
     ~Quota() noexcept;
-    auto reserve(object::ref<> self, Budget amount) noexcept -> std::expected<Reservation, errc>;
-    template<class Publish> auto resize(const object::ref<>& self, Budget target,
-        const object::ref<>& source, Budget ceiling, Publish&& publish) noexcept -> status_t;
+    auto reserve(object::ref<> self, Capacity amount) noexcept -> std::expected<Reservation, errc>;
+    template<class Publish> auto resize(const object::ref<>& self, Capacity target,
+        const object::ref<>& source, Capacity ceiling, Publish&& publish) noexcept -> status_t;
     auto info(u64) const noexcept -> QuotaInfo;
-    auto limit() const noexcept -> Budget;
-    auto available() const noexcept -> Budget;
+    auto limit() const noexcept -> Capacity;
+    auto available() const noexcept -> Capacity;
     auto state() const noexcept -> Phase;
     auto close() noexcept -> Phase;
     void retire(object::cleanup&&) noexcept;
@@ -200,15 +200,15 @@ private:
     friend class Allocation;
     friend class object::Control;
     object::Control control_;
-    void cancel(Budget) noexcept;
+    void cancel(Capacity) noexcept;
     void commit() noexcept;
     void attach(Allocation&) noexcept;
     void detach(Allocation&) noexcept;
-    void release(Budget) noexcept;
+    void release(Capacity) noexcept;
     void service(bool close = false, object::cleanup cleanup = {}) noexcept;
     void complete_cleanup() noexcept;
     mutable sync::Spin lock_;
-    Budget limit_, available_;
+    Capacity limit_, available_;
     usize pending_{}, allocations_{};
     Phase phase_{Phase::Open};
     bool finishing_{}, reassigning_{};
@@ -221,8 +221,8 @@ private:
 // Cold transfer of unused capacity. Allocation and delegation are the sole
 // lineage facts; reserve/release retain their existing local cost.
 template<class Publish>
-auto Quota::resize(const object::ref<>& self, Budget target, const object::ref<>& source,
-    Budget ceiling, Publish&& publish) noexcept -> status_t {
+auto Quota::resize(const object::ref<>& self, Capacity target, const object::ref<>& source,
+    Capacity ceiling, Publish&& publish) noexcept -> status_t {
     if (self.get() != this) return STATUS_BAD_ARGS;
     auto* allocation = self.allocation();
     object::ref<> parent;
@@ -251,11 +251,11 @@ auto Quota::resize(const object::ref<>& self, Budget target, const object::ref<>
     if (phase_ == Phase::Drained) return STATUS_CLOSED;
     libk_assert((limit_.empty() && !delegation_) ||
         (delegation_.owner_ == &quota && delegation_.amount_ == limit_));
-    const Budget committed{limit_.memory - available_.memory, limit_.caps - available_.caps};
+    const Capacity committed{limit_.memory - available_.memory, limit_.caps - available_.caps};
     if (!target.contains(committed)) return STATUS_BUSY;
-    const Budget up{target.memory > limit_.memory ? target.memory - limit_.memory : 0,
+    const Capacity up{target.memory > limit_.memory ? target.memory - limit_.memory : 0,
         target.caps > limit_.caps ? target.caps - limit_.caps : 0};
-    const Budget down{target.memory < limit_.memory ? limit_.memory - target.memory : 0,
+    const Capacity down{target.memory < limit_.memory ? limit_.memory - target.memory : 0,
         target.caps < limit_.caps ? limit_.caps - target.caps : 0};
     const bool grow = !up.empty();
     if (grow) {

@@ -203,15 +203,15 @@ class Pmm {
         // Group ids never repeat; callers serialize the group lifetime itself.
         std::atomic<usize> tag;
         u32 gen{};
-        usize next{Nil};
+        usize next{Nil}, prev{Nil};
         static constexpr auto label(State state, usize owner) noexcept -> usize {
             return ((owner + 1) << 2) | static_cast<usize>(state);
         }
         Desc(State state, u32 gen = 0, usize next = Nil, usize owner = Nil) noexcept
             : tag(label(state, owner)), gen(gen), next(next) {}
-        Desc(const Desc& other) noexcept : tag(other.tag.load(std::memory_order_relaxed)), gen(other.gen), next(other.next) {}
+        Desc(const Desc& other) noexcept : tag(other.tag.load(std::memory_order_relaxed)), gen(other.gen), next(other.next), prev(other.prev) {}
         auto operator=(const Desc& other) noexcept -> Desc& {
-            gen = other.gen; next = other.next;
+            gen = other.gen; next = other.next; prev = other.prev;
             tag.store(other.tag.load(std::memory_order_relaxed), std::memory_order_release);
             return *this;
         }
@@ -226,7 +226,7 @@ class Pmm {
         static auto individual(u32 gen) noexcept -> Desc { return {State::Single, gen}; }
         static auto group(usize owner, usize next, u32 gen) noexcept -> Desc { return {State::Group, gen, next, owner}; }
     };
-    static_assert(sizeof(Desc) == 24);
+    static_assert(sizeof(Desc) == 32);
 
     struct Arena {
         Pages range{};
@@ -247,6 +247,7 @@ class Pmm {
     };
 
     [[nodiscard]] auto initialize() noexcept -> InitializationResult;
+    auto descriptor(usize id) noexcept -> Desc&;
     [[nodiscard]] auto descriptor_at(Arena& arena, usize index) noexcept -> Desc&;
     [[nodiscard]] auto descriptor_at(const Arena& arena, usize index) const noexcept -> const Desc&;
     [[nodiscard]] static auto page_at(const Arena& arena, usize index) noexcept -> Page;
@@ -306,7 +307,8 @@ class PageGroup {
     [[nodiscard]] auto bytes(Page page) const noexcept -> const byte*;
 
     [[nodiscard]] auto allocate() noexcept -> Pmm::GroupAllocateResult;
-    // Transfers the source chain, relabelling its descriptors in O(n).
+    // Caller exclusively owns both groups. Transfers the source chain,
+    // relabelling descriptors in O(n) outside the global PMM lock.
     void append(PageGroup&&) noexcept;
     [[nodiscard]] auto grow(size_t page_count) noexcept -> bool;
     // Transfers one page out of the group without releasing the frame.  This

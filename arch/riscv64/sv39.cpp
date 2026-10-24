@@ -1,4 +1,4 @@
-#include "table.hpp"
+#include <mm/table.hpp>
 #include <new>
 
 namespace mm {
@@ -61,7 +61,8 @@ auto PageTable::cpu_root() const noexcept -> usize {
 
 auto PageTable::walk(mm::VPage va) const noexcept -> std::expected<Walk, PtErr> {
     const usize addr = va.base().raw();
-    if (!arch::pt_canonical(addr) || (kind_ != Kind::Kernel && !mm::is_user(va.base())))
+    if (kind_ == Kind::Device ? addr >= arch::IoEnd
+        : !arch::pt_canonical(addr) || (kind_ == Kind::User && !mm::is_user(va.base())))
         return std::unexpected(PtErr::BadAddr);
     Walk w{};
     auto page = root_;

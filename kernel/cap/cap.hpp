@@ -5,7 +5,7 @@
 
 #include <variant>
 #include <mm/types.hpp>
-#include <resource/budget.hpp>
+#include <resource/capacity.hpp>
 #include <expected>
 #include <object/ref.hpp>
 #include <libk/types.hpp>
@@ -112,7 +112,7 @@ using MemLimit = Limit<mm::ObjectRange>;
 using VmLimit = Limit<mm::VRange>;
 
 struct QuotaLimit final {
-    resource::Budget budget{};
+    resource::Capacity budget{};
     u64 object_kinds{};
 
     [[nodiscard]] friend constexpr auto operator==(

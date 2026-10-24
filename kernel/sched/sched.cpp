@@ -1,6 +1,5 @@
 #include <mm/slab.hpp>
-#include <sched/sc.hpp>
-#include <op.hpp>
+#include <sched/sched.hpp>
 #include <sched/dispatcher.hpp>
 #include <cpu/cpu.hpp>
 #include <algorithm>
@@ -105,20 +104,10 @@ auto Budget::configure(u64 amount, u64 period, usize capacity, u64 now) noexcept
 }
 
 Domain::Local::Local(Domain& owner, CpuId cpu) noexcept
-    : owner(owner), cpu(cpu), node{.domain = &owner, .weight = owner.config_.weight},
-      refill(Deadline::Fn::bind<&Local::wake>(*this)),
-      worker(Env::kernel(*owner.cpus_.get(cpu)->idle().env().kernel_vspace()), {run, this}, &owner) {
-    worker.bind_work(*owner.work_, owner.close_work_.key());
-}
+    : owner(owner), cpu(cpu), node{.domain=&owner, .weight=owner.config_.weight},
+      work{.parent=&node, .domain=&owner, .work=true},
+      refill(Deadline::Fn::bind<&Local::wake>(*this)) {}
 void Domain::Local::wake() noexcept { current_cpu().dispatcher().domain_ready(*this); }
-void Domain::Local::run(void* p) noexcept {
-    auto& local = *static_cast<Local*>(p);
-    for (;;) {
-        if (local.owner.accepting()) (void)local.owner.ordinary_.run(1);
-        if (local.owner.ordinary_.arm(local.cpu)) sched::block();
-        else sched::yield();
-    }
-}
 Domain::Domain(mm::Pmm& pmm, Cpus& cpus, Config config) noexcept
     : pmm_(pmm), cpus_(cpus), count_(cpus.count()),
       config_(config.cpus ? config : Config{.cpus = count_ >= 64 ? ~u64{} : (u64{1} << count_) - 1}),
@@ -127,7 +116,7 @@ Domain::Domain(mm::Pmm& pmm, Cpus& cpus, Config config) noexcept
     libk_assert(count_ && valid_config(config_));
 }
 Domain::~Domain() noexcept {
-    libk_assert(!contexts_ && !ops_ && !children_ && !parent_ && !next_parent_ && !pending_children_ && parent_binding_[0].drained() && parent_binding_[1].drained() && !pending_mail_ && !cleanup_);
+    libk_assert(!contexts_ && !works_ && !children_ && !parent_ && !next_parent_ && !pending_children_ && parent_binding_[0].drained() && parent_binding_[1].drained() && !pending_mail_ && !cleanup_);
     if (work_) work_->close(close_work_);
     for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (nodes_[cpu]) {
         libk_assert(!nodes_[cpu]->active && nodes_[cpu]->node.ready.empty() && !nodes_[cpu]->node.hook.is_linked());
@@ -136,7 +125,7 @@ Domain::~Domain() noexcept {
 }
 auto Domain::open() noexcept -> status_t {
     static_assert(MaxCpus * sizeof(Local*) <= mm::page_size);
-    auto fee = resource::acquire(quota_, {.memory = mm::page_size});
+    auto fee = resource::acquire(alloc_quota_, {.memory = mm::page_size});
     if (!fee) return STATUS_NO_MEMORY;
     auto page = pmm_.allocate_page();
     if (!page) return STATUS_NO_MEMORY;
@@ -145,10 +134,9 @@ auto Domain::open() noexcept -> status_t {
     std::ranges::fill(nodes_, nullptr);
     ordinary_.bind(WorkQueue::Wake::bind<&Domain::wake_work>(*this));
     for (usize cpu = 0; cpu < nodes_.size(); ++cpu) {
-        auto made = locals_.create(quota_, *this, CpuId{cpu});
+        auto made = locals_.create(alloc_quota_, *this, CpuId{cpu});
         if (!made) return STATUS_NO_MEMORY;
         nodes_[cpu] = *made;
-        libk_assert(nodes_[cpu]->worker.claim_home(cpus_.get(CpuId{cpu})->dispatcher()));
         if (cpu < 64 && (config_.cpus & (u64{1} << cpu))) libk_assert(ordinary_.arm(CpuId{cpu}));
     }
     return STATUS_OK;
@@ -159,20 +147,54 @@ void Domain::wake_work(CpuId cpu) noexcept {
             const auto config = info(0);
             cpu = CpuId{static_cast<usize>(std::countr_zero(config.cpus))};
         }
-        static_cast<void>(local(cpu).worker.execution(true));
-        static_cast<void>(sched::wake(cpus_, local(cpu).worker));
+        cpus_.get(cpu)->dispatcher().post(local(cpu));
     }
     else post_close();
 }
-auto Domain::post(Work& work) noexcept -> status_t {
+auto Domain::post(Work& work, libk::delegate<bool() noexcept> check) noexcept -> status_t {
     if (!work.cancelable()) return STATUS_BAD_ARGS;
     auto ticket = object::ref<>::retain_alive(work.key());
     std::optional<CpuId> wake;
     { sync::Lock guard{tree_lock_};
       if (!lineage_admitting()) return STATUS_CLOSED;
+      if (check && !check()) return STATUS_CLOSED;
       wake = ordinary_.enqueue(work, std::move(ticket));
     }
     ordinary_.wake(wake); return STATUS_OK;
+}
+auto Domain::commit(Source::Action publish) noexcept -> bool {
+    sync::Lock guard{tree_lock_};
+    if (!lineage_admitting()) return false;
+    publish(); return true;
+}
+auto Domain::admit(Work::Link& link, libk::delegate<status_t() noexcept> publish) noexcept -> status_t {
+    sync::Lock guard{tree_lock_};
+    if (!lineage_admitting()) return STATUS_CLOSED;
+    libk_assert(!link.linked_ && !link.flights_);
+    const auto status = publish();
+    if (status != STATUS_OK) return status;
+    link.next_ = works_; link.prev_ = nullptr;
+    if (works_) works_->prev_ = &link;
+    works_ = &link; link.linked_ = true;
+    return STATUS_OK;
+}
+auto Domain::release(Work::Link& link) noexcept -> bool {
+    {
+        sync::Lock guard{tree_lock_};
+        if (link.flights_) return false;
+        if (link.linked_) {
+            if (closing_work_ == &link) closing_work_ = link.next_;
+            if (link.prev_) link.prev_->next_ = link.next_; else works_ = link.next_;
+            if (link.next_) link.next_->prev_ = link.prev_;
+            link.prev_ = link.next_ = nullptr; link.linked_ = false;
+        }
+    }
+    post_close(); return true;
+}
+auto Domain::withdraw(Work& work, bool permanent) noexcept -> object::ref<> {
+    object::ref<> ticket;
+    { sync::Lock guard{tree_lock_}; ticket = ordinary_.close(work, permanent); }
+    post_close(); return ticket;
 }
 auto Domain::attach(cap::Resolved<Domain>& parent_cap) noexcept -> status_t {
     auto parent = parent_cap.reference();
@@ -357,7 +379,7 @@ auto Domain::close() noexcept -> u32 {
     { sync::Lock guard{tree_lock_};
       if (phase_ == DOMAIN_OPEN || phase_ == DOMAIN_CONFIGURING) {
           phase_.store(DOMAIN_CLOSING, std::memory_order_release);
-          closing_child_ = children_; closing_pending_ = pending_children_; closing_sc_ = contexts_; closing_op_ = ops_;
+          closing_child_ = children_; closing_pending_ = pending_children_; closing_sc_ = contexts_; closing_work_ = works_;
           if (pending_config_ || next_parent_) { pending_config_.reset(); applied_ = requested_; config_status_ = STATUS_CANCELED; }
           publication = events_.prepare(DOMAIN_CLOSING, true);
           changed = true;
@@ -425,22 +447,20 @@ void Domain::finish_close() noexcept {
     { sync::Lock guard{tree_lock_}; closing = phase_ == DOMAIN_CLOSING || phase_ == DOMAIN_DRAINED; }
     if (!closing) return;
     if (ordinary_.run(8, true)) { post_close(); return; }
-    for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (nodes_[cpu] && !nodes_[cpu]->worker.stop_requested())
-        nodes_[cpu]->worker.stop();
     // Initiate every real child relation in finite batches; do not wait for one
     // unresponsive home before requesting the others to drain.
     for (usize step = 0; step < 8; ++step) {
         object::ref<Sc> sc;
         object::ref<Domain> child;
-        bool canceled{};
+        Work::Link* claimed{};
+        object::ref<> execution;
+        Work::Fn cancel, ready;
         { sync::Lock guard{tree_lock_};
           if (phase_ != DOMAIN_CLOSING && phase_ != DOMAIN_DRAINED) return;
-          if (closing_op_) {
-              auto& op = *closing_op_; closing_op_ = op.cpu_next_;
-              // The index lock keeps an inline control record from being
-              // reused. Only publish prepaid intent; no provider executes here.
-              if (op.cancel() == STATUS_TOO_LATE) op.wake();
-              canceled = true;
+          if (closing_work_) {
+              claimed = closing_work_; closing_work_ = claimed->next_;
+              execution = object::ref<>::retain_alive(claimed->owner_);
+              ++claimed->flights_; cancel = claimed->cancel_; ready = claimed->ready_;
           } else if (closing_child_) {
               child = object::ref<Domain>::retain_alive(closing_child_->close_work_.key());
               closing_child_ = closing_child_->next_;
@@ -452,16 +472,20 @@ void Domain::finish_close() noexcept {
               closing_sc_ = closing_sc_->next_;
           }
         }
-        if (child) static_cast<void>(child->close());
+        if (claimed) {
+            cancel();
+            { sync::Lock guard{tree_lock_}; libk_assert(claimed->flights_); --claimed->flights_; }
+            ready(); // Last record access precedes wake and possible provider completion.
+        } else if (child) static_cast<void>(child->close());
         else if (sc) {
             { sync::Lock guard{sc->lock_}; sc->withdrawing_ = true; }
             sc->post_close();
-        } else if (!canceled) break;
+        } else break;
         if (step == 7) { post_close(); return; }
     }
     { sync::Lock guard{tree_lock_};
-      if ((phase_ != DOMAIN_CLOSING && phase_ != DOMAIN_DRAINED) || contexts_ || ops_ || children_ || pending_children_ || pending_mail_) return;
-      for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (nodes_[cpu] && (!nodes_[cpu]->stopped || !nodes_[cpu]->worker.stopped())) return;
+      if ((phase_ != DOMAIN_CLOSING && phase_ != DOMAIN_DRAINED) || contexts_ || works_ || children_ || pending_children_ || pending_mail_) return;
+      for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (nodes_[cpu] && !nodes_[cpu]->stopped) return;
       if (!ordinary_.drained()) return;
     }
     if (!parent_binding_[0].close() || !parent_binding_[1].close()) return;
@@ -717,107 +741,3 @@ void Sc::finish_close() noexcept {
 
 } // namespace sched
 
-// Accepted work keeps its original CPU quota independently of the submitting
-// Thread/SC. Both the provider and this Domain link share final Gate admission.
-auto Op::admit_cpu(Publish publish) noexcept -> status_t {
-    auto domain = cpu_.as<sched::Domain>();
-    if (!domain) return STATUS_BAD_ARGS;
-    sync::Lock guard{sched::Domain::tree_lock_};
-    if (!domain->get().lineage_admitting()) return STATUS_CLOSED;
-    const auto status = publish();
-    if (status != STATUS_OK) return status;
-    auto& owner = domain->get();
-    cpu_next_ = owner.ops_;
-    if (cpu_next_) cpu_next_->cpu_previous_ = this;
-    owner.ops_ = this; cpu_admitted_ = true;
-    return STATUS_OK;
-}
-auto Op::schedule() noexcept -> bool {
-    object::ref<> cpu;
-    { sync::Lock guard{lock_}; cpu = cpu_; }
-    auto domain = cpu.as<sched::Domain>();
-    if (!domain) return false;
-    auto ticket = object::ref<>::retain_alive(runner_->key());
-    std::optional<CpuId> wake;
-    auto& owner = domain->get();
-    {
-        sync::Lock topology{sched::Domain::tree_lock_};
-        sync::Lock guard{lock_};
-        if (cpu_.id() != cpu.id() || phase_ == OP_DONE || phase_ == OP_DRAINING || safety_ || canceled_
-            || !owner.lineage_admitting()) return false;
-        wake = owner.ordinary_.enqueue(*runner_, std::move(ticket));
-    }
-    owner.ordinary_.wake(wake);
-    return true;
-}
-void Op::run() noexcept {
-    object::ref<> provider;
-    Source::Action progress;
-    { sync::Lock guard{lock_}; provider = provider_; progress = progress_; }
-    if (progress) progress();
-}
-void Op::cancel_work() noexcept {
-    object::ref<> cpu, ticket;
-    { sync::Lock guard{lock_}; cpu = cpu_; }
-    if (auto domain = cpu.as<sched::Domain>()) {
-        sync::Lock topology{sched::Domain::tree_lock_};
-        sync::Lock guard{lock_};
-        if (cpu_.id() == cpu.id()) {
-            safety_ = true;
-            if (phase_ == OP_ACCEPTED) canceled_ = true;
-            ticket = domain->get().ordinary_.close(*runner_, runner_ == &job_);
-        }
-    }
-    wake(); // Committed work continues only its safety tail on maintenance.
-}
-void Op::release_cpu() noexcept {
-    object::ref<> cpu, released, ticket;
-    { sync::Lock guard{lock_}; cpu = cpu_; }
-    auto domain = cpu.as<sched::Domain>();
-    if (!domain) return;
-    auto& owner = domain->get();
-    {
-        sync::Lock topology{sched::Domain::tree_lock_};
-        sync::Lock guard{lock_};
-        released = std::move(cpu_); progress_ = {};
-        ticket = owner.ordinary_.close(*runner_, runner_ == &job_);
-        if (cpu_admitted_) {
-            if (owner.closing_op_ == this) owner.closing_op_ = cpu_next_;
-            if (cpu_previous_) cpu_previous_->cpu_next_ = cpu_next_; else owner.ops_ = cpu_next_;
-            if (cpu_next_) cpu_next_->cpu_previous_ = cpu_previous_;
-            cpu_previous_ = cpu_next_ = nullptr; cpu_admitted_ = false;
-        }
-    }
-    owner.post_close();
-}
-
-auto Op::commit() noexcept -> bool {
-    object::ref<> cpu;
-    { sync::Lock guard{lock_}; cpu = cpu_; }
-    auto domain = cpu.as<sched::Domain>();
-    std::optional<sync::Lock<sync::Spin>> topology;
-    if (domain) topology.emplace(sched::Domain::tree_lock_);
-    bool committed{};
-    auto publish = [&]() noexcept {
-        sync::Lock guard{lock_};
-        libk_assert(phase_ == OP_ACCEPTED);
-        if (canceled_ || safety_ || (domain && !domain->get().lineage_admitting())) return;
-        phase_ = OP_COMMITTED; committed = true;
-    };
-    (void)bindings_.publish(Source::Action::bind(publish));
-    return committed;
-}
-
-auto Op::start(object::ref<> cpu, const object::ref<>& self, cap::Graph::Admission admission,
-    std::span<const object::ref<>*> gates, Source::Action install, const cap::GrantPin* provider_grant) noexcept -> status_t {
-    cpu_domain(std::move(cpu));
-    auto admitted = [&]() noexcept {
-        auto commit = [&]() noexcept { accept(); if (install) install(); };
-        return bindings_.admit([&](std::span<cap::Attachment*> cells, Source::Action publish) noexcept {
-            const cap::Graph::Attach items[]{{provider_grant, cells[0], provider_grant ? nullptr : &self},
-                {nullptr, cells[1], &cpu_}};
-            return admission.attach(items, gates, publish) ? STATUS_OK : STATUS_CLOSED;
-        }, Source::Action::bind(commit));
-    };
-    return admit_cpu(Publish::bind(admitted));
-}

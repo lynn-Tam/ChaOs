@@ -1,10 +1,12 @@
 {
   "objects": {
     "input": {
-      "kind": "Channel"
+      "kind": "Channel",
+      "caps": 3
     },
     "output": {
-      "kind": "Channel"
+      "kind": "Channel",
+      "caps": 3
     },
     "images": {
       "kind": "Quota",
@@ -98,7 +100,9 @@
         "children": true,
         "kinds": {
           "$const": "OBJ_KINDS"
-        }
+        },
+        "max_bytes": 33554432,
+        "max_caps": 1280
       },
       "exports": [
         "block",

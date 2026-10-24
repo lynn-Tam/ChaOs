@@ -20,6 +20,24 @@ struct ThreadInit {
 static_assert(sizeof(ThreadInit) == 104);
 #endif
 
+#define EXIT_NORMAL 1U
+#define EXIT_FAULT 2U
+#define EXIT_STOP 3U
+struct ThreadExit {
+    uint32_t origin, kind;
+    int32_t status;
+    uint32_t reserved;
+    uint64_t pc, address;
+};
+#define EXEC_FAILED 1U
+#define EXEC_STOPPING 2U
+#define EXEC_STOPPED 4U
+struct ExecInfo {
+    uint32_t version, size;
+    uint64_t flags, sequence, thread;
+    struct ThreadExit failure;
+};
+
 #define SC_BOUND 1U
 #define SC_WITHDRAWING 2U
 

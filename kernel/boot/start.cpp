@@ -116,9 +116,9 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     libk_assert(domain->get().open() == STATUS_OK);
     boot.domain = std::move(*domain).publish();
 
-    // This is capacity deliberately withheld from userspace commitments. It
-    // pays for CPU runtime, cleanup executor and future kernel progress after the
-    // root pool has promised the remaining capacity to init.
+    // Headroom in the logical capacity offered to init. This does not reserve
+    // PMM frames: later physical allocation can still fail. Accepted teardown
+    // uses the storage prepaid by its original operation.
     constexpr usize system_base_pages = 256;
     constexpr usize system_pages_per_cpu = 64;
     const usize system_pages = system_base_pages
@@ -130,7 +130,7 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     boot.scope = std::move(*scope).publish();
     auto owner = object::Scope::reserve(boot.scope);
     libk_assert(owner);
-    auto root = boot.objects.get<resource::Quota>().create(std::move(*owner), resource::Reservation{}, resource::Budget{
+    auto root = boot.objects.get<resource::Quota>().create(std::move(*owner), resource::Reservation{}, resource::Capacity{
         .memory = static_cast<u64>(free_pages - system_pages)
             * mm::page_size,
         .caps = 4096,
@@ -145,14 +145,15 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     auto& runtime = *boot.cpus.get(Cpus::boot_id());
     boot.work.bind(WorkQueue::Wake::bind<&Cpus::wake_work>(boot.cpus));
     for (usize id = 0; id < boot.cpus.count(); ++id) start_worker(boot, *boot.cpus.get(CpuId{id}));
+    object::ref<Thread> initial;
     if (boot_info.module) {
         libk_assert(state.module);
-        const auto started = boot_root(boot, runtime, boot_info,
+        auto started = boot_root(boot, runtime, boot_info,
             std::move(*state.module), std::move(state.firmware));
         if (!started)
             console::print<"root task failed: {}\n">(static_cast<u8>(started.error()));
         libk_assert(started);
-        console::print<"root init: started\n">();
+        initial = std::move(*started);
     } else {
         libk_assert(boot.pmm.reclaim(std::move(state.firmware)));
     }
@@ -160,6 +161,11 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     runtime.install(runtime.hw.raw);
     console::print<"trap install ok\n">();
     boot.cpus.start();
+    if (initial) {
+        libk_assert(initial->execution(true));
+        initial.reset();
+        console::print<"root init: started\n">();
+    }
     runtime.dispatcher().enter_idle();
 }
 

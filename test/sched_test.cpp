@@ -6,12 +6,11 @@
 #include <utility>
 #include <mm/kspace.hpp>
 #include <mm/pmm.hpp>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <mm/mem.hpp>
 #include <mm/vspace.hpp>
 #include <mm/pager.hpp>
 #include <boot/info.hpp>
-#include <sched/sc.hpp>
 #include <sched/sched.hpp>
 #include <task/thread.hpp>
 
@@ -118,24 +117,28 @@ private:
 };
 
 bool test_refill_conserves_and_delays_budget(const TestContext&) noexcept {
-    sched::Budget aggregate{10, 100};
-    auto first = aggregate.reserve(0, 7), second = aggregate.reserve(0, 7);
-    const auto reserved = aggregate.info(0);
-    if (first.amount != 7 || second.amount != 3 || reserved.available || reserved.escrow != 10)
-        return false;
-    aggregate.settle(first, 3, 8);
-    aggregate.settle(second, 5, 5);
-    const auto used = aggregate.info(5);
-    if (used.balance + used.refill + used.escrow != 10 || used.debt != 3
-        || used.available || aggregate.info(103).available != 5 || aggregate.info(132).available != 5 || aggregate.info(133).available != 10)
-        return false;
-    sched::Budget repeated{10, 100};
-    for (u64 now : {0U, 200U, 400U}) {
-        const auto loan = repeated.reserve(now, 10);
-        if (loan.amount != 10) return false;
-        repeated.settle(loan, now, 20);
-        if (repeated.info(now + 199).available || repeated.info(now + 200).available != 10)
+    {
+        sched::Budget aggregate{10, 100};
+        auto first = aggregate.reserve(0, 7), second = aggregate.reserve(0, 7);
+        const auto reserved = aggregate.info(0);
+        if (first.amount != 7 || second.amount != 3 || reserved.available || reserved.escrow != 10)
             return false;
+        aggregate.settle(first, 3, 8);
+        aggregate.settle(second, 5, 5);
+        const auto used = aggregate.info(5);
+        if (used.balance + used.refill + used.escrow != 10 || used.debt != 3
+            || used.available || aggregate.info(103).available != 5 || aggregate.info(132).available != 5 || aggregate.info(133).available != 10)
+            return false;
+    }
+    {
+        sched::Budget repeated{10, 100};
+        for (u64 now : {0U, 200U, 400U}) {
+            const auto loan = repeated.reserve(now, 10);
+            if (loan.amount != 10) return false;
+            repeated.settle(loan, now, 20);
+            if (repeated.info(now + 199).available || repeated.info(now + 200).available != 10)
+                return false;
+        }
     }
     Sc queue{{.budget=10, .period=100,
               .refill_capacity=4}, 0};
@@ -238,11 +241,11 @@ bool test_resource_pool_refunds_after_object_reclaim(
         return false;
     }
 
-    constexpr resource::Budget limit{
+    constexpr resource::Capacity limit{
         .memory = 3 * mm::page_size,
         .caps = 4,
     };
-    constexpr resource::Budget charge{
+    constexpr resource::Capacity charge{
         .memory = mm::page_size,
         .caps = 1,
     };
@@ -262,7 +265,7 @@ bool test_resource_pool_refunds_after_object_reclaim(
         auto reserved = pool->reserve(std::move(self), charge);
         if (!reserved
             || pool->available()
-                != resource::Budget{
+                != resource::Capacity{
                     .memory = limit.memory - charge.memory,
                     .caps = limit.caps - charge.caps}) {
             return false;
@@ -285,7 +288,7 @@ bool test_resource_pool_refunds_after_object_reclaim(
         return false;
     }
     auto memory = std::move(pending_memory).value().publish();
-    const resource::Budget after_backing{
+    const resource::Capacity after_backing{
         .memory = limit.memory - charge.memory,
         .caps = limit.caps - charge.caps,
     };
@@ -338,17 +341,17 @@ bool test_resource_pool_child_returns_transferred_budget(
         return false;
     }
 
-    constexpr resource::Budget parent_limit{
+    constexpr resource::Capacity parent_limit{
         .memory = 16 * mm::page_size,
         .caps = 16,
     };
-    constexpr resource::Budget child_limit{
+    constexpr resource::Capacity child_limit{
         .memory = 4 * mm::page_size,
         .caps = 4,
     };
     // The child owns its delegated budget. Its pool capacity is a
     // separate parent-funded cost and returns with the child object.
-    constexpr resource::Budget transfer{
+    constexpr resource::Capacity transfer{
         .memory = mm::page_size,
     };
     auto pending_parent = sched_test_tasks->get<resource::Quota>().create(parent_limit);
@@ -374,7 +377,7 @@ bool test_resource_pool_child_returns_transferred_budget(
     }
     auto child = std::move(pending_child).value().publish();
 
-    constexpr resource::Budget object_charge{
+    constexpr resource::Capacity object_charge{
         .memory = mm::page_size,
         .caps = 1,
     };
@@ -424,8 +427,8 @@ bool test_resource_pool_child_returns_transferred_budget(
 bool test_group_close_waits_for_reservation(const TestContext&) noexcept {
     SchedStorageGuard storage{};
     if (!storage.initialize()) return false;
-    constexpr resource::Budget limit{.memory = 2 * mm::page_size, .caps = 2};
-    constexpr resource::Budget charge{.memory = mm::page_size, .caps = 1};
+    constexpr resource::Capacity limit{.memory = 2 * mm::page_size, .caps = 2};
+    constexpr resource::Capacity charge{.memory = mm::page_size, .caps = 1};
     auto pending = sched_test_tasks->get<resource::Quota>().create(limit);
     if (!pending) return false;
     auto group = pending->publish();

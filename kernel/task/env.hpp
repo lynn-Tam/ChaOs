@@ -50,6 +50,7 @@ class Env final : private libk::noncopyable {
         mm::VSpace* vspace{};
         cap::CSpace* cspace{};
         std::optional<mm::View> ipc{};
+        mm::Exec* exec{};
 
     private:
         friend class Env;
@@ -86,6 +87,7 @@ public:
     // Terminal user execution releases its effective roots independently of
     // Thread object lifetime. Stale diagnostic/capability references may keep
     // the Thread slot alive, but can no longer pin its VSpace or CSpace.
+    auto bind_exec(mm::Exec&, object::Key, Source::Action) noexcept -> bool;
     void detach_user() noexcept;
     [[nodiscard]] auto root() noexcept -> mm::Root;
     [[nodiscard]] auto kernel_vspace() const noexcept -> mm::KSpace*;

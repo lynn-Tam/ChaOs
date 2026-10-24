@@ -30,7 +30,6 @@ private:
     void dispatch() noexcept;
     void set(u32, bool) noexcept;
     auto take() noexcept -> u32;
-    auto word(usize offset) const noexcept -> volatile u32*;
     void progress() noexcept;
     void post() noexcept { work_.post(job_); }
     void invalidated() noexcept { auto self = object::ref<>::retain_alive(job_.key()); static_cast<void>(self.destroy()); }

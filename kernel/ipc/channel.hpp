@@ -123,6 +123,7 @@ public:
         -> std::expected<u64, ChannelError>;
     auto call(cap::Resolved<Channel>&, cap::CSpace&, const ChanMsg&, cap::Resolved<Channel>&) noexcept -> std::expected<u64, ChannelError>;
     auto cancel(cap::Resolved<Channel>&, u64 token, bool discard) noexcept -> bool;
+    auto drop(cap::Resolved<Channel>&, u64 sequence) noexcept -> status_t;
     [[nodiscard]] auto receive(
         cap::Resolved<Channel>& cap,
         cap::CSpace& destination,

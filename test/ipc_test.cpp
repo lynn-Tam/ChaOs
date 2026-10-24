@@ -1,6 +1,7 @@
 #include <task/thread.hpp>
 #include <irq/irq.hpp>
 #include <test/test.hpp>
+#include <libk/manual_lifetime.hpp>
 
 #include <cap/cap.hpp>
 #include <ipc/notification.hpp>
@@ -164,12 +165,14 @@ void register_ipc_tests(TestRegistry& registry) noexcept {
             auto drained = []() noexcept {};
             const auto deliver = libk::delegate<void(WaitResult) noexcept>::bind(receive);
             const auto done = Source::Drained::bind(drained);
-            std::array<std::optional<Source::Watch>, 20> watches;
+            static constinit libk::manual_lifetime<std::array<std::optional<Source::Watch>, 20>> storage;
+            auto& watches = storage.emplace();
             for (auto& watch : watches) watch.emplace(deliver, done);
             libk::scope_exit cleanup{[&]() noexcept {
                 for (auto& watch : watches) watch->detach();
                 source.close();
                 while (work.run()) {}
+                storage.reset();
             }};
             auto install = [](auto commit) noexcept { commit(); return STATUS_OK; };
             for (auto& watch : watches)

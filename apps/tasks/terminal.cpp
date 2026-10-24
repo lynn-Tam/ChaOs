@@ -76,17 +76,21 @@ auto ft_terminal::present(const ftxui::Component& component) -> status_t {
 }
 auto ft_terminal::flush() -> status_t {
     for (size_t budget = 0; sent_ < pending_.size() && budget < 8; ++budget) {
-        const auto count = std::min(pending_.size() - sent_, size_t{56});
-        ubus_msg frame;
-        frame.data.put("focus", focus_).put("data", std::as_bytes(std::span{pending_.data() + sent_, count}));
-        const auto status = control_.notify("Frame", std::move(frame), false);
+        io_frame frame; frame.size = std::min(pending_.size() - sent_, io_stream_limit);
+        ::memcpy(frame.data, pending_.data() + sent_, frame.size);
+        const auto status = output_.send(control_.endpoint(), frame, false, *control_.token("Frame"), focus_);
+        if (status == STATUS_STALE) { focused_ = false; return reset(); }
         if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
+            if (output_.active()) {
+                const auto status = writable_.close();
+                return status == STATUS_OK ? STATUS_WOULD_BLOCK : status;
+            }
             const auto armed = writable_ ? writable_.arm().status : writable_.open(port_, control_.endpoint(),
                 SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
             return armed == STATUS_OK ? STATUS_WOULD_BLOCK : armed;
         }
         if (status != STATUS_OK) return status;
-        sent_ += count;
+        sent_ += frame.size;
     }
     if (sent_ < pending_.size()) return STATUS_PENDING;
     if (!pending_.empty()) { frame_ = std::move(next_frame_); pending_.clear(); sent_ = 0; }

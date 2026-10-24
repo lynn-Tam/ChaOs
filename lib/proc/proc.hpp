@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <expected>
 #include <vm.hpp>
 #include <libk/cpio.hpp>
@@ -18,30 +19,33 @@ inline constexpr word_t proc_base_kinds = OBJ_BIT(ObjThread) | OBJ_BIT(ObjSc) | 
 struct proc_quota {
     word_t bytes{1024 * 1024}, caps{256}, kinds{proc_base_kinds};
     word_t slots{128}, pages{20}, quota_perms{RIGHT_CREATE | RIGHT_INSPECT};
-    word_t watches{64}, hints{16}, threads{64};
+    word_t watches{64}, hints{16};
     word_t max_bytes{}, max_caps{}; // Zero keeps that dimension's initial ceiling.
 };
 struct proc_auth { CreateAuth alloc{}; uint32_t cpus{}; cap_t domain{}; };
 
+struct proc_result {
+    int code{};
+    uint64_t thread{};
+    ThreadExit exit{.origin=EXIT_NORMAL, .kind=0, .status=STATUS_OK, .reserved=0, .pc=0, .address=0};
+};
+
 class proc_task {
-    enum class state { New, Running, Closing, Consumed };
+    enum class state { New, Running, Stopping, Exited, Closing, Drained };
+    enum watch { Cpu, Life, Exec, Scope, Quota, Watches };
     state state_{};
-    status_t status_{};
-    bool closing_{};
+    bool retiring_{}, dirty_{true};
+    proc_result result_;
     cap_owner quota_, scope_, vm_, cs_, thread_, sc_, domain_;
     ch_pair lifecycle_;
-    struct observer { cap_owner thread; ev_watch exit; uint64_t id{}; word_t role{}; };
-    std::vector<observer> threads_;
-    size_t thread_limit_{};
-    uint64_t vm_id_{}, initial_id_{};
     word_t cpus_{};
     cap_t events_{};
     mutable uint64_t cpu_at_{};
     mutable status_t cpu_status_{};
     mutable std::pair<uint64_t, std::vector<uint64_t>> cpu_;
-    std::array<ev_watch, 4> watches_;
+    std::array<ev_watch, Watches> watches_;
+    auto quiesce(int) noexcept -> status_t;
     auto close() noexcept -> status_t;
-    auto supervise(cap_owner, word_t role, bool reap = false) -> status_t;
 public:
     proc_task() = default;
     proc_task(const proc_task&) = delete;
@@ -56,20 +60,22 @@ public:
     auto lifecycle() const noexcept -> cap_t { return lifecycle_.ends[1].selector(); }
     auto initial_thread() const noexcept -> cap_t { return thread_.selector(); }
     auto initial_sc() const noexcept -> cap_t { return sc_.selector(); }
-    auto closing() const noexcept -> bool { return state_ == state::Closing; }
+    auto drained() const noexcept -> bool { return state_ == state::Drained; }
+    auto closing() const noexcept -> bool { return state_ >= state::Stopping; }
     auto open(const proc_auth&, const proc_quota&) noexcept -> status_t;
     auto prepare(cap_t desc, cap_t events, uint32_t cpu) noexcept -> status_t;
     auto start() noexcept -> status_t;
     auto execution_info() const noexcept -> std::expected<DomainInfo, status_t>;
-    auto execution(bool enabled) noexcept -> sys::SysResult { return sys::domain_execution(domain(), enabled); }
-    auto cpu_info() const -> std::expected<std::pair<uint64_t, std::vector<uint64_t>>, status_t>;
+    auto execution(bool enabled) noexcept -> sys::SysResult { dirty_ = true; return sys::domain_execution(domain(), enabled); }
+    auto cpu_info(word_t interval) const -> std::expected<std::pair<uint64_t, std::vector<uint64_t>>, status_t>;
     auto memory_info() const noexcept -> std::expected<VSpaceInfo, status_t>;
     auto resource_info() const noexcept -> std::expected<QuotaInfo, status_t>;
-    auto observe() noexcept -> sys::SysResult;
-    auto stop(status_t reason = STATUS_CANCELED) noexcept -> status_t;
-    auto poll() noexcept -> status_t;
-    auto polling() const noexcept -> bool { return quota_ && (!events_ || (state_ == state::Closing && !(watches_[2] && watches_[3]))); }
-    auto collect() noexcept -> sys::SysResult;
+    auto pending() const noexcept -> bool { return dirty_ || polling() || std::ranges::any_of(watches_, [](const auto& watch) { return watch.pending(); }); }
+    // One finite step. True means resources drained; result() never advances.
+    auto step() noexcept -> std::expected<bool, status_t>;
+    auto result() const noexcept -> std::optional<proc_result> { return state_ >= state::Exited ? std::optional{result_} : std::nullopt; }
+    auto retire(int reason = STATUS_CANCELED) noexcept -> status_t;
+    auto polling() const noexcept -> bool { return quota_ && (!events_ || (state_ <= state::Stopping ? !watches_[Exec] : scope_ ? !watches_[Scope] : !watches_[Quota])); }
 };
 
 #include <variant>

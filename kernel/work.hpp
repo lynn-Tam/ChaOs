@@ -12,10 +12,25 @@
 
 // An embedded Work has a weak owner key. Each queued/running callback owns a
 // storage Ref until it returns; static boot/pool work needs no owner ticket.
+namespace sched { class Domain; }
 class Source;
 class Work final : private libk::noncopyable_nonmovable {
 public:
     using Fn = libk::delegate<void() noexcept>;
+    // Accepted work is indexed independently of a specific operation protocol.
+    // Domain claims cancellation under its index lock, then calls outside it;
+    // release waits for the claimed callback before the record can be reused.
+    struct Link final : private libk::noncopyable_nonmovable {
+        friend class sched::Domain;
+        Link(Fn cancel, Fn ready) noexcept : cancel_(cancel), ready_(ready) {}
+        void bind(object::Key owner) noexcept { owner_ = owner; }
+    private:
+        Link* prev_{}, *next_{};
+        object::Key owner_;
+        Fn cancel_, ready_;
+        bool linked_{};
+        usize flights_{};
+    };
     constexpr Work() noexcept = default;
     constexpr explicit Work(Fn fn, Fn cancel = {}) noexcept : fn_(fn), cancel_(cancel) {}
     auto cancelable() const noexcept -> bool { return bool(cancel_); }

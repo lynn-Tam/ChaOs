@@ -13,13 +13,9 @@ def main():
     disk_image = None
     timeout = 5
     fail_sector = None
-    second_disk = False
     report = None
-    while extra_markers and extra_markers[0] in ("--bundle", "--disk", "--timeout", "--fail-sector", "--second-disk", "--report"):
+    while extra_markers and extra_markers[0] in ("--bundle", "--disk", "--timeout", "--fail-sector", "--report"):
         option = extra_markers.pop(0)
-        if option == "--second-disk":
-            second_disk = True
-            continue
         value = extra_markers.pop(0)
         if option == "--report":
             report = value
@@ -45,18 +41,11 @@ def main():
             config = pathlib.Path(directory) / "blkdebug.conf"
             config.write_text(f'[inject-error]\nevent = "read_aio"\nerrno = "5"\nsector = "{fail_sector}"\n')
             disk_source = f"blkdebug:{config}:{disk}"
-        if second_disk:
-            other = pathlib.Path(directory) / "probe2.img"
-            with other.open("wb") as stream:
-                stream.truncate(1024 * 1024)
         for count in cpus.split(","):
             command = [qemu, "-machine", "virt,iommu-sys=on", "-nographic",
                        "-bios", "default", "-kernel", kernel, "-smp", count,
                        "-drive", f"if=none,id=disk,format=raw,readonly=on,file={disk_source}",
                        "-device", "virtio-blk-pci,addr=1,drive=disk,disable-legacy=on,iommu_platform=on"]
-            if second_disk:
-                command += ["-drive", f"if=none,id=disk2,format=raw,readonly=on,file={other}",
-                            "-device", "virtio-blk-pci,addr=2,drive=disk2,disable-legacy=on,iommu_platform=on"]
             if bundle is not None:
                 command += ["-initrd", bundle]
             try:

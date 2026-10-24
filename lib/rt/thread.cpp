@@ -1,6 +1,6 @@
 #include <thread.hpp>
+#include <ipc.hpp>
 #include <vm.hpp>
-#include <rpc.hpp>
 #include <mutex>
 #include <atomic>
 #include <bit>
@@ -21,21 +21,23 @@ struct rt_storage {
     ev_watch stopped;
 };
 struct rt_record {
-    rt_record* next{};
+    rt_record* next{}, *pending_next{};
     std::atomic<unsigned> refs{2};
     rt_thread id{};
     rt_entry entry{};
     void* argument{};
     std::unique_ptr<rt_storage> storage;
-    uint32_t watched{}, reaped{};
-    status_t watch_status{};
+    uint32_t reaped{};
     void* result{};
     bool internal{}, detached{}, joining{};
-    std::atomic<bool> canceled{};
-    std::atomic<bool> finished{}, published{};
+    std::atomic<bool> published{};
 };
 static constinit rt_mutex registry_mutex, key_mutex;
 static rt_record* records;
+static rt_record* pending;
+static rt_record** pending_tail = &pending;
+static size_t pending_count;
+static cap_t reaper_events;
 static rt_key* keys;
 static unsigned next_key;
 static uint64_t next_id{1};
@@ -79,13 +81,7 @@ static void rt_unmap(vm_area& area) {
     if (status != STATUS_OK) sys::exit(status);
     rt_destroy(memory);
 }
-static auto rt_register(rt_record&, word_t) -> status_t;
 static void rt_reclaim(rt_record& record) {
-    if (!record.canceled.load(std::memory_order_acquire)) {
-        // Destroy invalidates external Observe grants: retire their observer first.
-        const auto acknowledged = rt_register(record, rt_life_reap);
-        if (acknowledged != STATUS_OK) sys::exit(acknowledged);
-    }
     auto& storage = *record.storage;
     const auto status = storage.stopped.close(); if (status != STATUS_OK) sys::exit(status);
     if (storage.context) for (auto selector : {storage.context->events, storage.context->park}) if (selector) {
@@ -94,18 +90,6 @@ static void rt_reclaim(rt_record& record) {
     rt_unmap(storage.stack); rt_unmap(storage.ipc);
     rt_destroy(storage.sc); rt_destroy(storage.thread);
     record.storage.reset();
-}
-static auto rt_register(rt_record& record, word_t operation = rt_life_register) -> status_t {
-    const word_t words[]{rt_life_version, operation, record.internal};
-    const CapXfer cap{record.storage->thread.selector(), RIGHT_OBSERVE | RIGHT_INSPECT, CAP_COPY, 0};
-    rpc_op call;
-    auto status = call.begin(rt_startup().lifecycle, rt_startup().alloc(), 0, words, std::span{&cap, 1});
-    if (status != STATUS_OK) return status;
-    ch_packet reply;
-    while ((status = call.poll(reply)) == STATUS_WOULD_BLOCK) {
-        const auto waited = call.wait(); if (waited != STATUS_OK) return waited;
-    }
-    return status != STATUS_OK ? status : reply.word_count == 1 ? static_cast<status_t>(reply.words[0]) : STATUS_PEER_FAULT;
 }
 static void rt_signal_reaper() {
     if (reaper_notice) {
@@ -182,54 +166,56 @@ static auto rt_prepare(rt_entry entry, void* argument, const rt_thread_attr& att
     }
     if (status != STATUS_OK) {
         if (record->storage->thread) rt_stop(record->storage->thread.selector());
-        record->canceled.store(true, std::memory_order_relaxed); rt_reclaim(*record);
+        rt_reclaim(*record);
         delete record; return std::unexpected(status);
     }
     return record;
+}
+static void rt_enqueue(rt_record& record) {
+    record.pending_next = nullptr;
+    *pending_tail = &record; pending_tail = &record.pending_next; ++pending_count;
 }
 static auto rt_reaper(void*) -> void* {
     auto& notice = *reaper_notice;
     __atomic_store_n(&reaper_ready, 1, __ATOMIC_RELEASE); rt_wake(&reaper_ready, true);
     for (;;) {
         (void)notice.take();
-        uint64_t cursor{};
-        for (;;) {
-            rt_record* record{};
+        size_t count;
+        { std::lock_guard lock{registry_mutex}; count = pending_count; }
+        while (count--) {
+            rt_record* record;
             {
                 std::lock_guard lock{registry_mutex};
-                for (auto* item = records; item; item = item->next)
-                    if (!item->internal && item->storage && item->id > cursor && (!record || item->id < record->id)) record = item;
-                if (record) record->refs.fetch_add(1, std::memory_order_relaxed);
+                record = pending; pending = record->pending_next; --pending_count;
+                if (!pending) pending_tail = &pending;
             }
-            if (!record) break;
-            cursor = record->id;
-            if (!__atomic_load_n(&record->watched, __ATOMIC_ACQUIRE)) {
-                record->watch_status = record->storage->stopped.open(rt_events(), record->storage->thread.selector(), THREAD_STOPPED);
-                __atomic_store_n(&record->watched, 1, __ATOMIC_RELEASE); rt_wake(&record->watched, true);
+            if (!record->storage->stopped.pending()) {
+                std::lock_guard lock{registry_mutex}; rt_enqueue(*record); continue;
             }
-            if ((record->watch_status == STATUS_OK || record->canceled.load(std::memory_order_acquire)) && !__atomic_load_n(&record->reaped, __ATOMIC_ACQUIRE)) {
-                const auto facts = sys::source_info(record->storage->thread.selector());
-                if (facts.status != STATUS_OK) sys::exit(facts.status);
-                if (facts.value & THREAD_STOPPED) {
-                    if (!record->finished.load(std::memory_order_acquire) && !record->canceled.load(std::memory_order_acquire)) sys::exit(STATUS_INTERNAL);
-                    rt_reclaim(*record);
-                    bool remove{}, last{};
-                    {
-                        std::lock_guard lock{registry_mutex};
-                        last = !--users;
-                        if (last) { rt_thread none{}; (void)exit_owner.compare_exchange_strong(none, rt_thread_self(), std::memory_order_acq_rel); }
-                        __atomic_store_n(&record->reaped, 1, __ATOMIC_RELEASE);
-                        if (record->detached) { rt_unlink(record); remove = true; }
-                    }
-                    rt_wake(&record->reaped, true);
-                    if (remove) rt_release(record);
-                    rt_release(record);
-                    if (last) rt_exit(0);
-                    continue;
-                }
-                if (const auto status = record->storage->stopped ? record->storage->stopped.arm().status : STATUS_OK; status != STATUS_OK) sys::exit(status);
+            const auto facts = sys::source_info(record->storage->thread.selector());
+            if (facts.status != STATUS_OK) sys::exit(facts.status);
+            if (!(facts.value & THREAD_STOPPED)) {
+                const auto status = record->storage->stopped.arm().status;
+                if (status != STATUS_OK) sys::exit(status);
+                std::lock_guard lock{registry_mutex}; rt_enqueue(*record);
+                continue;
             }
-            rt_release(record);
+            // A native fault is supervised at the VSpace. The reaper never
+            // invents success or frees a stack while its Thread can still run.
+            rt_reclaim(*record);
+            bool remove, last;
+            {
+                std::lock_guard lock{registry_mutex};
+                last = !--users;
+                if (last) { rt_thread none{}; (void)exit_owner.compare_exchange_strong(none, rt_thread_self(), std::memory_order_acq_rel); }
+                __atomic_store_n(&record->reaped, 1, __ATOMIC_RELEASE);
+                remove = record->detached;
+                if (remove) rt_unlink(record);
+            }
+            rt_wake(&record->reaped, true);
+            if (remove) rt_release(record);
+            rt_release(record); // The pending queue's reference transfers to this step.
+            if (last) rt_exit(0);
         }
         if (const auto status = notice.arm(); status != STATUS_OK) sys::exit(status);
         const auto status = ev_wait(rt_events()).status;
@@ -247,19 +233,24 @@ static auto rt_make_reaper() -> status_t {
     if (status == STATUS_OK) {
         auto port = sys::port_create(rt_startup().alloc(), 64, 16);
         record.storage->context->events = port.value;
+        reaper_events = port.value;
         if (port.status == STATUS_PENDING) port.status = op_wait(port.value).status;
         status = port.status;
         if (status == STATUS_OK) status = notice->open(rt_startup().alloc(), port.value);
     }
-    if (status == STATUS_OK) status = rt_register(record);
+    rt_record* initial;
+    { std::lock_guard registry{registry_mutex}; initial = rt_find(1); }
+    if (status == STATUS_OK) status = initial->storage->stopped.open(reaper_events, initial->storage->thread.selector(), THREAD_STOPPED);
     if (status != STATUS_OK) {
         { std::lock_guard registry{registry_mutex}; rt_unlink(&record); }
         rt_stop(record.storage->thread.selector());
         delete notice;
-        record.canceled.store(true, std::memory_order_relaxed); rt_reclaim(record);
+        (void)initial->storage->stopped.close();
+        reaper_events = 0; rt_reclaim(record);
         delete &record; return status;
     }
     reaper_notice = notice; // Execution owns this one lazily allocated doorbell.
+    { std::lock_guard registry{registry_mutex}; initial->refs.fetch_add(1, std::memory_order_relaxed); rt_enqueue(*initial); }
     record.published.store(true, std::memory_order_release);
     const auto enabled = sys::execution_set(record.storage->thread.selector(), true).status;
     if (enabled != STATUS_OK) sys::exit(enabled);
@@ -268,7 +259,7 @@ static auto rt_make_reaper() -> status_t {
     return STATUS_OK;
 }
 void rt_thread_init() {
-    if (!rt_startup().lifecycle) return;
+    if (!rt_initial().thread) return;
     const auto& initial = rt_initial();
     auto* record = new rt_record;
     record->storage = std::make_unique<rt_storage>();
@@ -289,13 +280,15 @@ extern "C" [[noreturn]] void rt_thread_boot(rt_record* record) {
     auto& current = rt_current();
     current.ipc = record->storage->ipc.address; current.tid = record->id; current.thread = record; record->storage->context = &current;
     // Exit may win after creation's last check but before this first dispatch.
-    rt_thread_exit(!record->internal && exit_owner.load(std::memory_order_acquire)
-        ? nullptr : record->entry(record->argument));
+    auto* result = !record->internal && exit_owner.load(std::memory_order_acquire)
+        ? nullptr : record->entry(record->argument);
+    if (record->internal) sys::exit(STATUS_INTERNAL);
+    rt_thread_exit(result);
 }
 auto rt_thread_self() noexcept -> rt_thread { return rt_current().tid; }
 auto rt_thread_create(rt_entry entry, void* argument, const rt_thread_attr& attr) -> std::expected<rt_thread, status_t> {
     if (!entry || !attr.stack_size || attr.stack_size > SIZE_MAX / 2 || attr.guard_size > SIZE_MAX / 2) return std::unexpected(STATUS_BAD_ARGS);
-    if (!rt_startup().lifecycle || exit_owner.load(std::memory_order_acquire)) return std::unexpected(STATUS_DENIED);
+    if (!rt_current().thread || exit_owner.load(std::memory_order_acquire)) return std::unexpected(STATUS_DENIED);
     if (!rt_current().park) {
         const auto park = sys::notification_create(rt_startup().alloc(), 1);
         if (park.status != STATUS_OK) return std::unexpected(park.status);
@@ -305,24 +298,23 @@ auto rt_thread_create(rt_entry entry, void* argument, const rt_thread_attr& attr
     auto prepared = rt_prepare(entry, argument, attr, false);
     if (!prepared) return std::unexpected(prepared.error());
     auto* record = *prepared;
-    rt_signal_reaper();
-    while (!__atomic_load_n(&record->watched, __ATOMIC_ACQUIRE)) (void)rt_wait32(&record->watched, 0);
-    auto status = record->watch_status;
-    if (status == STATUS_OK) status = rt_register(*record);
+    auto status = record->storage->stopped.open(reaper_events, record->storage->thread.selector(), THREAD_STOPPED);
+    const auto id = record->id;
+    if (status == STATUS_OK) {
+        record->published.store(true, std::memory_order_release);
+        status = sys::execution_set(record->storage->thread.selector(), true).status;
+    }
     if (status != STATUS_OK) {
-        record->canceled.store(true, std::memory_order_release);
-        { std::lock_guard lock{registry_mutex}; record->detached = false; }
-        rt_stop(record->storage->thread.selector());
-        rt_signal_reaper();
-        while (!__atomic_load_n(&record->reaped, __ATOMIC_ACQUIRE)) (void)rt_wait32(&record->reaped, 0);
-        { std::lock_guard lock{registry_mutex}; rt_unlink(record); }
+        // The creator still owns all heavy resources; no queue sees this record.
+        rt_stop(record->storage->thread.selector()); rt_reclaim(*record);
+        { std::lock_guard lock{registry_mutex}; rt_unlink(record); --users; }
         rt_release(record); rt_release(record); return std::unexpected(status);
     }
-    const auto id = record->id;
-    if (exit_owner.load(std::memory_order_acquire)) rt_exit(0);
-    record->published.store(true, std::memory_order_release);
-    status = sys::execution_set(record->storage->thread.selector(), true).status;
-    if (status != STATUS_OK) sys::exit(status);
+    {
+        std::lock_guard lock{registry_mutex};
+        record->refs.fetch_add(1, std::memory_order_relaxed); rt_enqueue(*record);
+    }
+    rt_signal_reaper();
     rt_release(record);
     return id;
 }
@@ -383,7 +375,7 @@ void rt_thread_fini() {
 [[noreturn]] void rt_thread_exit(void* result) {
     auto* record = static_cast<rt_record*>(rt_current().thread);
     if (!record) rt_exit(0);
-    rt_thread_fini(); record->result = result; record->finished.store(true, std::memory_order_release);
+    rt_thread_fini(); record->result = result;
     if (!__atomic_load_n(&reaper_ready, __ATOMIC_ACQUIRE)) rt_exit(0);
     sys::exit(STATUS_OK);
 }
@@ -398,7 +390,7 @@ void rt_thread_fini() {
     }
     rt_thread_fini(); rt_finalize(); rt_thread_fini();
     if (rt_startup().lifecycle) {
-        const word_t message[]{rt_life_version, rt_life_exit, word_t(status)};
+        const word_t message[]{rt_life_version, word_t(status)};
         const auto sent = ch_send(rt_startup().lifecycle, message).status;
         if (sent != STATUS_OK) sys::exit(sent);
         sys::exit(STATUS_OK);

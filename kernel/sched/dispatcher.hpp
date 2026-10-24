@@ -11,7 +11,6 @@
 #include <libk/noncopyable.hpp>
 #include <optional>
 #include <limits>
-#include <sched/sc.hpp>
 #include <sched/sched.hpp>
 #include <time.hpp>
 #include <uapi/abi.h>
@@ -89,7 +88,7 @@ private:
 
     void enqueue(Thread&) noexcept;
     void remove(Thread&) noexcept;
-    Thread* select(u64) noexcept;
+    Thread* select(u64&) noexcept;
     void detach(Thread&) noexcept;
     auto maintenance(const Thread&) const noexcept -> bool;
     void charge_to(u64 now) noexcept;
@@ -130,13 +129,13 @@ private:
     Thread* idle_{};
     time::Clock* clock_{};
     Sc* current_sc_{};
-    Node* current_branch_{};
+    Node* current_branch_{}, *current_work_{};
     Budget::Loan loan_{};
     struct Ticket { Domain* domain; Budget::Loan loan; };
     std::array<Ticket, Domain::max_depth> tickets_{};
     usize ticket_count_{};
     u64 duration_{};
-    auto reserve(Thread&, u64) noexcept -> bool;
+    auto reserve(Node*, Sc*, u64) noexcept -> bool;
     void settle(u64) noexcept;
     void drain_domains() noexcept;
     u64 loan_elapsed_{};
@@ -151,7 +150,7 @@ private:
     Node::Queue ready_;
     void insert(Node&) noexcept;
     void erase(Node&) noexcept;
-    void domain_ready(Domain::Local&) noexcept;
+    void domain_ready(Domain::Local&, bool resched = true) noexcept;
     libk::intrusive_list<Thread, &Thread::maintenance_hook_> maintenance_ready_{};
     Sc maintenance_;
     std::atomic<u64> fair_{};

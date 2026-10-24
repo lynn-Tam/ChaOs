@@ -52,13 +52,13 @@ CALL(SC_CREATE, 52, sc_create, Create) /* a1=domain, a2=budget ns, a3=period ns,
 CALL(THREAD_CREATE, 53, thread_create, Create) /* a1=VSpace, a2=CSpace, a3=start memory, a4=offset, a5=home cpu */
 CALL(NOTIFICATION_CREATE, 54, notification_create, Create) /* a1=immutable signal badge */
 CALL(CHANNEL_CREATE, 58, channel_create, Create) /* a1=queue, a2=max words, a3=max caps, a4=relations; PENDING returns both ends, SOURCE_OP observes initialization */
-CALL(PAGER_CREATE, 59, pager_create, Create) /* a0=ResourcePool */
+CALL(PAGER_CREATE, 59, pager_create, Create) /* a0=Quota */
 CALL(MEMORY_CREATE_PAGER, 61, memory_create_pager, Create) /* a1=bytes, a2=access, a3=pager, a4=flags, a5=prepaid page records; PENDING returns Mem, SOURCE_OP observes initialization */
-CALL(MEMORY_CREATE_PHYSICAL, 55, memory_create_physical, Create) /* a0=pool, a1=Phys(Create), a2=PA, a3=bytes, a4=perms */
-CALL(IRQ_CONTROLLER_CREATE, 56, irq_controller_create, Create) /* a0=pool, a1=Phys(Control), a2=config Memory, a3=offset */
-CALL(IRQ_CREATE, 57, irq_create, Create) /* a0=pool, a1=controller(Create), a2=source */
-CALL(IOMMU_CREATE, 60, iommu_create, Create) /* a0=pool, a1=Phys(Control), a2=config Memory, a3=offset */
-CALL(IO_SPACE_CREATE, 62, io_space_create, Create) /* a0=pool, a1=controller(Create), a2=requester */
+CALL(MEMORY_CREATE_PHYSICAL, 55, memory_create_physical, Create) /* a0=Quota, a1=Phys(Create), a2=PA, a3=bytes, a4=perms */
+CALL(IRQ_CONTROLLER_CREATE, 56, irq_controller_create, Create) /* a0=Quota, a1=Phys(Control), a2=config Memory, a3=offset */
+CALL(IRQ_CREATE, 57, irq_create, Create) /* a0=Quota, a1=controller(Create), a2=source */
+CALL(IOMMU_CREATE, 60, iommu_create, Create) /* a0=Quota, a1=Phys(Control), a2=config Memory, a3=offset */
+CALL(IO_SPACE_CREATE, 62, io_space_create, Create) /* a0=Quota, a1=controller(Create), a2=requester */
 
 CALL(SCOPE_CREATE, 63, scope_create, Create) /* a0=Quota, a6=parent Scope */
 CALL(SCOPE_CLOSE, 71, scope_close, Call)
@@ -96,6 +96,7 @@ CALL(CHANNEL_TRY_RECV, 121, channel_recv, Ipc) /* a0=Channel, message in IPC buf
 CALL(CHANNEL_CALL, 122, channel_send, Ipc) /* a0=request endpoint, a1=reply sender root; IPC request; value=call token */
 CALL(CHANNEL_CANCEL, 123, channel_cancel, Ipc) /* a0=reply receiver (Receive|Close), a1=call token, a2=CHANNEL_DISCARD or 0 */
 CALL(CHANNEL_CLOSE, 124, channel_close, Ipc) /* a0=Channel */
+CALL(CHANNEL_DROP, 125, channel_drop, Ipc) /* a0=receiver, a1=expected head sequence; no cap slots required */
 CALL(CHANNEL_MINT, 127, channel_mint, Ipc) /* a0=side root, a1=dest CSpace, a2=badge, a3=rights */
 
 /* One system monotonic domain across CPUs; returns ticks or Hz.
@@ -120,4 +121,6 @@ CALL(IO_SPACE_CLOSE, 149, io_call, Call) /* a0=domain; commits deny and retireme
 
 CALL(SCOPE_QUERY, 150, scope_query, Call) /* a0=Scope(Inspect), a1=Object ID, a2=facet, a3=cursor, a4=epoch, a5=IPC offset; typed result */
 
+CALL(VSPACE_STOP, 152, vm_exec, Call) /* a0=whole VSpace(Control); irreversible execution quiesce */
+CALL(VSPACE_EXIT, 153, vm_exec, Call) /* a0=whole VSpace(Observe), a1=IPC offset; ExecInfo */
 CALL(DOMAIN_EXECUTION, 151, domain_configure, Call) /* a0=Domain(Control), a1=enabled; returns intent sequence */

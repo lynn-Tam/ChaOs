@@ -5,39 +5,89 @@
 #include <cap.hpp>
 #include <start.hpp>
 #include <span>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string.h>
 
-// Hints only prompt a recheck of provider facts. Overflow requires observing
-// every subscription before acknowledging the rescan epoch.
+// Native watch generations route hints; cached events never replace provider
+// facts. Storage is admitted with the watch, so delivery allocates nothing.
+struct ev_port {
+    struct entry { PortEvent event{}; uint64_t covered{}, seen{}; bool dirty{}, first{true}, observed{}; };
+    rt_mutex mutex;
+    std::map<word_t, entry> watches;
+    word_t epoch{}, last{}, limit{};
+    bool scanned{};
+};
+inline constinit rt_mutex ev_mutex;
+inline auto ev_ports() -> auto& {
+    // Runtime coordination outlives C++ finalizers and all executing threads.
+    static auto* ports = new std::map<cap_t, std::weak_ptr<ev_port>>;
+    return *ports;
+}
+inline auto ev_state(cap_t port, bool create = false) -> std::shared_ptr<ev_port> {
+    std::lock_guard lock{ev_mutex};
+    const auto found = ev_ports().find(port);
+    auto state = found == ev_ports().end() ? std::shared_ptr<ev_port>{} : found->second.lock();
+    if (!state && create) { state = std::make_shared<ev_port>(); ev_ports()[port] = state; }
+    return state;
+}
 inline auto ev_wait(cap_t port, word_t deadline = 0) noexcept -> sys::SysResult {
-    auto result = sys::wait_one(port, PORT_READABLE | PORT_OVERFLOW, 0, deadline);
-    if (result.status != STATUS_OK) return result;
+    const auto state = ev_state(port);
+    if (!state) return sys::wait_one(port, PORT_READABLE | PORT_OVERFLOW, 0, deadline);
     for (;;) {
-        const auto taken = sys::port_take(port);
-        if (taken.status == STATUS_RETRY) break;
-        if (taken.status != STATUS_OK) return taken;
+        {
+            std::lock_guard lock{state->mutex};
+            for (size_t n = 0; n < 32; ++n) {
+                const auto status = sys::port_take(port).status;
+                if (status == STATUS_RETRY) break;
+                if (status != STATUS_OK) return {.status=status};
+                PortEvent event; ::memcpy(&event, reinterpret_cast<const void*>(rt_current().ipc), sizeof(event));
+                if (const auto found = state->watches.find(event.watch_gen); found != state->watches.end()) {
+                    auto& entry = found->second;
+                    if (!entry.observed || event.sequence > entry.seen || (event.flags & PORT_EVENT_CLOSED)) {
+                        entry.event = event; entry.dirty = true;
+                    }
+                }
+            }
+            const auto facts = sys::source_info(port);
+            if (facts.status != STATUS_OK) return facts;
+            if ((facts.value & PORT_OVERFLOW) && !state->scanned) {
+                for (size_t n = 0; n < 8; ++n) {
+                    const auto status = sys::port_records(port, 0, state->epoch, state->last, state->limit).status;
+                    if (status != STATUS_OK) return {.status=status};
+                    PortRecords page; ::memcpy(&page, reinterpret_cast<const void*>(rt_current().ipc), sizeof(page));
+                    state->epoch = page.epoch; state->limit = page.limit; state->last = page.next;
+                    for (const auto& event : std::span{page.events, page.count}) {
+                        if (const auto found = state->watches.find(event.watch_gen); found != state->watches.end()) {
+                            auto& entry = found->second;
+                            if (entry.dirty || (event.flags & PORT_EVENT_CLOSED) ||
+                                ((event.flags & PORT_EVENT_PENDING) && (!entry.observed || event.sequence > entry.seen))) {
+                                entry.event = event; entry.dirty = true; entry.covered = page.epoch;
+                            }
+                        }
+                    }
+                    if (!page.more) { state->scanned = true; break; }
+                }
+            }
+            if (state->scanned && std::ranges::none_of(state->watches, [&](const auto& row) { return row.second.covered == state->epoch; })) {
+                const auto status = sys::port_resync(port, state->epoch).status;
+                if (status != STATUS_OK) return {.status=status};
+                state->epoch = state->last = state->limit = 0; state->scanned = false;
+            }
+            if (std::ranges::any_of(state->watches, [](const auto& row) { return row.second.dirty; })
+                || (facts.value & (PORT_READABLE | PORT_OVERFLOW))) return {.status=STATUS_OK};
+        }
+        const auto waited = sys::wait_one(port, PORT_READABLE | PORT_OVERFLOW, 0, deadline);
+        if (waited.status != STATUS_OK) return waited;
     }
-    const auto state = sys::source_info(port);
-    if (state.status != STATUS_OK || !(state.value & PORT_OVERFLOW)) return state;
-    word_t epoch{}, last{};
-    for (;;) {
-        const auto status = sys::port_records(port, 0, epoch, last);
-        if (status.status == STATUS_STALE) return {.status = STATUS_OK};
-        if (status.status != STATUS_OK) return status;
-        PortRecords page;
-        ::memcpy(&page, reinterpret_cast<const void*>(rt_current().ipc), sizeof(page));
-        epoch = page.epoch;
-        if (!page.more) break;
-        last = page.next;
-    }
-    const auto status = sys::port_resync(port, epoch);
-    return status.status == STATUS_STALE ? sys::SysResult{.status = STATUS_OK} : status;
 }
 
 // One owned registration on a borrowed Port and Source capability.
 class ev_watch final {
     cap_t port_{};
     word_t id_{};
+    std::shared_ptr<ev_port> state_;
 public:
     ev_watch() = default;
     ev_watch(const ev_watch&) = delete;
@@ -46,34 +96,78 @@ public:
     auto operator=(ev_watch&& other) noexcept -> ev_watch& {
         if (this != &other) {
             if (const auto status = close(); status != STATUS_OK) sys::exit(status);
-            port_ = std::exchange(other.port_, 0); id_ = std::exchange(other.id_, 0);
+            port_ = std::exchange(other.port_, 0); id_ = std::exchange(other.id_, 0); state_ = std::move(other.state_);
         }
         return *this;
     }
     ~ev_watch() { if (const auto status = close(); status != STATUS_OK) sys::exit(status); }
     explicit operator bool() const noexcept { return id_ != 0; }
+    auto pending() const noexcept -> bool {
+        if (!state_) return false;
+        std::lock_guard lock{state_->mutex};
+        const auto& entry = state_->watches.find(id_)->second; return entry.dirty || entry.first;
+    }
+    auto event() const noexcept -> std::optional<PortEvent> {
+        if (!state_) return {};
+        std::lock_guard lock{state_->mutex};
+        const auto& entry = state_->watches.find(id_)->second;
+        return entry.dirty ? std::optional{entry.event} : std::nullopt;
+    }
+    void ack() const noexcept {
+        if (!state_) return;
+        std::lock_guard lock{state_->mutex};
+        auto& entry = state_->watches.find(id_)->second; entry.dirty = entry.first = false; entry.covered = 0;
+    }
     auto close() noexcept -> status_t {
         if (!id_) return STATUS_OK;
-        const auto status = sys::port_unwatch(port_, id_).status;
-        if (status == STATUS_OK) { id_ = 0; port_ = 0; }
-        return status;
+        {
+            std::lock_guard lock{state_->mutex};
+            const auto status = sys::port_unwatch(port_, id_).status;
+            if (status != STATUS_OK) return status;
+            state_->watches.erase(id_); id_ = 0;
+        }
+        {
+            std::lock_guard registry{ev_mutex}; std::lock_guard lock{state_->mutex};
+            if (state_->watches.empty()) ev_ports().erase(port_);
+        }
+        state_.reset(); port_ = 0; return STATUS_OK;
     }
     auto open(cap_t port, cap_t source, word_t mask, word_t seen = 0, word_t flags = 0,
-              word_t facet = SOURCE_STATE) noexcept -> status_t {
-        if (const auto status = close(); status != STATUS_OK) return status;
-        const auto result = sys::port_watch(port, source, mask, seen, 0, flags, facet);
-        if (result.status == STATUS_OK) { port_ = port; id_ = result.value; }
-        return result.status;
+              word_t facet = SOURCE_STATE, word_t key = 0) noexcept -> status_t {
+        return install(port, [&] { return sys::port_watch(port, source, mask, seen, key, flags, facet); });
     }
     auto grant(cap_t port, cap_t scope, uint64_t object, cap_t seed, uint64_t selected, uint64_t seen) -> status_t {
+        return install(port, [&] { return sys::port_grant(port, scope, object, seed, selected, seen); });
+    }
+    auto arm(word_t seen = 0) const noexcept -> sys::SysResult {
+        if (!id_) return {.status=STATUS_BAD_ARGS};
+        std::lock_guard lock{state_->mutex};
+        const auto result = sys::port_arm(port_, id_, seen);
+        if (result.status == STATUS_OK || result.status == STATUS_CLOSED) {
+            auto& entry = state_->watches.find(id_)->second;
+            entry.dirty = result.status == STATUS_OK && result.value;
+            entry.first = false; entry.covered = 0;
+            if (result.status == STATUS_OK) { entry.seen = result.value2; entry.observed = true; }
+        }
+        return result;
+    }
+private:
+    template<class Create> auto install(cap_t port, Create create) -> status_t {
         if (const auto status = close(); status != STATUS_OK) return status;
-        const auto result = sys::port_grant(port, scope, object, seed, selected, seen);
-        if (result.status == STATUS_OK) { port_ = port; id_ = result.value; }
+        std::lock_guard registry{ev_mutex};
+        auto& cached = ev_ports()[port];
+        auto state = cached.lock();
+        if (!state) { state = std::make_shared<ev_port>(); cached = state; }
+        std::lock_guard lock{state->mutex};
+        auto node = state->watches.extract(state->watches.try_emplace(0).first);
+        const auto result = create();
+        if (result.status == STATUS_OK) {
+            node.key() = result.value; state->watches.insert(std::move(node));
+            port_ = port; id_ = result.value; state_ = std::move(state);
+        } else if (state->watches.empty()) ev_ports().erase(port);
         return result.status;
     }
-    auto arm(word_t seen = 0) noexcept -> sys::SysResult {
-        return id_ ? sys::port_arm(port_, id_, seen) : sys::SysResult{.status=STATUS_BAD_ARGS};
-    }
+
 };
 
 // An explicit software doorbell, observed by the caller's existing Port.
@@ -185,11 +279,14 @@ public:
         return status;
     }
     auto arm() -> status_t { return watch_ ? watch_.arm().status : STATUS_OK; }
-    auto receive(ch_packet& packet) -> status_t {
-        const auto status = ch_recv(channel_, packet, false).status;
-        if (status != STATUS_WOULD_BLOCK || !watch_) return status;
-        const auto armed = watch_.arm().status;
-        return armed == STATUS_OK ? status : armed;
+    auto drop(word_t sequence) -> status_t { return sys::channel_drop(channel_, sequence).status; }
+    auto receive(ch_packet& packet) -> sys::SysResult {
+        auto result = ch_recv(channel_, packet, false);
+        if (result.status == STATUS_WOULD_BLOCK && watch_) {
+            const auto armed = watch_.arm().status;
+            if (armed != STATUS_OK) result.status = armed;
+        }
+        return result;
     }
 };
 

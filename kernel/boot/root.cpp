@@ -1,6 +1,6 @@
 #include <expected>
 #include <optional>
-#include <object/scope.hpp>
+#include <object/pool.hpp>
 #include <boot/info.hpp>
 #include <libk/cpio.hpp>
 #include <libk/elf.hpp>
@@ -20,7 +20,7 @@
 #include <mm/table.hpp>
 #include <wait.hpp>
 #include <mm/vspace.hpp>
-#include <sched/sc.hpp>
+#include <sched/sched.hpp>
 #include <sched/dispatcher.hpp>
 #include <task/env.hpp>
 #include <task/thread.hpp>
@@ -31,13 +31,13 @@
 constexpr usize root_stack_pages = 8;
 constexpr mm::va_t root_ipc_address{0x40000000};
 constexpr usize root_stack_size = root_stack_pages * mm::page_size;
-constexpr usize root_initial_bytes = 320;
+constexpr usize root_initial_bytes = 384;
 constexpr mm::va_t root_info_address{mm::UserEnd - 2 * mm::page_size};
 constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - root_stack_size};
 
 [[nodiscard]] static constexpr auto charge_pages(usize pages, u64 caps = 0) noexcept
-    -> resource::Budget {
-    return resource::Budget{
+    -> resource::Capacity {
+    return resource::Capacity{
         .memory = static_cast<u64>(pages) * mm::page_size,
         .caps = caps,
     };
@@ -89,9 +89,9 @@ constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - 
 
 // First user thread only. Failure aborts boot; this is not a process service
 // with an unload/retry protocol. Successful publication transfers ownership to
-// capabilities, mappings and the scheduler before these local refs are dropped.
+// capabilities and mappings; the caller enables execution after CPU admission.
 auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
-               mm::BootPages&& reservation, mm::BootPages&& firmware) noexcept -> std::expected<void, BootErr> {
+               mm::BootPages&& reservation, mm::BootPages&& firmware) noexcept -> std::expected<object::ref<Thread>, BootErr> {
     const auto module = *handoff.module;
     auto pool = boot.root;
     auto& pmm = boot.pmm;
@@ -139,7 +139,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
 
     object::ref<mm::Mem> stack, info, ipc_mem;
     auto reserve =
-        [&](resource::Budget usage) noexcept -> std::expected<resource::Reservation, BootErr> {
+        [&](resource::Capacity usage) noexcept -> std::expected<resource::Reservation, BootErr> {
         auto reserved = pool->reserve(pool, usage);
         return reserved
                    ? std::expected<resource::Reservation, BootErr>{(std::move(reserved).value())}
@@ -153,7 +153,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
                    cap::CSpace* space = nullptr) noexcept -> std::expected<cap::Handle, BootErr> {
         auto fee = reserve(cap::Graph::node_usage());
         if (!fee) return std::unexpected(fee.error());
-        auto root = pending.root(boot.grants, std::move(*fee), view);
+        auto root = boot.grants.create_root(std::move(*fee), pending.reference(), view);
         if (!root) return std::unexpected(BootErr::CapabilityFailed);
         cap::Handle handle;
         if (space) {
@@ -177,7 +177,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
     };
 
     // Keep construction/publication scratch in bounded cold steps.
-    auto create = [&]<class T> [[gnu::noinline]] (resource::Budget budget, auto&&... args) noexcept
+    auto create = [&]<class T> [[gnu::noinline]] (resource::Capacity budget, auto&&... args) noexcept
         -> std::expected<object::pending<T>, BootErr> {
         auto usage = reserve(budget);
         if (!usage) return std::unexpected(usage.error());
@@ -188,7 +188,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         if (!result) return std::unexpected(BootErr::OutOfMemory);
         return std::move(*result);
     };
-    auto create_mem = [&] [[gnu::noinline]] (object::ref<mm::Mem>& dst, resource::Budget budget,
+    auto create_mem = [&] [[gnu::noinline]] (object::ref<mm::Mem>& dst, resource::Capacity budget,
                           auto&&... args) noexcept {
         auto result = create.template operator()<mm::Mem>(budget,
             std::forward<decltype(args)>(args)...);
@@ -351,7 +351,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         const auto vspace_rights = cap::Rights::of(
             cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Reserve, cap::Right::Map,
             cap::Right::Unmap, cap::Right::Destroy, cap::Right::Protect, cap::Right::Inspect,
-            cap::Right::Manage, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
+            cap::Right::Manage, cap::Right::Control, cap::Right::Observe, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
         const cap::VmLimit vm_limit{
             .range = mm::VRange{mm::va_t{mm::UserBegin}, mm::UserEnd - mm::UserBegin},
             .perms = mm::Perms::of(mm::Perm::Read, mm::Perm::Write, mm::Perm::Execute),
@@ -366,7 +366,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             .object_kinds = resource_kinds,
         };
 
-        cap_t vm_cap{}, cs_cap{}, pool_cap{}, scope_cap{}, event_cap{};
+        cap_t vm_cap{}, cs_cap{}, pool_cap{}, scope_cap{}, event_cap{}, stack_cap{}, ipc_cap{};
         auto events = create.template operator()<ipc::Port>(object::pool<ipc::Port>::slot_usage(), pmm, ipc::Port::Config{128, 16});
         if (!events) return std::unexpected(events.error());
         status_t ready;
@@ -376,12 +376,14 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         const auto installed_event = install(*events, {event_rights});
         if (!installed_event) return std::unexpected(installed_event.error());
         event_cap = installed_event->raw();
-        if (!add_cap(vm_cap, *vspace, vspace_rights, vm_limit) ||
+        if (!add_cap(stack_cap, stack, rights(cap::Right::Map, cap::Right::Destroy), cap::MemLimit{{0, root_stack_pages}, rw}) ||
+            !add_cap(ipc_cap, ipc_mem, rights(cap::Right::Map, cap::Right::Destroy), cap::MemLimit{{0, 1}, rw}) ||
+            !add_cap(vm_cap, *vspace, vspace_rights, vm_limit) ||
             !add_cap(cs_cap, *cspace, cspace_rights) ||
             !add_cap(info_page.bundle, *bundle_pending,
                      cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Map,
                                      cap::Right::Inspect, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke), bundle_limit) ||
-            !add_cap(info_page.thread, *thread, basic_rights) ||
+            !add_cap(info_page.thread, *thread, cap::Rights::from_raw(basic_rights.raw() | RIGHT_OBSERVE)) ||
             !add_cap(pool_cap, pool, pool_rights, pool_limit) ||
             !add_cap(scope_cap, boot.scope, cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate,
                 cap::Right::Inspect, cap::Right::Create, cap::Right::Manage, cap::Right::Close,
@@ -406,14 +408,13 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         aux(6, AT_SYS_CPUS, boot.cpus.count()); aux(7, AT_SYS_IPC, root_ipc_address.raw());
         aux(8, AT_SYS_BOOT, root_info_address.raw()); aux(9, AT_SYS_BOOT_SIZE, info_page.bytes);
         aux(10, AT_SYS_SCOPE, scope_cap); aux(11, AT_SYS_DOMAIN, info_page.domain); aux(12, AT_SYS_STACK, root_stack_address.raw()); aux(13, AT_SYS_STACK_SIZE, root_stack_size);
-        aux(14, AT_NULL, 0);
+        aux(14, AT_SYS_THREAD, info_page.thread); aux(15, AT_SYS_SC, info_page.sc);
+        aux(16, AT_SYS_STACK_MEM, stack_cap); aux(17, AT_SYS_IPC_MEM, ipc_cap); aux(18, AT_NULL, 0);
         ::memcpy(initial + root_initial_bytes - 16, "init", 5);
         return {};
     };
     const auto published = publish_root();
     if (!published) return std::unexpected(published.error());
 
-    if (!root_thread->execution(true))
-        return std::unexpected(BootErr::SchedulingFailed);
-    return {};
+    return root_thread;
 }

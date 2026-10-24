@@ -1,3 +1,5 @@
+#include <io.hpp>
+#include <libk/path.hpp>
 #include <vm.hpp>
 #include <proc.hpp>
 
@@ -12,21 +14,12 @@
 #include <string>
 #include <vector>
 
-struct sh_chunk { status_t status{}; size_t size{}; char data[80]{}; };
+using sh_chunk = io_frame;
 static auto sh_send(cap_t channel, const sh_chunk& chunk, bool block = true) -> status_t {
-    ubus_msg message; message.status = chunk.status;
-    if (chunk.size) message.data.put("data", std::as_bytes(std::span{chunk.data, chunk.size}));
-    return ubus_send(channel, message, block);
-}
-static auto sh_receive(ubus_rx& input, sh_chunk& chunk) -> status_t {
-    ubus_msg message; const auto status = input.receive(message); if (status != STATUS_OK) return status;
-    chunk = {}; chunk.status = message.status;
-    if (message.count) return STATUS_PEER_FAULT;
-    if (const auto bytes = message.data["data"].as<std::span<const std::byte>>()) {
-        if (bytes->size() > sizeof(chunk.data)) return STATUS_PEER_FAULT;
-        chunk.size = bytes->size(); ::memcpy(chunk.data, bytes->data(), bytes->size());
-    } else if (message.data["data"]) return STATUS_PEER_FAULT;
-    return STATUS_OK;
+    io_tx output;
+    // Nonblocking uses here carry only input bytes/EOF. Bulk output has its
+    // own transmitter in the queued output record.
+    return output.send(channel, chunk, block);
 }
 class sh_writer {
     cap_t output_;
@@ -42,18 +35,6 @@ public:
     void write(const char* text) const { write(text, ::strlen(text)); }
     void put(char value) const { write(&value, 1); }
 };
-static auto sh_path(std::string_view path, std::string_view base = "/") -> std::string {
-    std::string result = path.starts_with('/') ? std::string{path} : std::string{base} + "/" + std::string{path};
-    size_t size{}, cursor{};
-    while (cursor < result.size()) {
-        const auto begin = cursor; while (cursor < result.size() && result[cursor] != '/') ++cursor;
-        const std::string_view part{result.data() + begin, cursor - begin};
-        if (part == "..") { while (size && result[size - 1] != '/') --size; if (size) --size; }
-        else if (!part.empty() && part != ".") { if (size) result[size++] = '/'; ::memmove(result.data() + size, part.data(), part.size()); size += part.size(); }
-        ++cursor;
-    }
-    result.resize(size); result.insert(0, "/"); return result;
-}
 
 struct sh_stage {
     std::shared_ptr<mgr_child> child;
@@ -91,11 +72,12 @@ class sh_shell {
     ubus_msg setup_;
     vm_area source_;
     cap_t input_cap_{}, output_cap_{};
-    mgr owner_{[this](mgr_child& child) { return image(child.image); }};
+    mgr owner_{[this](mgr_child& child) { return image(child.program()); }};
     std::deque<std::unique_ptr<sh_pipeline>> pipelines_;
     uint64_t next_{}, foreground_{}, focus_{};
-    struct output { sh_chunk frame; uint64_t owner{}, focus{}; };
+    struct output { sh_chunk frame; uint64_t owner{}, focus{}; std::unique_ptr<io_tx> tx; };
     std::deque<output> output_;
+    std::unique_ptr<io_tx> output_tx_;
     ev_watch output_ready_;
     std::string line_;
     std::string cwd_{"/"};
@@ -128,7 +110,7 @@ class sh_shell {
             if (output_.empty() || output_.back().owner != owner || output_.back().focus != focus
                 || output_.back().frame.size == sizeof(sh_chunk::data)) {
                 if (output_.size() == 128) return; // Echo/status overflow; child streams stop draining at 64.
-                output_.push_back({{}, owner, focus});
+                output_.push_back({{}, owner, focus, {}});
             }
             auto& frame = output_.back().frame;
             const auto count = std::min(text.size(), sizeof(frame.data) - frame.size);
@@ -215,27 +197,30 @@ class sh_shell {
         if (!policy) policy = config["commands"][argv[0]];
         std::string path{policy["program"].as<std::string_view>().value_or(argv[0])};
         if (path.find('/') == path.npos) { path = "/boot/" + path; if (!path.ends_with(".elf")) path += ".elf"; }
-        else path = sh_path(path, cwd_);
+        else path = libk::path_normal(path, cwd_);
         const auto base = path.substr(path.find_last_of('/') + 1);
         const auto limits = policy["resources"];
         const auto caps = limits["caps"].as<uint64_t>().value_or(160);
         const auto bytes = limits["bytes"].as<uint64_t>().value_or(4 * 1024 * 1024);
-        auto& child = owner_.add(base + "." + std::to_string(job.id) + "." + std::to_string(index), path,
+        auto recipe = mgr_recipe(base + "." + std::to_string(job.id) + "." + std::to_string(index), path,
             {.bytes=bytes, .caps=caps, .slots=std::max<uint64_t>(256, caps), .pages=(std::max<uint64_t>(256, caps) + 7) / 8 + 4,
                 .quota_perms=RIGHT_CREATE | RIGHT_INSPECT | (limits["children"].as<bool>().value_or(false) ? RIGHT_SPLIT : 0),
-                .watches=limits["watches"].as<uint64_t>().value_or(64), .hints=limits["hints"].as<uint64_t>().value_or(16), .threads=limits["threads"].as<uint64_t>().value_or(64), .max_bytes=std::max<uint64_t>(bytes, 16 * 1024 * 1024), .max_caps=std::max<uint64_t>(caps, 256)});
-        stage.child = owner_.find(child.child_id); child.args.clear();
-        if (policy["argv"]) for (const auto arg : policy["argv"].values()) child.args.emplace_back(*arg.as<std::string_view>());
-        else child.args = {std::string{argv[0]}};
-        for (const auto arg : argv.subspan(1)) child.args.emplace_back(arg);
-        child.env = {"PWD=" + cwd_};
-        child.cpu = (job.id + index) % env_.cpus;
+                .watches=limits["watches"].as<uint64_t>().value_or(64), .hints=limits["hints"].as<uint64_t>().value_or(16), .max_bytes=std::max<uint64_t>(bytes, 16 * 1024 * 1024), .max_caps=std::max<uint64_t>(caps, 256)});
+        std::vector<std::string> args;
+        if (policy["argv"]) for (const auto arg : policy["argv"].values()) args.emplace_back(*arg.as<std::string_view>());
+        else args = {std::string{argv[0]}};
+        for (const auto arg : argv.subspan(1)) args.emplace_back(arg);
+        ubus_data argv_data{ubus_type::Array}, environ{ubus_type::Array}; environ.push("PWD=" + cwd_);
+        for (size_t i = 1; i < args.size(); ++i) argv_data.push(args[i]);
+        recipe.data.put("argv0", args.empty() ? argv[0] : std::string_view{args.front()}).put("argv", argv_data)
+            .put("env", environ).put("cpu", (job.id + index) % env_.cpus);
         auto routes = profile["routes"]; if (!routes) routes = policy["routes"]; if (!routes) routes = config["routes"];
-        if (routes && !child.routes.assign(routes.bytes())) return STATUS_BAD_ARGS;
+        if (routes) recipe.data.put("routes", routes);
+        ubus_msg payload;
         const auto delivery = profile ? profile["commands"][argv[0]]["setup"] : policy["setup"];
         if (delivery) {
             auto message = setup_.slice(delivery); if (!message) return message.error();
-            child.setup = std::move(*message);
+            payload = std::move(*message);
         }
         for (const auto& [name, source, rights, badge] : std::array{
             std::tuple{"stdin", index ? job.pipes[index - 1]->ends[1].selector() : job.input.ends[1].selector(), word_t{RIGHT_RECEIVE}, word_t{0}},
@@ -243,18 +228,21 @@ class sh_shell {
             std::tuple{"stderr", job.output.ends[0].selector(), word_t{RIGHT_SEND}, word_t{1}}}) {
             const auto copy = badge ? sys::channel_mint(source, env_.cspace, badge, rights) : sys::cap_duplicate(source, env_.cspace, rights);
             if (copy.status != STATUS_OK) return copy.status;
-            const auto cap_idx = child.setup.give(cap_owner{copy.value});
+            const auto cap_idx = payload.give(cap_owner{copy.value});
             if (!cap_idx) return cap_idx.error();
-            child.setup.data.cap(name, *cap_idx);
+            payload.data.cap(name, *cap_idx);
         }
         if (job.stages.size() == 1) {
             const auto cap = sys::cap_duplicate(job.terminal_connector.selector(), env_.cspace, RIGHT_SEND | RIGHT_DUPLICATE);
             if (cap.status != STATUS_OK) return cap.status;
-            const auto term_idx = child.setup.offer(cap_owner{cap.value}, RIGHT_SEND | RIGHT_DUPLICATE);
+            const auto term_idx = payload.offer(cap_owner{cap.value}, RIGHT_SEND | RIGHT_DUPLICATE);
             if (!term_idx) return term_idx.error();
-            child.setup.data.cap("terminal", *term_idx);
+            payload.data.cap("terminal", *term_idx);
         }
-        return owner_.start(child);
+        recipe.data.put("setup", payload.data); payload.data = std::move(recipe.data);
+        auto child = owner_.configure(std::move(payload)); if (!child) return child.error();
+        stage.child = *child;
+        return owner_.start(**child);
     }
 
 public:
@@ -281,7 +269,7 @@ public:
         auto status = bus_.invoke("Get", std::move(query), reply);
         if (status == STATUS_OK) status = files.bind(reply.capability(reply.data["connector"]), "io.files", 1, 1);
         if (status != STATUS_OK) return status;
-        const auto target = sh_path(path, cwd_);
+        const auto target = libk::path_normal(path, cwd_);
         query = {}; query.data.put("path", target);
         status = files.invoke("List", std::move(query), reply);
         if (status == STATUS_OK) cwd_ = target;
@@ -290,7 +278,7 @@ public:
     void terminate(sh_pipeline& job) {
         job.state = sh_state::Terminating;
         leave(job);
-        for (auto& stage : job.stages) if (stage.task()) (void)stage.task()->stop();
+        for (auto& stage : job.stages) if (stage.task()) (void)stage.task()->retire();
     }
     void pump(bool sleep = true) {
         bool polling{}, progress{};
@@ -359,14 +347,14 @@ public:
             if (done && job.fullscreen && foreground_ == job.id) leave(job);
             for (unsigned i = 0; !screen_ && output_.size() < 64 && i < 16; ++i) {
                 sh_chunk frame;
-                const auto status = sh_receive(job.output_rx, frame);
+                const auto status = io_recv(job.output_rx, frame);
                 job.output_empty = status == STATUS_WOULD_BLOCK || status == STATUS_CLOSED || status == STATUS_PEER_CLOSED;
                 if (status != STATUS_OK) break;
                 progress = true;
                 if (frame.size) {
                     const bool background = !foreground_;
                     if (background && prompt_visible_) { enqueue("\r\x1b[2K"); prompt_visible_ = false; }
-                    output_.push_back({frame, job.id, 0});
+                    output_.push_back({frame, job.id, 0, {}});
                     line_start_ = frame.size && (frame.data[frame.size - 1] == '\n' || frame.data[frame.size - 1] == '\r');
                     if (background && line_start_ && reading_) prompt();
                 }
@@ -394,7 +382,7 @@ public:
         }
         for (unsigned i = 0; i < 16; ++i) {
             sh_chunk frame;
-            const auto status = sh_receive(input_, frame);
+            const auto status = io_recv(input_, frame);
             if (status == STATUS_WOULD_BLOCK) break;
             if (status != STATUS_OK) sys::exit(status);
             progress = true;
@@ -403,15 +391,20 @@ public:
         while (!output_.empty()) {
             auto& next = output_.front();
             if (next.focus && (next.owner != foreground_ || !job(next.owner) || next.focus != job(next.owner)->focus)) { output_.pop_front(); continue; }
-            const auto status = sh_send(output_cap_, next.frame, false);
+            if (!next.tx) next.tx = output_tx_ ? std::move(output_tx_) : std::make_unique<io_tx>();
+            const auto status = next.tx->send(output_cap_, next.frame, false);
             if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
+                if (next.tx->active()) {
+                    if (const auto closed = output_ready_.close(); closed != STATUS_OK) sys::exit(closed);
+                    break;
+                }
                 const auto armed = output_ready_ ? output_ready_.arm().status
                     : output_ready_.open(rt_events(), output_cap_, SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
                 if (armed != STATUS_OK) sys::exit(armed);
                 break;
             }
             if (status != STATUS_OK) sys::exit(status);
-            output_.pop_front(); progress = true;
+            output_tx_ = std::move(next.tx); output_.pop_front(); progress = true;
         }
         if (output_.empty())
             if (const auto status = output_ready_.close(); status != STATUS_OK) sys::exit(status);
@@ -439,8 +432,8 @@ public:
         auto& job = *entry;
         job.id = ++next_; job.command = command; job.background = background; job.profile = profile;
         job.stages.resize(cuts.size() - 1);
-        auto status = job.input.open(env_.alloc(), 8, 0);
-        if (status == STATUS_OK) status = job.output.open(env_.alloc(), 8, 0);
+        auto status = job.input.open(env_.alloc(), 8, 3);
+        if (status == STATUS_OK) status = job.output.open(env_.alloc(), 8, 3);
         if (status == STATUS_OK) status = job.terminal.open(8);
         if (status == STATUS_OK) {
             const auto input = sys::channel_mint(job.input.ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
@@ -456,14 +449,14 @@ public:
                 if (foreground_ == job.id) focus(job, true);
                 return STATUS_OK;
             });
-        if (status == STATUS_OK) status = job.terminal.add("Frame", {{"focus", ubus_type::U64}, {"data", ubus_type::Bytes, false, sizeof(sh_chunk::data)}}, {},
+        if (status == STATUS_OK) status = job.terminal.add("Frame", {{"focus", ubus_type::U64}, {"data", ubus_type::Bytes, true, io_inline}, {"buffer", ubus_type::Buffer, true}}, {},
             [this, &job](auto& request, auto&) {
                 if (foreground_ != job.id || request.data["focus"].template as<uint64_t>() != job.focus) return STATUS_STALE;
                 if (output_.size() >= 64) return STATUS_BUSY;
                 sh_chunk frame;
-                const auto bytes = *request.data["data"].template as<std::span<const std::byte>>();
-                frame.size = bytes.size(); ::memcpy(frame.data, bytes.data(), frame.size);
-                output_.push_back({frame, job.id, job.focus}); return STATUS_OK;
+                const auto status = io_decode(request, frame);
+                if (status != STATUS_OK) return status;
+                output_.push_back({frame, job.id, job.focus, {}}); return STATUS_OK;
             }, 0, true);
         if (status == STATUS_OK) {
             auto connector = job.terminal.connector();
@@ -472,7 +465,7 @@ public:
         if (status == STATUS_OK) status = job.output_rx.open(job.output.ends[1].selector(), rt_events());
         for (size_t i = 1; i < job.stages.size() && status == STATUS_OK; ++i) {
             auto& pipe = job.pipes.emplace_back(std::make_unique<ch_pair>());
-            status = pipe->open(env_.alloc(), 4, 0);
+            status = pipe->open(env_.alloc(), 4, 3);
             if (status == STATUS_OK) {
                 const auto end = sys::channel_mint(pipe->ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
                 job.stages[i - 1].end_sender = cap_owner{end.value}; status = end.status;

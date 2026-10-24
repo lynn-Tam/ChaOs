@@ -7,7 +7,7 @@
 #include <string>
 
 // Maximum control body for version 2; bulk data belongs in BufferSlice.
-inline constexpr size_t ubus_body_limit = 1u << 20;
+inline constexpr size_t ubus_body_limit = 1u << 20, ubus_control_limit = 64u << 10;
 
 // Transport capabilities are separate from value indices. A message owns all
 // received/explicitly offered slots; attach borrows a sender's slot until send.
@@ -44,7 +44,9 @@ using ubus_schema = std::vector<ubus_field>;
 struct ubus_method;
 
 struct ubus_request : ubus_msg {
-    cap_owner reply;
+    cap_owner reply, reply_body;
+    size_t reply_bytes{};
+    auto reserve_reply(size_t) -> status_t;
     auto facet() const -> word_t { return badge ? badge - 1 : 0; }
     std::shared_ptr<const ubus_method> method;
     auto respond(ubus_msg response = {}, bool* committed = nullptr) -> status_t;
@@ -76,12 +78,17 @@ auto ubus_receive_event(cap_t endpoint, ubus_msg&, bool block = false) -> status
 
 class ubus_rx {
     ch_rx input_;
+    size_t body_limit_{ubus_body_limit};
 public:
     explicit operator bool() const { return bool(input_); }
-    auto open(cap_t channel, cap_t events = 0) -> status_t { return input_.open(channel, events); }
+    auto open(cap_t channel, cap_t events = 0, size_t body_limit = ubus_body_limit) -> status_t {
+        if (body_limit < sizeof(ubus_head) || body_limit > ubus_body_limit) return STATUS_BAD_ARGS;
+        body_limit_ = body_limit; return input_.open(channel, events);
+    }
     auto close() -> status_t { return input_.close(); }
     auto arm() -> status_t { return input_.arm(); }
-    auto receive(ubus_request&) -> status_t;
+    auto receive(ubus_request&) -> sys::SysResult;
+    auto drop(word_t sequence) -> status_t { return input_.drop(sequence); }
     auto receive(ubus_msg&) -> status_t;
 };
 
@@ -92,6 +99,7 @@ class ubus_call {
     cap_t peer_{};
 public:
     auto active() const noexcept -> bool { return rpc_.active(); }
+    auto pending() const noexcept -> bool { return rpc_.pending(); }
     auto sent() const noexcept -> bool { return rpc_.sent(); }
     auto deadline() const noexcept -> word_t { return rpc_.deadline(); }
     auto begin(cap_t endpoint, ubus_msg message, bool drain = false) -> status_t;
@@ -127,7 +135,7 @@ public:
              word_t required = 0, bool notify = false) -> status_t;
     ~ubus_object();
     auto close() -> status_t;
-    auto open(size_t depth = 16, cap_t quota = 0, cap_owner scope = {}) -> status_t;
+    auto open(size_t depth = 16, cap_t quota = 0, cap_owner scope = {}, size_t body_limit = ubus_control_limit) -> status_t;
     auto scope() const -> cap_t { return scope_.selector(); }
     auto connector(word_t facet = 0) -> std::expected<cap_owner, status_t>;
     // A returned object releases mint authority: its last remote handle closes
@@ -143,7 +151,6 @@ public:
 // No second endpoint identity outlives or bypasses that grant's revocation.
 class ubus_conn {
     cap_owner endpoint_;
-    ev_watch peer_;
     ubus_data description_;
     ubus_call call_;
     struct binding { std::string interface; uint64_t minimum, maximum, features; cap_owner endpoint; };
@@ -152,6 +159,7 @@ class ubus_conn {
     auto install(cap_owner, ubus_value, std::string_view, uint64_t, uint64_t, uint64_t) -> status_t;
 public:
     auto active() const -> bool { return call_.active(); }
+    auto pending() const -> bool { return call_.pending(); }
     auto state() const -> status_t;
     auto close() -> status_t;
     auto release() -> std::expected<cap_owner, status_t>;
@@ -237,6 +245,7 @@ public:
             else if (!entry.committed) entry.cancelled = true;
         }
     }
+    auto pending(uint64_t through) const -> bool { return std::ranges::any_of(entries_, [=](const auto& entry) { return entry.id && entry.id <= through; }); }
     auto active() const -> size_t { return active_; }
     auto sequence() const -> uint64_t { return last_; }
 };
@@ -266,6 +275,7 @@ public:
     }
     auto completion(T& data, ubus_msg& response, uint64_t id = 0) -> status_t {
         for (auto& item : entries_) if (item && item->id && (!id || item->id == id)) {
+            if (!item->failure && !item->call.pending()) continue;
             const auto status = item->failure ? item->failure : item->call.poll(response);
             if (status == STATUS_WOULD_BLOCK) continue;
             if (status != STATUS_OK) response.status = status;

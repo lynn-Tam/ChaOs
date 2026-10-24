@@ -27,7 +27,7 @@ extern thread_local rt_context rt_local;
 inline auto rt_current() noexcept -> rt_context& { return rt_local; }
 auto rt_events() noexcept -> cap_t;
 
-inline constexpr word_t rt_life_version = 1, rt_life_register = 1, rt_life_exit = 2, rt_life_reap = 3;
+inline constexpr word_t rt_life_version = 2;
 struct rt_bootstrap {
     uintptr_t stack{};
     size_t stack_size{};

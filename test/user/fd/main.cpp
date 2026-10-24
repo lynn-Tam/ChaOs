@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <uapi/abi.h>
 #include <string_view>
+#include <vector>
 
 struct fd_image { cap_owner memory; uint64_t size; };
 static auto fd_map(ubus_conn& files, std::string_view path, word_t perms = VM_READ) -> std::expected<fd_image, status_t> {
@@ -202,10 +203,10 @@ int main(int argc, char** argv) {
     if (fsync(child) || close(child) || close(moved) || close(target) || close(replaced))
         return 30;
     const int async = open("fd-async", O_RDWR | O_CREAT | O_TRUNC, 0);
-    char source[3 * IO_LIMIT + 7]{};
-    for (unsigned i = 0; i < sizeof(source); ++i)
+    std::vector<char> source(3 * IO_LIMIT + 7);
+    for (unsigned i = 0; i < source.size(); ++i)
         source[i] = 'a' + i % 26;
-    if (async < 0 || write(async, source, sizeof(source)) != sizeof(source) || fsync(async))
+    if (async < 0 || write(async, source.data(), source.size()) != static_cast<ssize_t>(source.size()) || fsync(async))
         return 31;
     char boundary[20]{};
     if (pread(async, boundary, sizeof(boundary), IO_LIMIT - 6) != sizeof(boundary))
@@ -213,8 +214,8 @@ int main(int argc, char** argv) {
     for (unsigned i = 0; i < sizeof(boundary); ++i)
         if (boundary[i] != source[IO_LIMIT - 6 + i])
             return 46;
-    if (pread(async, boundary, sizeof(boundary), sizeof(source) - 3) != 3 ||
-        boundary[0] != source[sizeof(source) - 3])
+    if (pread(async, boundary, sizeof(boundary), source.size() - 3) != 3 ||
+        boundary[0] != source[source.size() - 3])
         return 47;
     request_id ids[IO_DEPTH]{};
     char bytes[IO_DEPTH]{};

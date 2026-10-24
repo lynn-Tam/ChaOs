@@ -47,14 +47,8 @@ static void finish_fault(
     default:
         break;
     }
-    static_cast<void>(thread.exit().claim(status));
-    // One-way diagnostic projection; it must never participate in fault policy.
-    console::print<
-        "user: contained fault pc={:#x} address={:#x} after syscalls={} "
-        "active-vspace-cpus={} fault-kind={}\n">(
-        context.pc(), address.raw(), thread.user_syscalls(),
-        thread.env().vspace()->active_cpus().size(),
-        static_cast<u8>(kind));
+    thread.report({.origin=EXIT_FAULT, .kind=static_cast<u32>(kind), .status=status, .reserved=0,
+        .pc=context.pc(), .address=address.raw()});
     dispatcher.request_reschedule(sched::DispatchReason::Exit);
 }
 
@@ -99,6 +93,7 @@ static void handle_trap(const arch::TrapEvent& event, arch::TrapCtx& context) no
             case syscall::Disposition::Exit:
                 const status_t status = static_cast<status_t>(
                     context.arg(1));
+                thread->report({.origin=EXIT_NORMAL, .kind=0, .status=status, .reserved=0, .pc=0, .address=0});
                 cpu.dispatcher().request_reschedule(sched::DispatchReason::Exit, status);
                 return;
             }
@@ -128,12 +123,8 @@ static void handle_trap(const arch::TrapEvent& event, arch::TrapCtx& context) no
                 finish_fault(*thread, kind, address, context, cpu.dispatcher());
             return;
         }
-        static_cast<void>(thread->exit().claim(STATUS_PEER_FAULT));
-        console::print<
-            "user: contained fault pc={:#x} address={:#x} after syscalls={} "
-            "active-vspace-cpus={}\n">(
-            event.pc, event.fault_addr, thread->user_syscalls(),
-            thread->env().vspace()->active_cpus().size());
+        thread->report({.origin=EXIT_FAULT, .kind=static_cast<u32>(event.cause), .status=STATUS_PEER_FAULT, .reserved=0,
+            .pc=event.pc, .address=event.fault_addr});
         cpu.dispatcher().request_reschedule(sched::DispatchReason::Exit);
         return;
     }

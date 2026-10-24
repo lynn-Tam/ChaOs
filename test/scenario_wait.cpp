@@ -10,7 +10,7 @@
 #include <mm/kspace.hpp>
 #include <mm/vspace.hpp>
 #include <libk/scope_guard.hpp>
-#include <sched/sc.hpp>
+#include <sched/sched.hpp>
 #include <sched/dispatcher.hpp>
 #include <sync.hpp>
 #include <task/thread.hpp>
@@ -151,7 +151,7 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
         kernel.work);
     libk_assert(space_pending);
     auto space = std::move(space_pending).value().publish();
-    auto memory_pending = kernel.objects.get<mm::Mem>().create({}, kernel.pmm, mm::page_size, mm::AnonCfg{.perms = mm::Perms::of(mm::Perm::Read), .eager = true});
+    auto memory_pending = kernel.objects.get<mm::Mem>().create({}, kernel.pmm, 2 * mm::page_size, mm::AnonCfg{.perms = mm::Perms::of(mm::Perm::Read), .eager = true});
     libk_assert(memory_pending);
     auto memory = std::move(memory_pending).value().publish();
     auto cleanup = libk::on_scope_exit([&]() noexcept {
@@ -162,16 +162,20 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
 
     });
     const mm::VmCtx context{&cpus, local};
-    const mm::VRange range{mm::va_t{0x70000000}, mm::page_size};
+    const mm::VRange range{mm::va_t{0x70000000}, 2 * mm::page_size};
     const auto access = mm::Perms::of(mm::Perm::Read);
     auto reference = object::ref<>{memory};
     libk_assert(reference);
     auto mapped =
-        space->map(context, {range, {0, 1}, access}, std::move(reference), memory.get(),
-                   {.range = {0, 1}, .perms = access});
+        space->map(context, {range, {0, 2}, access}, std::move(reference), memory.get(),
+                   {.range = {0, 2}, .perms = access});
     libk_assert(mapped && mapped.value().status == mm::VmStatus::Complete);
     const auto materialized = space->fault(context, range.base(), mm::Perm::Read);
     libk_assert(materialized && materialized->kind == mm::FaultKind::Materialized);
+    // Keep the sibling leaf resident: removing the first leaf must still wait
+    // for the remote hart, without detaching its shared page-table pages.
+    const auto sibling = space->fault(context, mm::va_t{range.base().raw() + mm::page_size}, mm::Perm::Read);
+    libk_assert(sibling && sibling->kind == mm::FaultKind::Materialized);
     VmPeer peer{space.get(), kernel};
     auto stack = mm::Stack::create(kernel.vm);
     libk_assert(stack);
@@ -196,7 +200,7 @@ auto pending_vm_wait(Cpu& runtime) noexcept -> bool {
     bool passed{};
     {
         sync::Irq interrupts;
-        const auto unmapped = space->unmap(context, range);
+        const auto unmapped = space->unmap(context, {range.base(), mm::page_size});
         libk_assert(unmapped && unmapped.value() == mm::VmStatus::Pending);
         auto target = object::ref<>{space};
         libk_assert(target);
@@ -354,6 +358,7 @@ void wait_entry(void* argument) noexcept {
 
 // A committed operation owns its completion through suspension and resource recall.
 struct ExecutionWait {
+    explicit ExecutionWait(Cpus& cpus, bool overrun = false) noexcept : cpus(cpus), overrun(overrun) {}
     Op operation{};
     Cpus& cpus;
     bool overrun{};
@@ -396,8 +401,10 @@ static auto execution_lifetime(Cpu& runtime) noexcept -> bool {
         libk_assert(thread->claim_home(k.cpus.get(cpu)->dispatcher()));
         return thread;
     };
+    static constinit libk::manual_lifetime<ExecutionWait> storage;
     for (bool stop : {false, true}) {
-        ExecutionWait op{.cpus = k.cpus, .overrun = !stop};
+        auto& op = storage.emplace(k.cpus, !stop);
+        auto cleanup = libk::on_scope_exit([&]() noexcept { storage.reset(); });
         op.operation.accept(); libk_assert(op.operation.commit());
         auto thread = create(op, k.cpus.count() > 1 ? CpuId{1} : runtime.id);
         auto pending = k.objects.get<sched::Sc>().create(sched::Sc::Config{
@@ -425,7 +432,7 @@ static auto execution_lifetime(Cpu& runtime) noexcept -> bool {
         } else {
             const auto debt = sc->info(clock.rd_ticks()).debt;
             libk_assert(debt != 0);
-            ExecutionWait other{.cpus = k.cpus};
+            ExecutionWait other{k.cpus};
             auto borrower = create(other, runtime.id);
             libk_assert(sc->bind(sc, borrower.get()));
             const auto changed = sc->info(clock.rd_ticks());
@@ -513,7 +520,7 @@ static auto domain_execution(Cpu&) noexcept -> bool {
     auto& k = *test::boot;
     if (k.cpus.count() < 4) return true;
     auto& clock = k.clock;
-    const auto mask = (u64{1} << k.cpus.count()) - 1;
+    const auto mask = k.cpus.count() >= 64 ? ~u64{} : (u64{1} << k.cpus.count()) - 1;
     std::array<object::ref<sched::Domain>, 4> domains;
     for (usize i = 0; i < domains.size(); ++i) {
         const sched::Domain::Config config{.cpus=mask,

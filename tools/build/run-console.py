@@ -11,7 +11,7 @@ import sys
 import time
 import tempfile
 
-def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=False, missing_storage=False, disk=None, persisted=False, control=False, threads=False):
+def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=False, missing_storage=False, disk=None, persisted=False, control=False, threads=False, second_disk=None, vfs=False):
     root = Path(__file__).resolve().parents[2]
     logs = root / '.tmp/project/interactive-storage'
     logs.mkdir(parents=True, exist_ok=True)
@@ -22,6 +22,9 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
         command[command.index('virt')] = 'virt,iommu-sys=on'
         command += ['-drive', f'if=none,id=data,format=raw,file={disk}',
                     '-device', 'virtio-blk-pci,addr=1,drive=data,disable-legacy=on,iommu_platform=on']
+    if second_disk:
+        command += ['-drive', f'if=none,id=other,format=raw,file={second_disk}',
+                    '-device', 'virtio-blk-pci,addr=2,drive=other,disable-legacy=on,iommu_platform=on']
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT)
     poll = selectors.DefaultSelector()
@@ -100,6 +103,15 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
 
     try:
         until(b'/ > ')
+        if vfs:
+            run('control-test vfs', b'[vfs] delayed Get/Bind, independent mount progress, pinned targets and Sync fanout ok')
+            print(f'[vfs] OK: {smp} harts, delayed Get/Bind and multi-mount lifecycle')
+            return
+        if second_disk:
+            run('control-test devices', b'[devices] independent DMA, cross-page 64KiB I/O and driver retirement ok')
+            states({'devices/block-8': 'running', 'devices/block-10': 'running'})
+            print(f'[devices] OK: {smp} harts, two live drivers, independent data and retirement')
+            return
         if threads:
             run('thread-test', b'[threads] pthread, TLS errno, cleanup, shared fd and parallel RPC ok')
             run('thread-test last', b'[threads] initial thread exit preserves argv, fd and workers')
@@ -133,7 +145,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             run('bus call foreign/math Add a=11 b=31', b'"sum":42')
             before = managers()
             # Replace only the actual owner, without a redundant session wrapper.
-            run('sleep 10000 &', b'Running')
+            run('sleep 86400000 &', b'Running')
             start = len(output); send(b'svc restart shell\r')
             echo = b'svc restart shell\n'; until(echo, start)
             until(b'/ > ', output.index(echo, start) + len(echo))
@@ -146,7 +158,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             run('control-test', b'[control] scoped badges, stale instances/cursors and real VM/quota stats ok')
             run('svc', b'survivor running')
             run('svc remove survivor', b'service change requested')
-            run('sleep 10000 &', b'Running')
+            run('sleep 86400000 &', b'Running')
             mark = len(output); run('svc restart devices', b'service change requested')
             until(b'uart: console ready\n', mark)
             run('svc', b'devices/uart running')
@@ -364,13 +376,16 @@ if __name__ == '__main__':
     mode = sys.argv[5] if len(sys.argv) >= 6 else ''
     iterations = int(sys.argv[6]) if len(sys.argv) >= 7 else 1
     for smp in harts.split(','):
-        if mode in ('interactive', 'recovery', 'control', 'threads'):
+        if mode in ('interactive', 'recovery', 'control', 'threads', 'devices', 'vfs'):
             temporary = Path(__file__).resolve().parents[2] / '.tmp/project/interactive-storage'
             temporary.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(dir=temporary) as directory:
                 disk = Path(directory) / 'data.img'
                 with disk.open('wb') as stream: stream.truncate(16 * 1024 * 1024)
-                exercise(qemu, kernel, bundle, smp, iterations, disk=disk, recovery=mode == 'recovery', control=mode == 'control', threads=mode == 'threads')
+                other = Path(directory) / 'other.img' if mode == 'devices' else None
+                if other:
+                    with other.open('wb') as stream: stream.truncate(16 * 1024 * 1024)
+                exercise(qemu, kernel, bundle, smp, iterations, vfs=mode == 'vfs', second_disk=other, disk=disk, recovery=mode == 'recovery', control=mode == 'control', threads=mode == 'threads')
                 if mode == 'interactive': exercise(qemu, kernel, bundle, smp, 0, disk=disk, persisted=True)
         else:
             exercise(qemu, kernel, bundle, smp, iterations, exec_check=mode == 'exec', missing_storage=mode == 'missing-storage', control=mode == 'control')

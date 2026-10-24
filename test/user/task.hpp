@@ -77,30 +77,36 @@ class test_tasks {
                      .perms = image.perms},
             config);
         if (status == STATUS_OK) status = task->start();
-        if (status != STATUS_OK) static_cast<void>(task->stop(status));
+        if (status != STATUS_OK) static_cast<void>(task->retire(status));
         return {{tasks_.size()}, status};
     }
     auto observe(test_id id) -> sys::SysResult {
         auto* t = get(id);
-        return t ? t->observe() : sys::SysResult{.status = STATUS_INVALID_CAP};
+        if (!t) return {.status=STATUS_INVALID_CAP};
+        const auto progress = t->step();
+        if (!progress) return {.status=progress.error()};
+        const auto result = t->result();
+        return {.status=result ? STATUS_OK : STATUS_WOULD_BLOCK, .value=result ? word_t(result->code) : 0};
     }
     auto request_stop(test_id id) -> status_t {
         auto* t = get(id);
-        return t ? t->stop() : STATUS_INVALID_CAP;
+        return t ? t->retire() : STATUS_INVALID_CAP;
     }
-    auto poll(test_id id) -> status_t {
-        auto* t = get(id);
-        return t ? t->poll() : STATUS_INVALID_CAP;
-    }
+    auto poll(test_id id) -> status_t { return observe(id).status; }
     auto collect(test_id id) -> sys::SysResult {
         auto* t = get(id);
-        if (!t)
-            return {.status = STATUS_INVALID_CAP};
-        auto result = t->collect();
-        if (result.status == STATUS_OK)
-            tasks_[id.value - 1].reset();
-        return result;
+        if (!t) return {.status=STATUS_INVALID_CAP};
+        const auto progress = t->step();
+        if (!progress) return {.status=progress.error()};
+        const auto result = t->result();
+        if (!result) return {.status=STATUS_WOULD_BLOCK};
+        const auto status = t->retire(result->code);
+        if (status != STATUS_OK) return {.status=status};
+        if (!t->drained()) return {.status=STATUS_WOULD_BLOCK};
+        tasks_[id.value - 1].reset();
+        return {.status=STATUS_OK, .value=word_t(result->code)};
     }
+
 };
 
 inline void open(test_image& image, const rt_env& info) {

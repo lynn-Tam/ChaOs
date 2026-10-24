@@ -88,6 +88,9 @@ auto asid_mask() noexcept -> usize {
 void flush_tlb(usize asid) noexcept {
     asm volatile("sfence.vma x0, %0" :: "r"(asid) : "memory");
 }
+void flush_tlb_page(usize address, usize asid) noexcept {
+    asm volatile("sfence.vma %0, %1" :: "r"(address), "r"(asid) : "memory");
+}
 bool flush_remote(usize hart) noexcept {
     constexpr usize width = sizeof(usize) * 8;
     const usize base = hart & ~(width - 1);

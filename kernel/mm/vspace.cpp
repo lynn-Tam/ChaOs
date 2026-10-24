@@ -304,7 +304,7 @@ auto VSpace::prepare(const object::ref<>& quota, Pmm& pmm, KSpace& kernel, WorkQ
     resource::Usage usage;
     if (quota) {
         source = quota;
-        auto acquired = resource::acquire(source, resource::Budget{.memory = page_size});
+        auto acquired = resource::acquire(source, resource::Capacity{.memory = page_size});
         if (!acquired) return std::unexpected(VSpaceError::ResourceExhausted);
         usage = std::move(*acquired);
     }
@@ -341,7 +341,7 @@ void VSpace::release_root() noexcept {
         libk_assert(!quota_);
         return;
     }
-    const resource::Budget expected{
+    const resource::Capacity expected{
         .memory = static_cast<u64>(pages) * page_size,
     };
     libk_assert(table_charge_.amount() == expected);
@@ -362,7 +362,7 @@ auto VSpace::binding_count() const noexcept -> usize {
 
 auto VSpace::attach_execution() noexcept -> bool {
     sync::Lock guard{lock_};
-    if (state_ != VSpaceState::Live || bindings_ == std::numeric_limits<usize>::max()) {
+    if (state_ != VSpaceState::Live || (exec_flags_ & (EXEC_STOPPING | EXEC_STOPPED)) || bindings_ == std::numeric_limits<usize>::max()) {
         return false;
     }
     ++bindings_;
@@ -370,16 +370,75 @@ auto VSpace::attach_execution() noexcept -> bool {
 }
 
 void VSpace::detach_execution() noexcept {
-    bool ready{};
+    Source::Publication publication;
+    bool ready;
     {
         sync::Lock guard{lock_};
-        libk_assert(bindings_ != 0);
+        libk_assert(bindings_);
         --bindings_;
-        ready = state_ == VSpaceState::Stopping && bindings_ == 0;
+        if (!bindings_ && (exec_flags_ & EXEC_STOPPING)) {
+            libk_assert(execs_.empty());
+            exec_flags_ = (exec_flags_ & EXEC_FAILED) | EXEC_STOPPED;
+            publication = exec_events_.prepare(exec_flags_, true);
+        }
+        ready = state_ == VSpaceState::Stopping && !bindings_;
     }
-    if (ready) {
-        work_->post(job_);
+    if (ready) work_->post(job_);
+}
+
+auto VSpace::bind_exec(Exec& exec, object::Key owner, Source::Action stop) noexcept -> bool {
+    sync::Lock guard{lock_};
+    if (state_ != VSpaceState::Live || (exec_flags_ & (EXEC_STOPPING | EXEC_STOPPED))) return false;
+    libk_assert(bindings_ && !exec.hook.is_linked() && owner.valid() && stop);
+    exec.owner = owner; exec.stop = stop;
+    execs_.push_back(exec);
+    return true;
+}
+void VSpace::unbind_exec(Exec& exec) noexcept {
+    sync::Lock guard{lock_};
+    libk_assert(exec.hook.is_linked());
+    execs_.erase(exec);
+}
+auto VSpace::fail_exec(u64 thread, ThreadExit result) noexcept -> Source::Publication {
+    if (result.origin == EXIT_STOP || result.status == STATUS_OK) return {};
+    sync::Lock guard{lock_};
+    if (failed_thread_) return {};
+    failed_thread_ = thread; failure_ = result; exec_flags_ |= EXEC_FAILED;
+    return exec_events_.prepare(exec_flags_, true);
+}
+auto VSpace::exec_info() const noexcept -> ExecInfo {
+    sync::Lock guard{lock_};
+    return {.version=1, .size=sizeof(ExecInfo), .flags=exec_flags_,
+        .sequence=exec_events_.snapshot().sequence, .thread=failed_thread_, .failure=failure_};
+}
+void VSpace::stop_exec() noexcept {
+    Source::Publication publication;
+    {
+        sync::Lock guard{lock_};
+        if (exec_flags_ & (EXEC_STOPPING | EXEC_STOPPED)) return;
+        exec_flags_ |= bindings_ ? EXEC_STOPPING : EXEC_STOPPED;
+        publication = exec_events_.prepare(exec_flags_, true);
     }
+    work_->post(job_);
+}
+void VSpace::advance_exec() noexcept {
+    for (usize step = 0; step < 8; ++step) {
+        object::ref<> ticket;
+        Source::Action stop;
+        {
+            sync::Lock guard{lock_};
+            if (!(exec_flags_ & EXEC_STOPPING)) return;
+            // Rotate each claimed entry once; concurrent unlink never leaves a cursor.
+            auto it = execs_.begin();
+            if (it == execs_.end() || it->stopping) return;
+            auto& exec = *it;
+            exec.stopping = true;
+            ticket = object::ref<>::retain_alive(exec.owner); stop = exec.stop;
+            execs_.erase(exec); execs_.push_back(exec);
+        }
+        stop(); // No Exec access follows; this stop can complete on another CPU.
+    }
+    work_->post(job_);
 }
 
 auto VSpace::can_destroy_object(cap::VmLimit auth) const noexcept -> bool {
@@ -615,6 +674,7 @@ void VSpace::settle() noexcept {
 }
 
 void VSpace::retire(object::cleanup&& cleanup) noexcept {
+    stop_exec();
     bool can_start{};
     {
         sync::Lock guard{lock_};
@@ -847,7 +907,7 @@ auto VSpace::reserve_tables(MapPage* pages) noexcept -> std::expected<TableReser
         if (!bytes) {
             return std::unexpected(VSpaceError::ResourceExhausted);
         }
-        auto acquired = resource::acquire(quota_, resource::Budget{
+        auto acquired = resource::acquire(quota_, resource::Capacity{
                                                       .memory = bytes.value(),
                                                   });
         if (!acquired) {
@@ -868,13 +928,13 @@ auto VSpace::reserve_tables(MapPage* pages) noexcept -> std::expected<TableReser
 
 void VSpace::commit_tables(TableReserve& reserve) noexcept {
     if (reserve.usage) {
-        const resource::Budget charged = reserve.usage.amount();
+        const resource::Capacity charged = reserve.usage.amount();
         libk_assert(charged.caps == 0 && charged.memory % page_size == 0);
         const usize total = static_cast<usize>(charged.memory / page_size);
         libk_assert(total >= reserve.pages.page_count());
         const usize consumed = total - reserve.pages.page_count();
         if (consumed != 0) {
-            table_charge_.merge(reserve.usage.split(resource::Budget{
+            table_charge_.merge(reserve.usage.split(resource::Capacity{
                 .memory = static_cast<u64>(consumed) * page_size,
             }));
         }
@@ -889,7 +949,7 @@ void VSpace::retire_table(Flush& retire, OwnedPage&& page) noexcept {
         libk_assert(retire.adopt(std::move(page)));
         return;
     }
-    auto usage = table_charge_.split(resource::Budget{
+    auto usage = table_charge_.split(resource::Capacity{
         .memory = page_size,
     });
     libk_assert(retire.adopt(std::move(page), std::move(usage)));
@@ -1196,10 +1256,12 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
                     const auto perms = PageTable::user_perms(map->binding_->private_write_ && !page->private_owned() ? Perms::of(Perm::Read) : *edit.perms);
                     libk_assert(perms);
                     auto old = root_->protect(*vp, *perms); libk_assert(old);
+                    op.flush_.invalidate(page->address_);
                     libk_assert(fold_usage(*page, *old));
                 } else {
                     map->binding_->pages_.erase(*page);
                     auto old = root_->unmap(*vp); libk_assert(old);
+                    op.flush_.invalidate(page->address_, !old->tables.empty());
                     libk_assert(fold_usage(*page, old->usage));
                     for (auto& table : old->tables) retire_table(op.flush_, std::move(table));
                     queue_page(*page);
@@ -1329,7 +1391,7 @@ auto VSpace::fault(VmCtx ctx, va_t address, Perm perms, Source::Context* context
                 if (!touched) return std::unexpected(VSpaceError::TranslationCorrupt);
                 // Svade traps on A/D=0. A valid leaf can also be hidden by a
                 // stale negative translation; both require a local fence.
-                arch::flush_tlb_all();
+                tlb_.fence_local();
                 return (FaultResult{
                     .kind = FaultKind::Ready,
                     .mapping = mapping->key_,
@@ -1354,7 +1416,7 @@ auto VSpace::copy_private_fault(VmCtx ctx, Map& mapping, MapPage& source) noexce
     if (!pmm_->is_ram(source.page())) return std::unexpected(VSpaceError::NotRam);
     resource::Usage usage{};
     if (quota_) {
-        auto acquired = resource::acquire(quota_, resource::Budget{.memory = page_size});
+        auto acquired = resource::acquire(quota_, resource::Capacity{.memory = page_size});
         if (!acquired) return std::unexpected(VSpaceError::ResourceExhausted);
         usage = std::move(acquired).value();
     }
@@ -1391,6 +1453,7 @@ auto VSpace::copy_private_fault(VmCtx ctx, Map& mapping, MapPage& source) noexce
     libk_assert(permissions);
     auto replaced = editor.replace(*virtual_page, replacement->page(), *permissions);
     libk_assert(replaced);
+    retire.invalidate(source.address_);
     auto folded = fold_usage(source, *replaced);
     libk_assert(folded);
     auth.pages_.erase(source);
@@ -1407,7 +1470,7 @@ auto VSpace::copy_private_fault(VmCtx ctx, Map& mapping, MapPage& source) noexce
                         .status = committed});
 }
 
-auto VSpace::materialize_fault(VmCtx ctx, Map& mapping, va_t page_address, usize object_page,
+auto VSpace::materialize_fault(VmCtx, Map& mapping, va_t page_address, usize object_page,
                                Source::Context* context) noexcept
     -> std::expected<FaultResult, VSpaceError> {
     Edit editing{this};
@@ -1471,6 +1534,7 @@ auto VSpace::materialize_fault(VmCtx ctx, Map& mapping, va_t page_address, usize
     auto& editor = *root_;
     const auto virtual_page = VPage::from_base(page_address);
     libk_assert(virtual_page);
+    const bool nonleaf = tables.pages.page_count() != 0;
     auto installed = editor.map(*virtual_page, page->page(), *permissions, tables.pages);
     libk_assert(installed);
     commit_tables(tables);
@@ -1478,19 +1542,14 @@ auto VSpace::materialize_fault(VmCtx ctx, Map& mapping, va_t page_address, usize
     auth.pages_.insert(*page);
     if (memory->managed()) resident_ += page_size;
     rollback.release();
-    auto& retire = transaction().flush_;
-    auto committed =
-        commit_flush(std::move(mutation), ctx, retire, mapping.perms_.contains(Perm::Execute));
+    mutation.publish_leaf(page_address, nonleaf, mapping.perms_.contains(Perm::Execute));
     lock.restore();
     editing.reset();
-    if (committed == VmStatus::Complete) {
-        finish_bindings();
-    }
     return (FaultResult{
         .kind = FaultKind::Materialized,
         .mapping = key,
         .object_page = object_page,
-        .status = committed,
+        .status = VmStatus::Complete,
     });
 }
 
@@ -1550,6 +1609,7 @@ auto VSpace::sample_usage(VmCtx ctx, va_t address, bool clear) noexcept
     auto usage = fold_usage(*mapped, *cleared);
     libk_assert(usage);
     auto& retire = transaction().flush_;
+    retire.invalidate(page_range.base());
     auto committed = commit_flush(std::move(mutation), ctx, retire);
     lock.restore();
     if (committed != VmStatus::Complete) return std::unexpected(VSpaceError::Busy);
@@ -1659,6 +1719,7 @@ auto VSpace::start_invalidation(VmCtx ctx, Binding& auth) noexcept -> std::expec
         libk_assert(virtual_page);
         auto unmapped = editor.unmap(*virtual_page);
         libk_assert(unmapped);
+        retire.invalidate(page->address_, !unmapped->tables.empty());
         auto folded = fold_usage(*page, unmapped->usage);
         libk_assert(folded);
         for (auto& table : unmapped.value().tables) {
@@ -1806,9 +1867,9 @@ void VSpace::complete_cleanup() noexcept {
     {
         sync::Lock guard{lock_};
         if (state_ != VSpaceState::Quiescent || !cleanup_) return;
-        if (!settled_.drained()) {
+        if (!settled_.drained() || !exec_events_.drained()) {
             guard.restore();
-            settled_.close();
+            settled_.close(); exec_events_.close();
             return;
         }
         cleanup = std::move(*cleanup_);
@@ -1818,6 +1879,7 @@ void VSpace::complete_cleanup() noexcept {
 }
 
 void VSpace::run_work() noexcept {
+    advance_exec();
     object::ref<> operation;
     { sync::Lock guard{lock_}; operation = operation_; }
     if (operation && static_cast<VmOp*>(operation.get())->op().schedule()) return;

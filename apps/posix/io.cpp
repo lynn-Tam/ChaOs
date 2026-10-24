@@ -1,3 +1,5 @@
+#include <io.hpp>
+#include <libk/path.hpp>
 #include <string.h>
 #include <utility>
 #include <variant>
@@ -22,11 +24,8 @@
 #include <thread.hpp>
 
 static auto files() -> status_t;
-static constexpr size_t px_depth = 32, px_limit = 4096;
 enum class px_op { Read = 1, Write };
 struct px_cmd { uint64_t id{}; px_op operation{}; uint64_t offset{}, length{}; bool sequential{}; };
-enum : uint64_t { px_read = 1, px_write = 2, px_create = 4, px_truncate = 8, px_exclusive = 16, px_append = 32 };
-enum : status_t { px_exists = -256, px_not_dir, px_is_dir, px_not_empty, px_name_long, px_too_large, px_no_space, px_cross_device };
 
 struct open_desc;
 struct px_call { px_cmd command; void* destination{}; size_t slot{}; ubus_call call; };
@@ -41,6 +40,7 @@ struct px_context {
     ubus_conn rpc, bus;
     std::array<pending, IO_DEPTH> requests;
     request_id next{};
+    io_tx output;
     rt_cleanup cleanup;
     ~px_context();
 };
@@ -55,7 +55,7 @@ static auto px_local() -> px_context& {
 
 // An open description shares only immutable authority and buffer slots. Each
 // in-flight call belongs to its submitting thread, including its Reply/Port.
-class px_file {
+class px_session {
     cap_owner endpoint_;
     vm_area buffer_;
     cap_desc descriptor_;
@@ -63,13 +63,14 @@ class px_file {
     rt_mutex submit_;
     uint32_t slots_{};
     uint64_t next_{}, loan_{};
+    size_t limit_{}, depth_{}, stride_{};
     status_t error_{};
     uint64_t access_{};
+    bool closed_{};
     static constexpr std::array<std::string_view, 6> names{"Read", "Write", "Cancel", "Close", "Sync", "Stat"};
     std::array<word_t, names.size()> tokens_{};
 public:
-    ~px_file() {
-        if (endpoint_) { ubus_msg reply; (void)invoke("Close", {}, reply); }
+    ~px_session() {
         if (exported_) (void)sys::cap_revoke(exported_.selector());
         auto memory = std::move(buffer_.memory);
         if (const auto status = buffer_.close(); status != STATUS_OK) sys::exit(status);
@@ -88,30 +89,35 @@ public:
         ubus_conn peer;
         auto status = peer.adopt(std::move(endpoint)); if (status != STATUS_OK) return status;
         ubus_msg info; status = peer.invoke("Stat", {}, info); if (status != STATUS_OK) return status;
-        next_ = info.data["sequence"].as<uint64_t>().value_or(0);
+        const auto sequence = info.data["sequence"].as<uint64_t>(), size = info.data["size"].as<uint64_t>();
+        const auto limit = info.data["limit"].as<uint64_t>(), depth = info.data["depth"].as<uint64_t>();
+        if (!sequence || !size || !limit || !*limit || *limit > io_limit || !depth || !*depth || *depth > io_depth) return STATUS_PEER_FAULT;
+        next_ = *sequence; limit_ = *limit; depth_ = *depth; stride_ = (limit_ + 4095) & ~size_t{4095};
         for (size_t i = 0; i < names.size(); ++i) {
             tokens_[i] = peer.token(names[i]).value_or(0);
         }
         auto authority = peer.release(); if (!authority) return authority.error();
         endpoint_ = std::move(*authority);
-        auto memory = vm_area::create(rt_startup().alloc(), rt_vm(), 0, px_depth * px_limit);
+        auto memory = vm_area::create(rt_startup().alloc(), rt_vm(), 0, depth_ * stride_);
         if (!memory) return memory.error();
         buffer_ = std::move(*memory);
         const CapView view{.version=CAP_ATTENUATION_VERSION_CURRENT, .kind=ObjMem, .size=CAP_ATTENUATION_SIZE,
-            .rights=RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_REVOKE, .words={0, px_depth, VM_READ | VM_WRITE}};
+            .rights=RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_REVOKE, .words={0, depth_ * stride_ / 4096, VM_READ | VM_WRITE}};
         auto grant = descriptor_.derive(buffer_.memory.selector(), view); if (!grant) return grant.error();
-        exported_ = std::move(*grant); access_ = access & (px_read | px_write); return STATUS_OK;
+        exported_ = std::move(*grant); access_ = access & (io_read | io_write); return STATUS_OK;
     }
+    auto limits() const -> io_limits { return {limit_, depth_}; }
     auto submit(px_call& local, px_cmd command, void* data) -> status_t {
         std::lock_guard lock{submit_};
+        if (closed_) return STATUS_CLOSED;
         if (error_) return error_;
-        if (!endpoint_ || next_ == UINT64_MAX || command.length > px_limit || command.offset > UINT64_MAX - command.length) return STATUS_BAD_ARGS;
-        if (!(access_ & (command.operation == px_op::Read ? px_read : px_write))) return STATUS_INVALID_CAP;
-        if (slots_ == UINT32_MAX) return STATUS_BUSY;
+        if (!endpoint_ || next_ == UINT64_MAX || command.length > limit_ || command.offset > UINT64_MAX - command.length) return STATUS_BAD_ARGS;
+        if (!(access_ & (command.operation == px_op::Read ? io_read : io_write))) return STATUS_DENIED;
+        if (size_t(std::popcount(slots_)) == depth_) return STATUS_BUSY;
         const auto kind = size_t(command.operation);
         if (!tokens_[kind - 1]) return STATUS_INVALID_OP;
         local.slot = std::countr_one(slots_); command.id = ++next_;
-        const auto offset = local.slot * px_limit;
+        const auto offset = local.slot * stride_;
         local.command = command; local.destination = data;
         if (command.operation == px_op::Write && command.length)
             ::memcpy(reinterpret_cast<void*>(buffer_.address + offset), data, command.length);
@@ -127,6 +133,7 @@ public:
         return status;
     }
     auto completion(px_call& local) -> std::optional<int64_t> {
+        if (!local.call.pending()) return {};
         ubus_msg response;
         const auto status = local.call.poll(response); if (status == STATUS_WOULD_BLOCK) return {};
         auto outcome = status == STATUS_OK ? response.status : status;
@@ -134,7 +141,7 @@ public:
         if (outcome == STATUS_OK && (!count || *count > local.command.length)) outcome = STATUS_PEER_FAULT;
         const auto bytes = outcome == STATUS_OK ? *count : 0;
         if (bytes && local.destination && local.command.operation != px_op::Write)
-            ::memcpy(local.destination, reinterpret_cast<const void*>(buffer_.address + local.slot * px_limit), bytes);
+            ::memcpy(local.destination, reinterpret_cast<const void*>(buffer_.address + local.slot * stride_), bytes);
         {
             std::lock_guard lock{submit_};
             if (status != STATUS_OK && !error_) {
@@ -146,7 +153,7 @@ public:
         }
         return outcome == STATUS_OK ? int64_t(bytes) : int64_t(outcome);
     }
-    auto invoke(std::string_view name, ubus_msg q, ubus_msg& r) const -> status_t {
+    auto call(std::string_view name, ubus_msg q, ubus_msg& r) const -> status_t {
         const auto found = std::ranges::find(names, name); if (found == names.end()) return STATUS_INVALID_OP;
         q.tag = tokens_[found - names.begin()]; if (!q.tag) return STATUS_INVALID_OP;
         ubus_call call;
@@ -154,21 +161,18 @@ public:
         if (status != STATUS_OK) return status;
         const auto waited = call.wait(r); return waited == STATUS_OK ? r.status : waited;
     }
-    auto cancel(uint64_t id) const -> status_t { ubus_msg q, r; q.data.put("id", id); return invoke("Cancel", std::move(q), r); }
+    auto invoke(std::string_view name, ubus_msg q, ubus_msg& r) -> status_t {
+        std::lock_guard lock{submit_};
+        if (closed_) return STATUS_CLOSED;
+        if (name == "Close") closed_ = true;
+        if (error_) return error_;
+        if (next_ == UINT64_MAX) return STATUS_EXHAUSTED;
+        q.data.put("id", ++next_);
+        return call(name, std::move(q), r);
+    }
+    auto cancel(uint64_t id) const -> status_t { ubus_msg q, r; q.data.put("id", id); return call("Cancel", std::move(q), r); }
 };
 
-static auto px_path(std::string_view path, std::string_view base = "/") -> std::string {
-    std::string result = path.starts_with('/') ? std::string{path} : std::string{base} + "/" + std::string{path};
-    size_t size{}, cursor{};
-    while (cursor < result.size()) {
-        const auto begin = cursor; while (cursor < result.size() && result[cursor] != '/') ++cursor;
-        const std::string_view part{result.data() + begin, cursor - begin};
-        if (part == "..") { while (size && result[size - 1] != '/') --size; if (size) --size; }
-        else if (!part.empty() && part != ".") { if (size) result[size++] = '/'; ::memmove(result.data() + size, part.data(), part.size()); size += part.size(); }
-        ++cursor;
-    }
-    result.resize(size); result.insert(0, "/"); return result;
-}
 
 extern "C" auto __errno() -> int* {
     static thread_local int value;
@@ -213,28 +217,28 @@ static auto px_result(int64_t value) noexcept -> int64_t {
     case STATUS_PEER_CLOSED:
         errno = EPIPE;
         break;
-    case px_exists:
+    case io_exists:
         errno = EEXIST;
         break;
-    case px_not_dir:
+    case io_not_dir:
         errno = ENOTDIR;
         break;
-    case px_is_dir:
+    case io_is_dir:
         errno = EISDIR;
         break;
-    case px_not_empty:
+    case io_not_empty:
         errno = ENOTEMPTY;
         break;
-    case px_name_long:
+    case io_name_long:
         errno = ENAMETOOLONG;
         break;
-    case px_too_large:
+    case io_too_large:
         errno = EFBIG;
         break;
-    case px_cross_device:
+    case io_cross_device:
         errno = EXDEV;
         break;
-    case px_no_space:
+    case io_no_space:
         errno = ENOSPC;
         break;
     default:
@@ -249,7 +253,7 @@ static std::shared_ptr<const std::string> cwd = std::make_shared<const std::stri
 static auto px_cwd() -> std::shared_ptr<const std::string> {
     std::lock_guard lock{table_mutex}; return cwd;
 }
-static auto px_absolute(std::string_view path) -> std::string { return px_path(path, *px_cwd()); }
+static auto px_absolute(std::string_view path) -> std::string { return libk::path_normal(path, *px_cwd()); }
 
 struct directory {
     rt_mutex mutex;
@@ -261,7 +265,7 @@ struct directory {
 
 struct input_stream {
     cap_owner channel;
-    ubus_msg frame;
+    io_frame frame;
     bool ended{};
     uint64_t offset{};
 };
@@ -269,12 +273,14 @@ struct output_stream {
     cap_owner channel;
 };
 struct open_desc {
+    size_t fds{}; // Table ownership is independent of in-flight I/O/completion references.
     rt_mutex sequential;
-    std::variant<input_stream, output_stream, px_file> data;
-    auto queue() noexcept -> px_file& { return std::get<px_file>(data); }
+    std::variant<input_stream, output_stream, px_session> data;
+    auto queue() noexcept -> px_session& { return std::get<px_session>(data); }
 };
 static std::vector<std::shared_ptr<open_desc>> fds(3);
 static bool initialized;
+static status_t init_status{};
 static constinit rt_mutex init_mutex;
 static auto files() -> status_t {
     if (px_local().rpc.endpoint()) {
@@ -297,15 +303,18 @@ static auto desc(int fd) noexcept -> std::shared_ptr<open_desc> {
 }
 static auto file(int fd) noexcept -> std::shared_ptr<open_desc> {
     auto value = desc(fd);
-    return value && std::holds_alternative<px_file>(value->data) ? value : nullptr;
+    return value && std::holds_alternative<px_session>(value->data) ? value : nullptr;
 }
-static auto install(std::shared_ptr<open_desc> value) -> int {
-    std::lock_guard lock{table_mutex};
+static auto px_install(std::shared_ptr<open_desc> value) -> int {
+    ++value->fds;
     const auto slot = std::ranges::find(fds, nullptr);
     if (slot != fds.end()) { *slot = std::move(value); return slot - fds.begin(); }
     fds.push_back(std::move(value)); return fds.size() - 1;
 }
-static_assert(IO_DEPTH == px_depth && IO_LIMIT == px_limit);
+static auto install(std::shared_ptr<open_desc> value) -> int {
+    std::lock_guard lock{table_mutex}; return px_install(std::move(value));
+}
+static_assert(IO_DEPTH == io_depth && IO_LIMIT == io_limit);
 static auto finish(pending&) noexcept -> int64_t;
 px_context::~px_context() {
     for (auto& item : requests) if (item.file) {
@@ -355,7 +364,7 @@ static auto transfer(std::shared_ptr<open_desc> file, px_op op, void* data, uint
         return STATUS_BAD_ARGS;
     uint64_t done{};
     while (done < size) {
-        const auto count = size - done < IO_LIMIT ? size - done : uint64_t{IO_LIMIT};
+        const auto count = std::min(size - done, file->queue().limits().bytes);
         pending* item{};
         const auto status = enqueue(file, op, static_cast<uint8_t*>(data) + done, count,
                                     offset + done, !explicit_offset, true, item);
@@ -420,17 +429,18 @@ extern "C" int closedir(DIR* dir) {
 auto px_init() noexcept -> status_t {
     std::lock_guard init{init_mutex};
     if (initialized) return STATUS_BUSY;
+    if (init_status != STATUS_OK) return init_status;
     const auto& env = rt_startup();
-    initialized = true;
     std::array<cap_owner, 3> streams;
     auto status = px_local().bus.bind(env.environment); if (status != STATUS_OK) return status;
     ubus_msg setup; status = px_local().bus.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
+    init_status = STATUS_CLOSED; // Receive is consumed; a failed publication cannot repeat it.
     const std::array<std::string_view, 3> fields{"stdin", "stdout", "stderr"};
     for (size_t fd = 0; fd < streams.size(); ++fd) streams[fd] = setup.take(setup.data["message"][fields[fd]]);
     std::string initial_cwd{"/"};
     for (auto** value = environ; value && *value; ++value)
         if (const std::string_view entry{*value}; entry.starts_with("PWD=/")) {
-            initial_cwd = px_path(entry.substr(4));
+            initial_cwd = libk::path_normal(entry.substr(4));
             break;
         }
     std::array<std::shared_ptr<open_desc>, 3> initial_fds;
@@ -442,10 +452,17 @@ auto px_init() noexcept -> status_t {
             value->data.emplace<input_stream>().channel = std::move(streams[fd]);
         else
             value->data.emplace<output_stream>().channel = std::move(streams[fd]);
-        initial_fds[fd] = std::move(value);
+        value->fds = 1; initial_fds[fd] = std::move(value);
     }
+    if (std::atexit([] {
+        for (size_t fd = 0;; ++fd) {
+            { std::lock_guard lock{table_mutex}; if (fd == fds.size()) break; }
+            (void)::close(fd);
+        }
+    })) return init_status = STATUS_NO_MEMORY;
     auto path = std::make_shared<const std::string>(std::move(initial_cwd));
     { std::lock_guard lock{table_mutex}; cwd = std::move(path); std::move(initial_fds.begin(), initial_fds.end(), fds.begin()); }
+    initialized = true; init_status = STATUS_OK;
     return STATUS_OK;
 }
 
@@ -495,17 +512,17 @@ extern "C" int open(const char* path, int flags, ...) {
     const uint32_t mode = flags & 3u;
     if (mode == O_RDONLY && (flags & (O_CREAT | O_TRUNC | O_EXCL | O_APPEND)))
         return px_result(STATUS_BAD_ARGS);
-    uint64_t backend = mode == O_RDONLY   ? px_read
-                       : mode == O_WRONLY ? px_write
-                                          : px_read | px_write;
+    uint64_t backend = mode == O_RDONLY   ? io_read
+                       : mode == O_WRONLY ? io_write
+                                          : io_read | io_write;
     if (flags & O_CREAT)
-        backend |= px_create;
+        backend |= io_create;
     if (flags & O_TRUNC)
-        backend |= px_truncate;
+        backend |= io_truncate;
     if (flags & O_EXCL)
-        backend |= px_exclusive;
+        backend |= io_exclusive;
     if (flags & O_APPEND)
-        backend |= px_append;
+        backend |= io_append;
     cap_owner object;
     const auto absolute = px_absolute(path);
     auto status = files();
@@ -515,7 +532,9 @@ extern "C" int open(const char* path, int flags, ...) {
         query.data.put("action", "lend").put("bytes", uint64_t{192 * 1024}).put("caps", uint64_t{0}).put("kinds", word_t{OBJ_BIT(ObjChannel) | OBJ_BIT(ObjMem)});
         status = px_local().bus.invoke("Resource", std::move(query), reply);
         if (status != STATUS_OK) return px_result(status);
-        loan = *reply.data["loan"].as<uint64_t>();
+        const auto offered = reply.data["loan"].as<uint64_t>();
+        if (!offered || !*offered) return px_result(STATUS_PEER_FAULT);
+        loan = *offered;
         auto quota = reply.take(reply.data["quota"]);
         query = {};
         const auto budget_idx = query.attach(quota.selector(), RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE);
@@ -530,16 +549,28 @@ extern "C" int open(const char* path, int flags, ...) {
         return px_result(status);
     }
     auto value = std::make_shared<open_desc>();
-    auto& session = value->data.emplace<px_file>();
+    auto& session = value->data.emplace<px_session>();
     status = session.open(std::move(object), backend, loan);
     return status == STATUS_OK ? install(std::move(value)) : px_result(status);
 }
 
+extern "C" int32_t px_limits(int32_t fd, io_limits* limits) {
+    const auto value = file(fd);
+    if (!value) return STATUS_INVALID_CAP;
+    if (!limits || !std::holds_alternative<px_session>(value->data)) return STATUS_BAD_ARGS;
+    *limits = value->queue().limits(); return STATUS_OK;
+}
+
 extern "C" int32_t close(int32_t fd) {
     std::shared_ptr<open_desc> removed;
+    bool last;
     { std::lock_guard lock{table_mutex};
       if (fd < 0 || size_t(fd) >= fds.size() || !fds[fd]) return px_result(STATUS_INVALID_CAP);
-      removed = std::move(fds[fd]); }
+      removed = std::move(fds[fd]); last = !--removed->fds; }
+    if (last && std::holds_alternative<px_session>(removed->data)) {
+        ubus_msg response;
+        return px_result(removed->queue().invoke("Close", {}, response));
+    }
     return 0;
 }
 
@@ -574,33 +605,31 @@ extern "C" int32_t mkstemp(char* path) {
 }
 
 extern "C" int dup(int fd) {
-    auto value = desc(fd);
-    return value ? install(std::move(value)) : px_result(STATUS_INVALID_CAP);
+    std::lock_guard lock{table_mutex};
+    return fd < 0 || size_t(fd) >= fds.size() || !fds[fd] ? px_result(STATUS_INVALID_CAP) : px_install(fds[fd]);
 }
 
 extern "C" ssize_t read(int fd, void* data, size_t size) {
     auto value = desc(fd);
-    if (!value || size > INT64_MAX || (size && !data))
-        return px_result(STATUS_BAD_ARGS);
+    if (!value) return px_result(STATUS_INVALID_CAP);
+    if (size > INT64_MAX || (size && !data)) return px_result(STATUS_BAD_ARGS);
     std::lock_guard lock{value->sequential};
     if (auto* input = std::get_if<input_stream>(&value->data)) {
         if (size == 0)
             return px_result(0);
-        auto bytes = input->frame.data["data"].as<std::span<const std::byte>>().value_or(std::span<const std::byte>{});
-        while (input->offset == bytes.size()) {
+        while (input->offset == input->frame.size) {
             if (input->ended) return 0;
-            const auto status = ubus_receive_event(input->channel.selector(), input->frame, true);
+            const auto status = io_recv(input->channel.selector(), input->frame);
             if (status != STATUS_OK) return px_result(status);
             if (input->frame.status != STATUS_OK) return px_result(input->frame.status);
-            bytes = input->frame.data["data"].as<std::span<const std::byte>>().value_or(std::span<const std::byte>{});
-            input->ended = bytes.empty(); input->offset = 0;
+            input->ended = !input->frame.size; input->offset = 0;
         }
-        const auto count = std::min(size, bytes.size() - input->offset);
-        ::memcpy(data, bytes.data() + input->offset, count);
+        const auto count = std::min(size, input->frame.size - input->offset);
+        ::memcpy(data, input->frame.data + input->offset, count);
         input->offset += count;
         return px_result(count);
     }
-    return px_result(file(fd) ? transfer(value, px_op::Read, data, size, 0, false)
+    return px_result(std::holds_alternative<px_session>(value->data) ? transfer(value, px_op::Read, data, size, 0, false)
                               : STATUS_INVALID_CAP);
 }
 
@@ -677,11 +706,7 @@ extern "C" int32_t px_cancel(request_id id) {
 
 extern "C" int32_t fsync(int32_t fd) {
     auto opened = file(fd);
-    if (!opened)
-        return px_result(STATUS_BAD_ARGS);
-    const auto drained = drain(opened);
-    if (drained != STATUS_OK)
-        return px_result(drained);
+    if (!opened) return px_result(STATUS_INVALID_CAP);
     ubus_msg response;
     return px_result(opened->queue().invoke("Sync", {}, response));
 }
@@ -690,6 +715,14 @@ extern "C" int32_t px_sync(void) {
     const auto status = drain();
     if (status != STATUS_OK)
         return status;
+    std::vector<std::shared_ptr<open_desc>> opened;
+    { std::lock_guard lock{table_mutex};
+      for (const auto& file : fds) if (file && std::holds_alternative<px_session>(file->data)
+          && std::ranges::find(opened, file) == opened.end()) opened.push_back(file); }
+    for (const auto& file : opened) {
+        ubus_msg response; const auto status = file->queue().invoke("Sync", {}, response);
+        if (status != STATUS_OK) return status;
+    }
     const auto ready = files();
     ubus_msg reply; return ready == STATUS_OK ? px_local().rpc.invoke("Sync", {}, reply) : ready;
 }
@@ -745,7 +778,7 @@ extern "C" int32_t rename(const char* from, const char* to) {
     if (!from || !*from || !to || !*to)
         return px_result(STATUS_BAD_ARGS);
     const auto base = px_cwd();
-    const auto source = px_path(from, *base), target = px_path(to, *base);
+    const auto source = libk::path_normal(from, *base), target = libk::path_normal(to, *base);
     const auto status = files();
     ubus_msg query, reply; query.data.put("from", source).put("to", target);
     return px_result(status == STATUS_OK ? px_local().rpc.invoke("Rename", std::move(query), reply) : status);
@@ -755,7 +788,7 @@ extern "C" ssize_t write(int fd, const void* data, size_t size) {
     auto value = desc(fd);
     if (!value) return px_result(STATUS_INVALID_CAP);
     std::lock_guard lock{value->sequential};
-    if (std::holds_alternative<px_file>(value->data))
+    if (std::holds_alternative<px_session>(value->data))
         return px_result(transfer(value, px_op::Write, const_cast<void*>(data), size, 0, false));
     auto* output = value ? std::get_if<output_stream>(&value->data) : nullptr;
     if (!output)
@@ -766,12 +799,12 @@ extern "C" ssize_t write(int fd, const void* data, size_t size) {
     const auto* bytes = static_cast<const char*>(data);
     uint64_t done{};
     while (done < size) {
-        const auto chunk = std::min(size - done, size_t{80});
-        ubus_msg message; message.data.put("data", std::as_bytes(std::span{bytes + done, chunk}));
-        const auto status = ubus_send(output->channel.selector(), message);
+        io_frame frame; frame.size = std::min(size - done, io_stream_limit);
+        ::memcpy(frame.data, bytes + done, frame.size);
+        const auto status = px_local().output.send(output->channel.selector(), frame);
         if (status != STATUS_OK)
             return px_result(done != 0 ? static_cast<int64_t>(done) : status);
-        done += chunk;
+        done += frame.size;
     }
     return px_result(done);
 }
