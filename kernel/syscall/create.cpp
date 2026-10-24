@@ -774,19 +774,19 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto cspace_create(Call& inv
 
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto domain_create(Call& inv) noexcept -> Result {
     auto quota = resolve_pool(inv, cap::Right::Create);
-    auto parent = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Create));
+    auto parent = inv.cspace.resolve<sched::ScDomain>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Create));
     if (!quota || !parent) return returned(cap_status(!quota ? quota.error() : parent.error()));
     const auto budget = inv.cpu.dispatcher().clock().ticks<time::ns>(inv.trap.arg(2));
     const auto period = inv.cpu.dispatcher().clock().ticks<time::ns>(inv.trap.arg(3));
     if (!budget || !period || inv.trap.arg(4) > 65535) return returned(STATUS_BAD_ARGS);
-    const sched::Domain::Config config{.cpus=inv.trap.arg(5), .budget=*budget, .period=*period,
+    const sched::ScDomain::Config config{.cpus=inv.trap.arg(5), .budget=*budget, .period=*period,
         .weight=static_cast<u32>(inv.trap.arg(4))};
-    if (!sched::Domain::valid_config(config)) return returned(STATUS_BAD_ARGS);
-    auto admission = check_create<sched::Domain>(inv, *quota, object::pool<sched::Domain>::slot_usage());
+    if (!sched::ScDomain::valid_config(config)) return returned(STATUS_BAD_ARGS);
+    auto admission = check_create<sched::ScDomain>(inv, *quota, object::pool<sched::ScDomain>::slot_usage());
     if (!admission) return returned(admission.error());
-    auto fee = reserve(*quota, object::pool<sched::Domain>::slot_usage());
+    auto fee = reserve(*quota, object::pool<sched::ScDomain>::slot_usage());
     if (!fee) return returned(pool_error(fee.error()));
-    auto object = construct<sched::Domain>(inv, std::move(*fee), inv.cpu.objects.pmm(), *inv.cpu.cpus, config);
+    auto object = construct<sched::ScDomain>(inv, std::move(*fee), inv.cpu.objects.pmm(), *inv.cpu.cpus, config);
     if (!object) return returned(STATUS_NO_MEMORY);
     const auto opened = object->get().open();
     if (opened != STATUS_OK) return returned(opened);
@@ -803,7 +803,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto sc_create(Call& inv) no
     arch::TrapCtx& trap = inv.trap;
     auto pool = resolve_pool(inv, cap::Right::Create);
     auto domain =
-        inv.cspace.resolve<sched::Domain>(handle_of(trap.arg(1)), cap::Rights::of(cap::Right::Create));
+        inv.cspace.resolve<sched::ScDomain>(handle_of(trap.arg(1)), cap::Rights::of(cap::Right::Create));
     if (!pool || !domain) {
         return returned(cap_status(!pool ? pool.error() : domain.error()));
     }

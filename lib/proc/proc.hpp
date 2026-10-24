@@ -27,7 +27,7 @@ struct proc_auth { CreateAuth alloc{}; uint32_t cpus{}; cap_t domain{}; };
 struct proc_result {
     int code{};
     uint64_t thread{};
-    ThreadExit exit{.origin=EXIT_NORMAL, .kind=0, .status=STATUS_OK, .reserved=0, .pc=0, .address=0};
+    ThreadExit exit{.origin=EXIT_NORMAL, .kind=FAULT_NONE, .status=STATUS_OK, .reserved=0, .pc=0, .address=0};
 };
 
 class proc_task {

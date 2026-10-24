@@ -23,6 +23,20 @@ static_assert(sizeof(ThreadInit) == 104);
 #define EXIT_NORMAL 1U
 #define EXIT_FAULT 2U
 #define EXIT_STOP 3U
+// ThreadExit.kind: architecture-independent terminal fault causes.
+// Normal exit and administrative Stop use FAULT_NONE.
+#define FAULT_NONE       0U
+#define FAULT_UNKNOWN    1U
+#define FAULT_UNMAPPED   2U
+#define FAULT_GUARD      3U
+#define FAULT_PERMS      4U  // VSpace permission denial.
+#define FAULT_QUOTA      5U  // Logical resource capacity exhausted.
+#define FAULT_MEMORY     6U  // Physical memory allocation failed.
+#define FAULT_BACKING    7U
+#define FAULT_BREAKPOINT 8U
+#define FAULT_ILLEGAL    9U
+#define FAULT_ALIGN      10U
+#define FAULT_ACCESS     11U // Architectural instruction/load/store access fault.
 struct ThreadExit {
     uint32_t origin, kind;
     int32_t status;

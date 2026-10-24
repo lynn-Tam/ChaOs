@@ -21,22 +21,22 @@ class Cpus;
 
 namespace sched {
 
-class Domain;
+class ScDomain;
 class Dispatcher;
 
-// A real runnable position for Domain branches and Thread leaves.
+// A real runnable position for ScDomain branches and Thread leaves.
 // Only its home CPU changes these queue fields.
-struct Node final {
+struct ScNode final {
     libk::intrusive_tree_hook hook{};
     struct Less {
-        bool operator()(const Node& a, const Node& b) const noexcept {
+        bool operator()(const ScNode& a, const ScNode& b) const noexcept {
             return std::pair{a.service, a.sequence} < std::pair{b.service, b.sequence};
         }
     };
-    using Queue = libk::intrusive_tree<Node, &Node::hook, Less>;
+    using Queue = libk::intrusive_tree<ScNode, &ScNode::hook, Less>;
     Queue ready{};
-    Node* parent{};
-    Domain* domain{};
+    ScNode* parent{};
+    ScDomain* domain{};
     ::Thread* thread{};
     bool work{};
     u64 service{}, fraction{}, floor{}, sequence{};
@@ -45,14 +45,14 @@ struct Node final {
 
 // A conserved aggregate ledger. Escrow is unavailable to other CPUs until
 // its owner reaches a real scheduling boundary and settles actual execution.
-class Budget final : private libk::noncopyable_nonmovable {
+class ScBudget final : private libk::noncopyable_nonmovable {
 public:
     static constexpr usize max_refills = 8;
     struct Loan { u64 amount{}, generation{}; };
     struct Info { __int128 balance; u64 refill, escrow, generation, available, debt; };
-    Budget(u64 amount, u64 period, usize capacity = max_refills) noexcept
+    ScBudget(u64 amount, u64 period, usize capacity = max_refills) noexcept
         : amount_(amount), period_(period), capacity_(capacity), balance_(amount) { libk_assert(capacity && capacity <= max_refills); }
-    ~Budget() noexcept { libk_assert(!escrow_); }
+    ~ScBudget() noexcept { libk_assert(!escrow_); }
     auto info(u64 now) const noexcept -> Info;
     auto next_refill() const noexcept -> u64;
     auto reserve(u64 now, u64 limit) noexcept -> Loan;
@@ -85,7 +85,7 @@ class Dispatcher;
 
 class Sc;
 
-class Domain final : private libk::noncopyable_nonmovable {
+class ScDomain final : private libk::noncopyable_nonmovable {
 public:
     static constexpr usize max_depth = 32;
     struct Config { u64 cpus{}, budget{}, period{}; u32 weight{1024}; bool enabled{true}; };
@@ -98,11 +98,11 @@ public:
     }
     using Result = std::expected<void, Error>;
     struct Local {
-        Local(Domain&, CpuId) noexcept;
-        Domain& owner;
+        Local(ScDomain&, CpuId) noexcept;
+        ScDomain& owner;
         CpuId cpu;
-        Node node, work;
-        Deadline refill;
+        ScNode node, work;
+        ScDeadline refill;
         std::atomic<bool> active{};
         libk::intrusive_list_hook mail_hook{};
         object::ref<> ticket;
@@ -110,8 +110,8 @@ public:
         std::atomic<bool> stopped{}, waiting{};
         void wake() noexcept;
     };
-    Domain(mm::Pmm&, Cpus&, Config) noexcept;
-    ~Domain() noexcept;
+    ScDomain(mm::Pmm&, Cpus&, Config) noexcept;
+    ~ScDomain() noexcept;
     void bind_allocation(resource::Allocation& allocation) noexcept { alloc_quota_ = allocation.quota(); }
     template<class Transaction> auto reassign_usage(const object::ref<>& to, Transaction&& transaction) noexcept
         -> std::expected<u64, status_t> {
@@ -124,11 +124,11 @@ public:
     auto release(Work::Link&) noexcept -> bool;
     auto withdraw(Work&, bool permanent) noexcept -> object::ref<>;
     auto commit(Source::Action publish) noexcept -> bool;
-    auto attach(cap::Resolved<Domain>&) noexcept -> status_t;
-    auto attach(object::ref<Domain>, const cap::GrantPin* = nullptr) noexcept -> status_t;
+    auto attach(cap::Resolved<ScDomain>&) noexcept -> status_t;
+    auto attach(object::ref<ScDomain>, const cap::GrantPin* = nullptr) noexcept -> status_t;
     auto close() noexcept -> u32;
-    auto reparent(const cap::Resolved<Domain>& self, cap::Resolved<Domain>& parent) noexcept -> std::expected<u64, status_t>;
-    auto configure(Config, Domain* parent, std::optional<bool> enabled = {}) noexcept -> std::expected<u64, status_t>;
+    auto reparent(const cap::Resolved<ScDomain>& self, cap::Resolved<ScDomain>& parent) noexcept -> std::expected<u64, status_t>;
+    auto configure(Config, ScDomain* parent, std::optional<bool> enabled = {}) noexcept -> std::expected<u64, status_t>;
     void links(u64 cursor, LinkRecords& out) const noexcept {
         parent_binding_[0].links(out, LINK_PARENT, cursor); parent_binding_[1].links(out, LINK_PARENT, cursor);
     }
@@ -174,27 +174,27 @@ private:
     std::optional<Config> pending_config_;
     u64 requested_{}, applied_{};
     status_t config_status_{};
-    Budget budget_;
+    ScBudget budget_;
     std::atomic<u32> phase_{DOMAIN_OPEN};
-    Domain* children_{}, *prev_{}, *next_{}, *closing_child_{};
+    ScDomain* children_{}, *prev_{}, *next_{}, *closing_child_{};
     Sc* contexts_{}, *closing_sc_{};
     Work::Link* works_{}, *closing_work_{};
     using ParentBinding = cap::Bindings<1>;
     ParentBinding parent_binding_[2]{
-        {ParentBinding::Action::bind<&Domain::parent_revoked>(*this), ParentBinding::Action::bind<&Domain::post_close>(*this)},
-        {ParentBinding::Action::bind<&Domain::parent_revoked>(*this), ParentBinding::Action::bind<&Domain::post_close>(*this)}};
+        {ParentBinding::Action::bind<&ScDomain::parent_revoked>(*this), ParentBinding::Action::bind<&ScDomain::post_close>(*this)},
+        {ParentBinding::Action::bind<&ScDomain::parent_revoked>(*this), ParentBinding::Action::bind<&ScDomain::post_close>(*this)}};
     usize parent_slot_{};
-    object::ref<Domain> next_parent_, scan_;
-    Domain* pending_children_{}, *closing_pending_{}, *pending_prev_{}, *pending_next_{};
+    object::ref<ScDomain> next_parent_, scan_;
+    ScDomain* pending_children_{}, *closing_pending_{}, *pending_prev_{}, *pending_next_{};
     u64 scan_version_{};
     std::atomic<bool> relocating_{};
     void unstage() noexcept;
-    Src<DOMAIN_CLOSING | DOMAIN_DRAINED | DOMAIN_CONFIGURING> events_{Source::Drained::bind<&Domain::post_close>(*this)};
+    Src<DOMAIN_CLOSING | DOMAIN_DRAINED | DOMAIN_CONFIGURING> events_{Source::Drained::bind<&ScDomain::post_close>(*this)};
     WorkQueue* work_{};
-    Work close_work_{Work::Fn::bind<&Domain::finish_close>(*this)};
+    Work close_work_{Work::Fn::bind<&ScDomain::finish_close>(*this)};
     object::cleanup cleanup_{};
     object::ref<> alloc_quota_;
-    object::ref<Domain> parent_;
+    object::ref<ScDomain> parent_;
     mm::Slab<Local, false, false> locals_;
     resource::Usage index_fee_;
     mm::OwnedPage index_;
@@ -205,7 +205,7 @@ private:
 class Sc final : private libk::noncopyable_nonmovable {
 public:
     static constexpr bool fixed_usage = true;
-    static constexpr usize max_refills = Budget::max_refills;
+    static constexpr usize max_refills = ScBudget::max_refills;
     struct Config {
         u64 budget{}, period{}; // Both zero means uncapped.
         u64 cpus{~u64{0}};
@@ -227,7 +227,7 @@ public:
     auto next_refill() const noexcept -> u64;
     auto charge(u64 now, u64 elapsed) noexcept -> u64;
     auto bound() const noexcept -> bool { sync::Lock guard{lock_}; return owner_ != nullptr; }
-    auto admit(cap::Resolved<Domain>&, CpuId) noexcept -> Result;
+    auto admit(cap::Resolved<ScDomain>&, CpuId) noexcept -> Result;
     auto bind(object::ref<Sc>, Thread&) noexcept -> Result;
     auto bind(object::ref<Sc>, Thread&,
         const cap::Resolved<Sc>&, const cap::Resolved<Thread>&) noexcept -> Result;
@@ -244,7 +244,7 @@ public:
     void retire(object::cleanup&&) noexcept;
 
 private:
-    friend class Domain;
+    friend class ScDomain;
     friend class Dispatcher;
     friend class ::Thread;
     void domain_revoked() noexcept;
@@ -257,12 +257,12 @@ private:
     void record(u64 elapsed) noexcept;
     Src<SC_BOUND | SC_WITHDRAWING> events_{Source::Drained::bind<&Sc::post_close>(*this)};
     Config config_;
-    Budget budget_;
+    ScBudget budget_;
     mutable sync::Spin lock_{};
     Thread* owner_{}; // Thread owns the SC reference; retirement drains this relation.
     cap::Bindings<2> binding_{cap::Bindings<2>::Action::bind<&Sc::post_close>(*this),
         cap::Bindings<2>::Action::bind<&Sc::post_close>(*this)};
-    Domain* domain_{};
+    ScDomain* domain_{};
     Sc* prev_{}, *next_{};
     Dispatcher* location_{};
     u64 service_{}, fraction_{}, generation_{}, applied_{}, runtime_{}, lag_{};

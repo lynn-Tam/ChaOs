@@ -4,7 +4,7 @@
 #include <wait.hpp>
 #include <uapi/cap.h>
 
-namespace sched { class Domain; }
+namespace sched { class ScDomain; }
 
 // Common accepted-work lifetime and cancellation. Concrete providers own the
 // resources and hardware proof; this record only owns authority and results.

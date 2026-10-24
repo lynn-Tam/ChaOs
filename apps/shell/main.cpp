@@ -108,6 +108,7 @@ class sh_shell {
     void enqueue(std::string_view text, uint64_t owner = 0, uint64_t focus = 0) {
         while (!text.empty()) {
             if (output_.empty() || output_.back().owner != owner || output_.back().focus != focus
+                || (output_.back().tx && output_.back().tx->active())
                 || output_.back().frame.size == sizeof(sh_chunk::data)) {
                 if (output_.size() == 128) return; // Echo/status overflow; child streams stop draining at 64.
                 output_.push_back({{}, owner, focus, {}});

@@ -49,7 +49,7 @@ class Thread final : private libk::noncopyable_nonmovable {
             return events_.prepare(SOURCE_READY, true);
         }
         auto claim(status_t status) noexcept -> bool {
-            return bool(claim(ThreadExit{.origin=EXIT_NORMAL, .kind=0, .status=status, .reserved=0, .pc=0, .address=0}));
+            return bool(claim(ThreadExit{.origin=EXIT_NORMAL, .kind=FAULT_NONE, .status=status, .reserved=0, .pc=0, .address=0}));
         }
     };
     enum class State : u8 { Prepared, Ready, Running, Throttled, Blocked, Exited };
@@ -153,7 +153,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     friend class Wait;
     friend class sched::Dispatcher;
     friend class sched::Sc;
-    friend class sched::Domain;
+    friend class sched::ScDomain;
     auto can_bind(const sched::Sc&) const noexcept -> bool;
     void bind(object::ref<sched::Sc>, u64 generation) noexcept;
 
@@ -204,10 +204,10 @@ class Thread final : private libk::noncopyable_nonmovable {
     std::optional<u64> wait_when_;
     u64 home_epoch_{};
     bool transferred_{};
-    sched::Node ready_{.thread = this};
+    sched::ScNode ready_{.thread = this};
     libk::intrusive_list_hook maintenance_hook_{};
     libk::intrusive_list_hook mail_hook_{};
-    sched::Deadline refill_{sched::Deadline::Fn::bind<&Thread::refill>(*this)};
+    sched::ScDeadline refill_{sched::ScDeadline::Fn::bind<&Thread::refill>(*this)};
     void refill() noexcept;
     u8 actions_{};
     std::atomic<bool> mailed_{};

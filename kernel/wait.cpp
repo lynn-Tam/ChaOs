@@ -56,7 +56,7 @@ void Wait::wake() noexcept {
 }
 
 Source::Registration::Registration(Wait& owner) noexcept
-    : owner_(owner), deadline_(sched::Deadline::Fn::bind<&Registration::expire>(*this)) {}
+    : owner_(owner), deadline_(sched::ScDeadline::Fn::bind<&Registration::expire>(*this)) {}
 
 void Source::Registration::complete() noexcept { owner_.wake(); }
 

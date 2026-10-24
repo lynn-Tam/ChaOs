@@ -872,6 +872,28 @@ bool test_tables_share_reserve_and_retire(const TestContext&) noexcept {
     return pmm.free_page_count() == free && pmm.verify_invariants();
 }
 
+bool test_device_iova_bounds(const TestContext&) noexcept {
+    PmmFixture fixture{primary_memory_storage, make_available_map(384)};
+    if (!fixture) return false;
+    auto& pmm = fixture.memory();
+    auto table = mm::PageTable::create(pmm, mm::PageTable::Kind::Device);
+    auto payload = pmm.allocate_page();
+    if (!table || !payload) return false;
+    constexpr usize end = usize{1} << 38; // First-stage Sv39 low canonical half.
+    const auto last = *mm::VPage::from_base(mm::va_t{end - mm::page_size});
+    if (!table->map(last, 1, [&] { return payload->page(); }, arch::PtPerm::Rw)
+        || !table->query(last)) return false;
+    const auto free = pmm.free_page_count();
+    for (auto address : {end, usize{1} << 39, arch::PtKernelBegin}) {
+        const auto page = *mm::VPage::from_base(mm::va_t{address});
+        const auto mapped = table->map(page, 1, [&] { return payload->page(); }, arch::PtPerm::Rw);
+        const auto found = table->query(page);
+        if (mapped || mapped.error() != mm::PtErr::BadAddr || found || found.error() != mm::PtErr::BadAddr
+            || pmm.free_page_count() != free) return false;
+    }
+    return table->query(last)->page == payload->page();
+}
+
 bool test_direct_large_leaf(const TestContext&) noexcept {
     PmmFixture fixture{primary_memory_storage, make_available_map(384)};
     if (!fixture) return false;
@@ -1023,6 +1045,7 @@ bool test_node_key_survives_page_reuse(const TestContext&) noexcept {
 
 void register_allocator_tests(TestRegistry& registry) noexcept {
     (void)registry.add("pmm", "page tables share, reserve and retire actual frames", test_tables_share_reserve_and_retire);
+    (void)registry.add("pmm", "device IOVA obeys first-stage canonical bounds", test_device_iova_bounds);
     (void)registry.add("pmm", "direct map uses permanent large leaves", test_direct_large_leaf);
     (void)registry.add("slab", "returning a page cannot resurrect an old node key", test_node_key_survives_page_reuse);
     (void)registry.add("pmm", "owned page destruction releases its frame", test_allocate_owner_releases_on_destruction);

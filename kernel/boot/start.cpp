@@ -111,7 +111,7 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     for (auto hart : boot_info.cpus.span() | std::views::drop(1))
         if (!boot.cpus.add(hart, boot.objects, boot.grants, boot.vm, boot.clock))
             console::print<"cpu: prepare hart={} failed\n">(hart.raw);
-    auto domain = boot.objects.get<sched::Domain>().create(boot.pmm, boot.cpus, sched::Domain::Config{});
+    auto domain = boot.objects.get<sched::ScDomain>().create(boot.pmm, boot.cpus, sched::ScDomain::Config{});
     libk_assert(domain);
     libk_assert(domain->get().open() == STATUS_OK);
     boot.domain = std::move(*domain).publish();

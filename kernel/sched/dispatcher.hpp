@@ -51,9 +51,9 @@ public:
     [[nodiscard]] auto remaining_budget() const noexcept -> u64;
 
     [[nodiscard]] auto arm(
-        Deadline& deadline,
+        ScDeadline& deadline,
         u64 when) noexcept -> bool;
-    void disarm(Deadline& deadline) noexcept;
+    void disarm(ScDeadline& deadline) noexcept;
 
     [[noreturn]] void enter_idle() noexcept;
     void on_context_enter() noexcept;
@@ -64,7 +64,7 @@ public:
     [[nodiscard]] auto post_wake(Thread&) noexcept -> WakeResult;
     void request_stop(Thread&) noexcept;
     void drain_remote() noexcept;
-    void post(Domain::Local&) noexcept;
+    void post(ScDomain::Local&) noexcept;
     void yield() noexcept;
     void block_current() noexcept;
     [[noreturn]] void exit_current() noexcept;
@@ -79,7 +79,7 @@ public:
 
 private:
     friend class Sc;
-    friend struct Domain::Local;
+    friend struct ScDomain::Local;
     enum Action : u8 { Control = 1, Wake = 2, Stop = 4 };
     enum class StopDisposition : u8 {
         Deferred,
@@ -93,7 +93,7 @@ private:
     auto maintenance(const Thread&) const noexcept -> bool;
     void charge_to(u64 now) noexcept;
 
-    void insert(Deadline&, u64) noexcept;
+    void insert(ScDeadline&, u64) noexcept;
     void expire(u64 now) noexcept;
     void dispatch(
         DispatchReason reason,
@@ -129,13 +129,13 @@ private:
     Thread* idle_{};
     time::Clock* clock_{};
     Sc* current_sc_{};
-    Node* current_branch_{}, *current_work_{};
-    Budget::Loan loan_{};
-    struct Ticket { Domain* domain; Budget::Loan loan; };
-    std::array<Ticket, Domain::max_depth> tickets_{};
+    ScNode* current_branch_{}, *current_work_{};
+    ScBudget::Loan loan_{};
+    struct Ticket { ScDomain* domain; ScBudget::Loan loan; };
+    std::array<Ticket, ScDomain::max_depth> tickets_{};
     usize ticket_count_{};
     u64 duration_{};
-    auto reserve(Node*, Sc*, u64) noexcept -> bool;
+    auto reserve(ScNode*, Sc*, u64) noexcept -> bool;
     void settle(u64) noexcept;
     void drain_domains() noexcept;
     u64 loan_elapsed_{};
@@ -147,10 +147,10 @@ private:
     Thread* handoff_outgoing_{};
     DispatchReason handoff_reason_{DispatchReason::Exit};
     status_t handoff_exit_status_{STATUS_OK};
-    Node::Queue ready_;
-    void insert(Node&) noexcept;
-    void erase(Node&) noexcept;
-    void domain_ready(Domain::Local&, bool resched = true) noexcept;
+    ScNode::Queue ready_;
+    void insert(ScNode&) noexcept;
+    void erase(ScNode&) noexcept;
+    void domain_ready(ScDomain::Local&, bool resched = true) noexcept;
     libk::intrusive_list<Thread, &Thread::maintenance_hook_> maintenance_ready_{};
     Sc maintenance_;
     std::atomic<u64> fair_{};
@@ -162,10 +162,10 @@ private:
                  < std::pair{b.when_, reinterpret_cast<usize>(&b)};
         }
     };
-    libk::intrusive_tree<Deadline, &Deadline::hook_, Earlier> deadlines_{};
+    libk::intrusive_tree<ScDeadline, &ScDeadline::hook_, Earlier> deadlines_{};
     sync::Spin mail_lock_{};
     libk::intrusive_list<Thread, &Thread::mail_hook_> mail_{};
-    libk::intrusive_list<Domain::Local, &Domain::Local::mail_hook> domains_{};
+    libk::intrusive_list<ScDomain::Local, &ScDomain::Local::mail_hook> domains_{};
     bool has_timer_{};
     bool has_ipi_{};
     std::optional<u64> timer_;

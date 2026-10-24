@@ -26,7 +26,7 @@ struct Boot {
     object::Objects objects;
     cap::Graph grants;
     Cpus cpus;
-    object::ref<sched::Domain> domain;
+    object::ref<sched::ScDomain> domain;
     object::ref<resource::Quota> root;
     object::ref<object::Scope> scope;
     object::ref<mm::Phys> physical;

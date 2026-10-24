@@ -8,7 +8,7 @@
 #include <limits>
 
 namespace sched {
-auto Budget::info(u64 now) const noexcept -> Info {
+auto ScBudget::info(u64 now) const noexcept -> Info {
     sync::Lock guard{lock_};
     auto balance = balance_;
     u64 refill{};
@@ -20,14 +20,14 @@ auto Budget::info(u64 now) const noexcept -> Info {
         !amount_ ? std::numeric_limits<u64>::max() : balance > 0 ? static_cast<u64>(balance) : 0,
         balance < 0 ? static_cast<u64>(-balance) : 0};
 }
-void Budget::mature(u64 now) noexcept {
+void ScBudget::mature(u64 now) noexcept {
     libk_assert(lock_.held());
     while (!refills_.empty() && refills_.front().ready <= now) {
         balance_ += static_cast<__int128>(refills_.front().amount);
         refills_.pop_front();
     }
 }
-auto Budget::next_refill() const noexcept -> u64 {
+auto ScBudget::next_refill() const noexcept -> u64 {
     sync::Lock guard{lock_};
     auto balance = balance_;
     for (const auto& r : refills_) {
@@ -36,7 +36,7 @@ auto Budget::next_refill() const noexcept -> u64 {
     }
     return std::numeric_limits<u64>::max(); // Outstanding escrow must really return.
 }
-auto Budget::reserve(u64 now, u64 limit) noexcept -> Loan {
+auto ScBudget::reserve(u64 now, u64 limit) noexcept -> Loan {
     sync::Lock guard{lock_};
     mature(now);
     if (!amount_) return {0, generation_};
@@ -44,7 +44,7 @@ auto Budget::reserve(u64 now, u64 limit) noexcept -> Loan {
     balance_ -= static_cast<__int128>(amount); escrow_ += amount;
     return {amount, generation_};
 }
-void Budget::record(u64 now, u64 elapsed) noexcept {
+void ScBudget::record(u64 now, u64 elapsed) noexcept {
     libk_assert(lock_.held());
     mature(now);
     if (!amount_ || !elapsed) return;
@@ -66,19 +66,19 @@ void Budget::record(u64 now, u64 elapsed) noexcept {
         auto& last = refills_.back(); last.ready = std::max(last.ready, ready); last.amount += elapsed;
     } else libk_assert(refills_.try_emplace_back(Refill{ready, elapsed}));
 }
-auto Budget::settle(Loan loan, u64 now, u64 elapsed) noexcept -> bool {
+auto ScBudget::settle(Loan loan, u64 now, u64 elapsed) noexcept -> bool {
     sync::Lock guard{lock_};
     libk_assert(loan.generation == generation_ && loan.amount <= escrow_);
     balance_ += static_cast<__int128>(loan.amount); escrow_ -= loan.amount;
     record(now, elapsed);
     return !amount_ || balance_ > 0;
 }
-auto Budget::consume(u64 now, u64 elapsed) noexcept -> u64 {
+auto ScBudget::consume(u64 now, u64 elapsed) noexcept -> u64 {
     sync::Lock guard{lock_};
     record(now, elapsed);
     return balance_ < 0 ? static_cast<u64>(-balance_) : 0;
 }
-auto Budget::configure(u64 amount, u64 period, usize capacity, u64 now) noexcept -> bool {
+auto ScBudget::configure(u64 amount, u64 period, usize capacity, u64 now) noexcept -> bool {
     sync::Lock guard{lock_};
     if (escrow_ || generation_ == std::numeric_limits<u64>::max()) return false;
     mature(now);
@@ -103,19 +103,19 @@ auto Budget::configure(u64 amount, u64 period, usize capacity, u64 now) noexcept
     return true;
 }
 
-Domain::Local::Local(Domain& owner, CpuId cpu) noexcept
+ScDomain::Local::Local(ScDomain& owner, CpuId cpu) noexcept
     : owner(owner), cpu(cpu), node{.domain=&owner, .weight=owner.config_.weight},
       work{.parent=&node, .domain=&owner, .work=true},
-      refill(Deadline::Fn::bind<&Local::wake>(*this)) {}
-void Domain::Local::wake() noexcept { current_cpu().dispatcher().domain_ready(*this); }
-Domain::Domain(mm::Pmm& pmm, Cpus& cpus, Config config) noexcept
+      refill(ScDeadline::Fn::bind<&Local::wake>(*this)) {}
+void ScDomain::Local::wake() noexcept { current_cpu().dispatcher().domain_ready(*this); }
+ScDomain::ScDomain(mm::Pmm& pmm, Cpus& cpus, Config config) noexcept
     : pmm_(pmm), cpus_(cpus), count_(cpus.count()),
       config_(config.cpus ? config : Config{.cpus = count_ >= 64 ? ~u64{} : (u64{1} << count_) - 1}),
       budget_(config_.budget, config_.period),
       locals_(pmm, mm::Slab<Local, false, false>::quota_for(count_)) {
     libk_assert(count_ && valid_config(config_));
 }
-Domain::~Domain() noexcept {
+ScDomain::~ScDomain() noexcept {
     libk_assert(!contexts_ && !works_ && !children_ && !parent_ && !next_parent_ && !pending_children_ && parent_binding_[0].drained() && parent_binding_[1].drained() && !pending_mail_ && !cleanup_);
     if (work_) work_->close(close_work_);
     for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (nodes_[cpu]) {
@@ -123,7 +123,7 @@ Domain::~Domain() noexcept {
         locals_.destroy(*nodes_[cpu]);
     }
 }
-auto Domain::open() noexcept -> status_t {
+auto ScDomain::open() noexcept -> status_t {
     static_assert(MaxCpus * sizeof(Local*) <= mm::page_size);
     auto fee = resource::acquire(alloc_quota_, {.memory = mm::page_size});
     if (!fee) return STATUS_NO_MEMORY;
@@ -132,7 +132,7 @@ auto Domain::open() noexcept -> status_t {
     index_ = std::move(*page); index_fee_ = std::move(*fee);
     nodes_ = {reinterpret_cast<Local**>(index_.bytes()), count_};
     std::ranges::fill(nodes_, nullptr);
-    ordinary_.bind(WorkQueue::Wake::bind<&Domain::wake_work>(*this));
+    ordinary_.bind(WorkQueue::Wake::bind<&ScDomain::wake_work>(*this));
     for (usize cpu = 0; cpu < nodes_.size(); ++cpu) {
         auto made = locals_.create(alloc_quota_, *this, CpuId{cpu});
         if (!made) return STATUS_NO_MEMORY;
@@ -141,7 +141,7 @@ auto Domain::open() noexcept -> status_t {
     }
     return STATUS_OK;
 }
-void Domain::wake_work(CpuId cpu) noexcept {
+void ScDomain::wake_work(CpuId cpu) noexcept {
     if (accepting()) {
         if (!allows(cpu)) {
             const auto config = info(0);
@@ -151,7 +151,7 @@ void Domain::wake_work(CpuId cpu) noexcept {
     }
     else post_close();
 }
-auto Domain::post(Work& work, libk::delegate<bool() noexcept> check) noexcept -> status_t {
+auto ScDomain::post(Work& work, libk::delegate<bool() noexcept> check) noexcept -> status_t {
     if (!work.cancelable()) return STATUS_BAD_ARGS;
     auto ticket = object::ref<>::retain_alive(work.key());
     std::optional<CpuId> wake;
@@ -162,12 +162,12 @@ auto Domain::post(Work& work, libk::delegate<bool() noexcept> check) noexcept ->
     }
     ordinary_.wake(wake); return STATUS_OK;
 }
-auto Domain::commit(Source::Action publish) noexcept -> bool {
+auto ScDomain::commit(Source::Action publish) noexcept -> bool {
     sync::Lock guard{tree_lock_};
     if (!lineage_admitting()) return false;
     publish(); return true;
 }
-auto Domain::admit(Work::Link& link, libk::delegate<status_t() noexcept> publish) noexcept -> status_t {
+auto ScDomain::admit(Work::Link& link, libk::delegate<status_t() noexcept> publish) noexcept -> status_t {
     sync::Lock guard{tree_lock_};
     if (!lineage_admitting()) return STATUS_CLOSED;
     libk_assert(!link.linked_ && !link.flights_);
@@ -178,7 +178,7 @@ auto Domain::admit(Work::Link& link, libk::delegate<status_t() noexcept> publish
     works_ = &link; link.linked_ = true;
     return STATUS_OK;
 }
-auto Domain::release(Work::Link& link) noexcept -> bool {
+auto ScDomain::release(Work::Link& link) noexcept -> bool {
     {
         sync::Lock guard{tree_lock_};
         if (link.flights_) return false;
@@ -191,18 +191,18 @@ auto Domain::release(Work::Link& link) noexcept -> bool {
     }
     post_close(); return true;
 }
-auto Domain::withdraw(Work& work, bool permanent) noexcept -> object::ref<> {
+auto ScDomain::withdraw(Work& work, bool permanent) noexcept -> object::ref<> {
     object::ref<> ticket;
     { sync::Lock guard{tree_lock_}; ticket = ordinary_.close(work, permanent); }
     post_close(); return ticket;
 }
-auto Domain::attach(cap::Resolved<Domain>& parent_cap) noexcept -> status_t {
+auto ScDomain::attach(cap::Resolved<ScDomain>& parent_cap) noexcept -> status_t {
     auto parent = parent_cap.reference();
     if (!parent) return STATUS_CLOSED;
     const auto& grant = parent_cap.pin();
-    return attach(std::move(*parent).as<Domain>().value(), &grant);
+    return attach(std::move(*parent).as<ScDomain>().value(), &grant);
 }
-auto Domain::attach(object::ref<Domain> parent, const cap::GrantPin* grant) noexcept -> status_t {
+auto ScDomain::attach(object::ref<ScDomain> parent, const cap::GrantPin* grant) noexcept -> status_t {
     auto self = object::ref<>::retain_alive(close_work_.key());
     sync::Lock guard{tree_lock_};
     if (!parent || parent_ || !parent->lineage_open() || phase_ != DOMAIN_OPEN
@@ -221,26 +221,26 @@ auto Domain::attach(object::ref<Domain> parent, const cap::GrantPin* grant) noex
     }
     return object::ref<>::publish(gates, commit) ? STATUS_OK : STATUS_CLOSED;
 }
-auto Domain::depth() const noexcept -> usize {
+auto ScDomain::depth() const noexcept -> usize {
     libk_assert(tree_lock_.held());
     usize result{};
     for (auto* node = this; node; node = node->parent_ ? &node->parent_.get() : nullptr) ++result;
     return result;
 }
-auto Domain::lineage_open() const noexcept -> bool {
+auto ScDomain::lineage_open() const noexcept -> bool {
     libk_assert(tree_lock_.held());
     for (auto* node = this; node; node = node->parent_ ? &node->parent_.get() : nullptr)
         if (!node->accepting()) return false;
     return true;
 }
-auto Domain::lineage_admitting() const noexcept -> bool {
+auto ScDomain::lineage_admitting() const noexcept -> bool {
     libk_assert(tree_lock_.held());
     for (auto* node = this; node; node = node->parent_ ? &node->parent_.get() : nullptr)
         if (node->phase_ == DOMAIN_CLOSING || node->phase_ == DOMAIN_DRAINED
             || !object::ref<>::admitting(node->close_work_.key())) return false;
     return true;
 }
-void Domain::unstage() noexcept {
+void ScDomain::unstage() noexcept {
     libk_assert(tree_lock_.held() && next_parent_);
     if (next_parent_->closing_pending_ == this) next_parent_->closing_pending_ = pending_next_;
     if (pending_prev_) pending_prev_->pending_next_ = pending_next_;
@@ -248,13 +248,13 @@ void Domain::unstage() noexcept {
     if (pending_next_) pending_next_->pending_prev_ = pending_prev_;
     pending_prev_ = pending_next_ = nullptr;
 }
-auto Domain::reparent(const cap::Resolved<Domain>& self, cap::Resolved<Domain>& parent_cap) noexcept
+auto ScDomain::reparent(const cap::Resolved<ScDomain>& self, cap::Resolved<ScDomain>& parent_cap) noexcept
     -> std::expected<u64, status_t> {
     auto target = parent_cap.reference();
     auto storage = self.reference();
-    auto scan = object::ref<Domain>::retain_alive(close_work_.key());
+    auto scan = object::ref<ScDomain>::retain_alive(close_work_.key());
     if (!target || !storage) return std::unexpected(STATUS_CLOSED);
-    auto parent = std::move(*target).as<Domain>().value();
+    auto parent = std::move(*target).as<ScDomain>().value();
     Source::Publication publication;
     u64 sequence;
     { sync::Lock guard{tree_lock_};
@@ -291,8 +291,8 @@ auto Domain::reparent(const cap::Resolved<Domain>& self, cap::Resolved<Domain>& 
     if (publication) object::changed(close_work_.key());
     publication.publish(); notify(true); post_close(); return sequence;
 }
-auto Domain::finish_move() noexcept -> bool {
-    std::array<object::ref<Domain>, 10> released;
+auto ScDomain::finish_move() noexcept -> bool {
+    std::array<object::ref<ScDomain>, 10> released;
     usize releases{};
     // The proposed parent has its own real membership until either commit or
     // cancellation; close of either parent can therefore find this child.
@@ -302,7 +302,7 @@ auto Domain::finish_move() noexcept -> bool {
       for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (!nodes_[cpu]->stopped) return true;
       if (scan_version_ != tree_version_) {
           released[releases++] = std::move(scan_);
-          scan_ = object::ref<Domain>::retain_alive(close_work_.key());
+          scan_ = object::ref<ScDomain>::retain_alive(close_work_.key());
           scan_version_ = tree_version_;
       }
       for (usize step = 0; scan_ && step < 8; ++step) {
@@ -310,13 +310,13 @@ auto Domain::finish_move() noexcept -> bool {
           if (node->depth() - depth() + 1 + next_parent_->depth() > max_depth) {
               config_status_ = STATUS_BAD_ARGS; released[releases++] = std::move(scan_); break;
           }
-          Domain* next = node->children_;
+          ScDomain* next = node->children_;
           if (!next) {
               while (node != this && !node->next_) node = &node->parent_.get();
               if (node != this) next = node->next_;
           }
           released[releases++] = std::move(scan_);
-          scan_ = next ? object::ref<Domain>::retain_alive(next->close_work_.key()) : object::ref<Domain>{};
+          scan_ = next ? object::ref<ScDomain>::retain_alive(next->close_work_.key()) : object::ref<ScDomain>{};
       }
       if (scan_) { post_close(); return true; }
       if (config_status_ == STATUS_PENDING && !relocating_) {
@@ -330,7 +330,7 @@ auto Domain::finish_move() noexcept -> bool {
     { sync::Lock guard{tree_lock_}; failed = config_status_ != STATUS_PENDING; }
     if (!parent_binding_[failed ? 1 - parent_slot_ : parent_slot_].close()) return true;
     Source::Publication publication;
-    object::ref<Domain> old;
+    object::ref<ScDomain> old;
     bool changed{};
     { sync::Lock guard{tree_lock_};
       if (phase_ != DOMAIN_CONFIGURING) return true;
@@ -362,18 +362,18 @@ auto Domain::finish_move() noexcept -> bool {
     if (changed) notify(true);
     return true;
 }
-auto Domain::info(u64 now) const noexcept -> DomainInfo {
+auto ScDomain::info(u64 now) const noexcept -> DomainInfo {
     sync::Lock guard{tree_lock_};
     const auto b = budget_.info(now);
     return {.version=3, .size=sizeof(DomainInfo), .cpus=config_.cpus, .budget=config_.budget,
         .period=config_.period, .available=b.available, .debt=b.debt, .escrow=b.escrow,
         .weight=config_.weight, .phase=phase_.load(), .requested=requested_, .applied=applied_, .runtime=runtime_.load(), .work_runtime=work_runtime_.load(), .status=config_status_, .flags=(config_.enabled ? DOMAIN_ENABLED : 0U) | ((pending_config_ ? pending_config_->enabled : config_.enabled) ? DOMAIN_REQUESTED_ENABLED : 0U)};
 }
-void Domain::notify(bool all) noexcept {
+void ScDomain::notify(bool all) noexcept {
     for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (nodes_[cpu] && (all || nodes_[cpu]->waiting.exchange(false, std::memory_order_acq_rel)))
         cpus_.get(CpuId{cpu})->dispatcher().post(*nodes_[cpu]);
 }
-auto Domain::close() noexcept -> u32 {
+auto ScDomain::close() noexcept -> u32 {
     Source::Publication publication;
     bool changed{};
     { sync::Lock guard{tree_lock_};
@@ -389,7 +389,7 @@ auto Domain::close() noexcept -> u32 {
     if (changed) notify(true);
     post_close(); return phase_.load();
 }
-auto Domain::configure(Config config, Domain* parent, std::optional<bool> enabled) noexcept -> std::expected<u64, status_t> {
+auto ScDomain::configure(Config config, ScDomain* parent, std::optional<bool> enabled) noexcept -> std::expected<u64, status_t> {
     u64 sequence;
     Source::Publication publication;
     { sync::Lock guard{tree_lock_};
@@ -416,12 +416,12 @@ auto Domain::configure(Config config, Domain* parent, std::optional<bool> enable
     publication.publish();
     notify(true); post_close(); return sequence;
 }
-void Domain::retire(object::cleanup&& cleanup) noexcept {
+void ScDomain::retire(object::cleanup&& cleanup) noexcept {
     { sync::Lock guard{tree_lock_}; cleanup_ = std::move(cleanup); }
     static_cast<void>(close());
 }
-void Domain::post_close() noexcept { if (work_) work_->post(close_work_); }
-void Domain::finish_close() noexcept {
+void ScDomain::post_close() noexcept { if (work_) work_->post(close_work_); }
+void ScDomain::finish_close() noexcept {
     Source::Publication publication;
     bool configured{};
     { sync::Lock guard{tree_lock_};
@@ -430,7 +430,7 @@ void Domain::finish_close() noexcept {
           for (usize cpu = 0; cpu < nodes_.size(); ++cpu) if (nodes_[cpu] && !nodes_[cpu]->stopped) return;
           libk_assert(pending_config_);
           const auto config = *pending_config_;
-          config_status_ = budget_.configure(config.budget, config.period, Budget::max_refills,
+          config_status_ = budget_.configure(config.budget, config.period, ScBudget::max_refills,
               current_cpu().dispatcher().clock().rd_ticks()) ? STATUS_OK : STATUS_BUSY;
           if (config_status_ == STATUS_OK) config_ = config;
           pending_config_.reset(); applied_ = requested_;
@@ -451,7 +451,7 @@ void Domain::finish_close() noexcept {
     // unresponsive home before requesting the others to drain.
     for (usize step = 0; step < 8; ++step) {
         object::ref<Sc> sc;
-        object::ref<Domain> child;
+        object::ref<ScDomain> child;
         Work::Link* claimed{};
         object::ref<> execution;
         Work::Fn cancel, ready;
@@ -462,10 +462,10 @@ void Domain::finish_close() noexcept {
               execution = object::ref<>::retain_alive(claimed->owner_);
               ++claimed->flights_; cancel = claimed->cancel_; ready = claimed->ready_;
           } else if (closing_child_) {
-              child = object::ref<Domain>::retain_alive(closing_child_->close_work_.key());
+              child = object::ref<ScDomain>::retain_alive(closing_child_->close_work_.key());
               closing_child_ = closing_child_->next_;
           } else if (closing_pending_) {
-              child = object::ref<Domain>::retain_alive(closing_pending_->close_work_.key());
+              child = object::ref<ScDomain>::retain_alive(closing_pending_->close_work_.key());
               closing_pending_ = closing_pending_->pending_next_;
           } else if (closing_sc_) {
               sc = object::ref<Sc>::retain_alive(closing_sc_->close_work_.key());
@@ -489,13 +489,13 @@ void Domain::finish_close() noexcept {
       if (!ordinary_.drained()) return;
     }
     if (!parent_binding_[0].close() || !parent_binding_[1].close()) return;
-    object::ref<Domain> staged, scan;
+    object::ref<ScDomain> staged, scan;
     { sync::Lock guard{tree_lock_};
       scan = std::move(scan_);
       if (next_parent_) { unstage(); staged = std::move(next_parent_); }
     }
     if (staged) staged->post_close();
-    object::ref<Domain> parent;
+    object::ref<ScDomain> parent;
     { sync::Lock guard{tree_lock_};
       if (parent_) {
           parent = std::move(parent_); ++tree_version_;
@@ -520,10 +520,10 @@ void Domain::finish_close() noexcept {
     { sync::Lock guard{tree_lock_}; done = std::move(cleanup_); }
     if (done) { work_->close(close_work_); done.complete(); }
 }
-auto Domain::admit(Sc& sc, CpuId cpu) noexcept -> Result {
+auto ScDomain::admit(Sc& sc, CpuId cpu) noexcept -> Result {
     sync::Lock guard{tree_lock_}; return admit_locked(sc, cpu);
 }
-auto Domain::admit_locked(Sc& sc, CpuId cpu) noexcept -> Result {
+auto ScDomain::admit_locked(Sc& sc, CpuId cpu) noexcept -> Result {
     libk_assert(tree_lock_.held());
     if (!lineage_open()) return std::unexpected(Error::Busy);
     if (!allows_locked(cpu) || !(sc.config_.cpus & (u64{1} << cpu.raw))) return std::unexpected(Error::InvalidCpu);
@@ -534,7 +534,7 @@ auto Domain::admit_locked(Sc& sc, CpuId cpu) noexcept -> Result {
     contexts_ = &sc;
     return {};
 }
-auto Domain::unadmit(Sc& sc) noexcept -> Result {
+auto ScDomain::unadmit(Sc& sc) noexcept -> Result {
     { sync::Lock guard{tree_lock_};
       if (sc.domain_ != this) return std::unexpected(Error::NotAdmitted);
       if (sc.owner_) return std::unexpected(Error::Busy);
@@ -593,7 +593,7 @@ auto Sc::configure(Config config, u64 now) noexcept -> Result {
     libk::scope_exit notify{[&]() noexcept { if (changed) state_changed(); }};
     sync::Lock guard{lock_};
     if (!valid_config(config) || !domain_ || withdrawing_) return std::unexpected(Error::InvalidConfig);
-    sync::Lock topology{Domain::tree_lock_};
+    sync::Lock topology{ScDomain::tree_lock_};
     if (domain_->phase_ != DOMAIN_OPEN) return std::unexpected(Error::Active);
     if (owner_) return std::unexpected(Error::Active);
     for (usize cpu = 0; cpu < 64; ++cpu)
@@ -617,12 +617,12 @@ void Sc::state_changed() noexcept {
     }
     if (changed) object::changed(close_work_.key());
 }
-auto Sc::admit(cap::Resolved<Domain>& parent_cap, CpuId cpu) noexcept -> Result {
+auto Sc::admit(cap::Resolved<ScDomain>& parent_cap, CpuId cpu) noexcept -> Result {
     auto target = parent_cap.reference();
     auto self = object::ref<>::retain_alive(close_work_.key());
     if (!target) return std::unexpected(Error::NotAdmitted);
     sync::Lock guard{lock_};
-    sync::Lock topology{Domain::tree_lock_};
+    sync::Lock topology{ScDomain::tree_lock_};
     auto& domain = parent_cap.object();
     if (domain_ || withdrawing_ || !domain.lineage_open()) return std::unexpected(Error::AlreadyAdmitted);
     if (!domain.allows_locked(cpu) || !(config_.cpus & (u64{1} << cpu.raw))) return std::unexpected(Error::WrongCpu);
@@ -647,7 +647,7 @@ auto Sc::bind(object::ref<Sc> self, Thread& target) noexcept -> Result {
     Result result = std::unexpected(Error::Active);
     Dispatcher* home{};
     { sync::Lock guard{lock_};
-      sync::Lock topology{Domain::tree_lock_};
+      sync::Lock topology{ScDomain::tree_lock_};
       sync::Lock thread{target.lock_};
       if (!domain_ || owner_ || withdrawing_ || releasing_ || !binding_.reset()) return result;
       auto domain = object::ref<>::retain_alive(domain_->close_work_.key());
@@ -665,7 +665,7 @@ auto Sc::bind(object::ref<Sc> self, Thread& target,
     const cap::Resolved<Sc>& context, const cap::Resolved<Thread>& thread) noexcept -> Result {
     Dispatcher* home;
     { sync::Lock guard{lock_};
-      sync::Lock topology{Domain::tree_lock_};
+      sync::Lock topology{ScDomain::tree_lock_};
       sync::Lock beneficiary{target.lock_};
       if (withdrawing_ || owner_ || releasing_ || generation_ == std::numeric_limits<u64>::max()
           || !target.can_bind(*this) || !binding_.reset()) return std::unexpected(Error::AlreadyBound);

@@ -128,7 +128,7 @@ private:
         Condition condition_{};
         WaitResult result_{};
         Wait& owner_;
-        sched::Deadline deadline_;
+        sched::ScDeadline deadline_;
     };
     using Queue = libk::intrusive_list<Registration, &Registration::hook_>;
     using Watches = libk::intrusive_list<Watch, &Watch::hook_>;

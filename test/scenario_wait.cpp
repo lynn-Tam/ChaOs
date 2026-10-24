@@ -521,12 +521,12 @@ static auto domain_execution(Cpu&) noexcept -> bool {
     if (k.cpus.count() < 4) return true;
     auto& clock = k.clock;
     const auto mask = k.cpus.count() >= 64 ? ~u64{} : (u64{1} << k.cpus.count()) - 1;
-    std::array<object::ref<sched::Domain>, 4> domains;
+    std::array<object::ref<sched::ScDomain>, 4> domains;
     for (usize i = 0; i < domains.size(); ++i) {
-        const sched::Domain::Config config{.cpus=mask,
+        const sched::ScDomain::Config config{.cpus=mask,
             .budget=i == 2 ? *clock.ticks<1, time::ms>() : 0,
             .period=i == 2 ? *clock.ticks<10, time::ms>() : 0};
-        auto made = k.objects.get<sched::Domain>().create(k.pmm, k.cpus, config);
+        auto made = k.objects.get<sched::ScDomain>().create(k.pmm, k.cpus, config);
         libk_assert(made && made->get().open() == STATUS_OK);
         domains[i] = made->publish();
         libk_assert(domains[i]->attach(i == 3 ? domains[2] : k.domain) == STATUS_OK);
@@ -558,7 +558,7 @@ static auto domain_execution(Cpu&) noexcept -> bool {
     libk_assert(many && used[3] && many * 10 > used[3] * 7 && many * 10 < used[3] * 14);
 
     libk_assert((used[4] + used[5]) && (used[4] + used[5]) * 100 < elapsed * 16);
-    const auto config = sched::Domain::Config{.cpus=mask, .budget=*clock.ticks<2, time::ms>(),
+    const auto config = sched::ScDomain::Config{.cpus=mask, .budget=*clock.ticks<2, time::ms>(),
         .period=*clock.ticks<20, time::ms>(), .weight=512};
     const auto sequence = domains[2]->configure(config, &k.domain.get());
     libk_assert(sequence);

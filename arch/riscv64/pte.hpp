@@ -10,7 +10,8 @@ inline constexpr usize Ptes = usize{1} << PtBits;
 inline constexpr usize PtUserBegin = RISCV64_LOW_GUARD_END;
 inline constexpr usize PtUserEnd = usize{1} << (12 + PtBits * PtLevels - 1);
 inline constexpr usize IoBegin = 4096; // Zero selects automatic IOVA placement.
-inline constexpr usize IoEnd = usize{1} << (12 + PtBits * PtLevels);
+// First-stage Sv39 IOVA uses the contiguous low canonical half.
+inline constexpr usize IoEnd = usize{1} << (12 + PtBits * PtLevels - 1);
 inline constexpr usize PtKernelBegin = ~(PtUserEnd - 1);
 constexpr bool pt_canonical(usize addr) noexcept {
     return addr < PtUserEnd || addr >= PtKernelBegin;

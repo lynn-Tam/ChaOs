@@ -4,13 +4,13 @@
 // Accepted work keeps its original CPU quota independently of the submitting
 // Thread/SC. Both the provider and this Domain link share final Gate admission.
 auto Op::admit_cpu(Publish publish) noexcept -> status_t {
-    auto domain = cpu_.as<sched::Domain>();
+    auto domain = cpu_.as<sched::ScDomain>();
     return domain ? domain->get().admit(cpu_link_, publish) : STATUS_BAD_ARGS;
 }
 auto Op::schedule() noexcept -> bool {
     object::ref<> cpu;
     { sync::Lock guard{lock_}; cpu = cpu_; }
-    auto domain = cpu.as<sched::Domain>();
+    auto domain = cpu.as<sched::ScDomain>();
     if (!domain) return false;
     auto check = [&]() noexcept {
         sync::Lock guard{lock_};
@@ -27,19 +27,19 @@ void Op::run() noexcept {
 void Op::cancel_work() noexcept {
     object::ref<> cpu;
     { sync::Lock guard{lock_}; cpu = cpu_; safety_ = true; if (phase_ == OP_ACCEPTED) canceled_ = true; }
-    if (auto domain = cpu.as<sched::Domain>()) (void)domain->get().withdraw(*runner_, runner_ == &job_);
+    if (auto domain = cpu.as<sched::ScDomain>()) (void)domain->get().withdraw(*runner_, runner_ == &job_);
     wake();
 }
 auto Op::detach() noexcept -> bool {
     object::ref<> cpu;
     { sync::Lock guard{lock_}; cpu = cpu_; }
-    if (auto domain = cpu.as<sched::Domain>(); domain && !domain->get().release(cpu_link_)) return false;
+    if (auto domain = cpu.as<sched::ScDomain>(); domain && !domain->get().release(cpu_link_)) return false;
     return bindings_.close();
 }
 void Op::release_cpu() noexcept {
     object::ref<> cpu;
     { sync::Lock guard{lock_}; cpu = std::move(cpu_); progress_ = {}; }
-    if (auto domain = cpu.as<sched::Domain>()) {
+    if (auto domain = cpu.as<sched::ScDomain>()) {
         libk_assert(domain->get().release(cpu_link_));
         (void)domain->get().withdraw(*runner_, runner_ == &job_);
     }
@@ -48,7 +48,7 @@ void Op::release_cpu() noexcept {
 auto Op::commit() noexcept -> bool {
     object::ref<> cpu;
     { sync::Lock guard{lock_}; cpu = cpu_; }
-    auto domain = cpu.as<sched::Domain>();
+    auto domain = cpu.as<sched::ScDomain>();
     bool committed{};
     auto publish = [&]() noexcept {
         sync::Lock guard{lock_};

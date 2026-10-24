@@ -118,7 +118,7 @@ private:
 
 bool test_refill_conserves_and_delays_budget(const TestContext&) noexcept {
     {
-        sched::Budget aggregate{10, 100};
+        sched::ScBudget aggregate{10, 100};
         auto first = aggregate.reserve(0, 7), second = aggregate.reserve(0, 7);
         const auto reserved = aggregate.info(0);
         if (first.amount != 7 || second.amount != 3 || reserved.available || reserved.escrow != 10)
@@ -131,7 +131,7 @@ bool test_refill_conserves_and_delays_budget(const TestContext&) noexcept {
             return false;
     }
     {
-        sched::Budget repeated{10, 100};
+        sched::ScBudget repeated{10, 100};
         for (u64 now : {0U, 200U, 400U}) {
             const auto loan = repeated.reserve(now, 10);
             if (loan.amount != 10) return false;

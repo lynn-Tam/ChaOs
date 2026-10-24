@@ -221,7 +221,7 @@ static auto source(cap::Resolved<void>& cap, u64 facet, u64 mask) noexcept -> So
     }
     if (reference->kind() == ObjDomain && facet == SOURCE_STATE && cap.rights().contains(cap::Right::Inspect)
         && !(mask & ~(DOMAIN_CLOSING | DOMAIN_DRAINED | DOMAIN_CONFIGURING)))
-        return &static_cast<sched::Domain*>(reference->get())->events();
+        return &static_cast<sched::ScDomain*>(reference->get())->events();
     if (reference->kind() == ObjSc && facet == SOURCE_STATE && cap.rights().contains(cap::Right::Inspect)
         && !(mask & ~(SC_BOUND | SC_WITHDRAWING)))
         return &static_cast<sched::Sc*>(reference->get())->events();

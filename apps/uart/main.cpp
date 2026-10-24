@@ -42,9 +42,9 @@ int main() {
     size_t sent{};
     for (;;) {
         if (sent == outgoing.size) {
+            sent = outgoing.size = 0;
             const auto received = io_recv(output, outgoing, false);
             if (received != STATUS_OK && received != STATUS_WOULD_BLOCK) sys::exit(received);
-            if (received == STATUS_OK) sent = 0;
         }
         const auto end = std::min(outgoing.size, sent + 256);
         while (sent < end) port.put(outgoing.data[sent++]);

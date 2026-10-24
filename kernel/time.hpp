@@ -74,12 +74,12 @@ class Dispatcher;
 // armed. The callback runs on that CPU with interrupts disabled; remote
 // producers publish subsystem state and wake the owner instead of mutating
 // this queue.
-class Deadline final : private libk::noncopyable_nonmovable {
+class ScDeadline final : private libk::noncopyable_nonmovable {
 public:
     using Fn = libk::delegate<void() noexcept>;
 
-    explicit Deadline(Fn cb) noexcept : cb_(cb) {}
-    ~Deadline() noexcept { libk_assert(!armed() && !hook_.is_linked() && cb_); }
+    explicit ScDeadline(Fn cb) noexcept : cb_(cb) {}
+    ~ScDeadline() noexcept { libk_assert(!armed() && !hook_.is_linked() && cb_); }
 
     [[nodiscard]] auto armed() const noexcept -> bool {
         return owner_ != nullptr;

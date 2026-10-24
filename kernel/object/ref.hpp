@@ -22,7 +22,7 @@
 namespace ipc { class Channel; class Notification; class Port; }
 namespace irq { class Irq; class Ctl; }
 namespace io { class Iommu; class Space; class IoOp; }
-namespace sched { class Sc; class Domain; }
+namespace sched { class Sc; class ScDomain; }
 namespace cap { class CSpace; }
 namespace resource { class Quota; class Allocation; struct Capacity; }
 namespace mm { class Mem; class VSpace; class VmOp; class Phys; }
@@ -55,7 +55,7 @@ using Types = Catalog<Def<mm::VmOp, ObjVmOp>, Def<io::IoOp, ObjIoOp>, Def<io::Sp
     Def<io::Iommu, ObjIommu>, Def<mm::VSpace, ObjVSpace>, Def<mm::Mem, ObjMem>, Def<mm::Phys, ObjPhys>,
     Def<Pager, ObjPager>, Def<cap::CSpace, ObjCSpace>,
     Def<ipc::Channel, ObjChannel>, Def<ipc::Notification, ObjNotification>, Def<ipc::Port, ObjPort>,
-    Def<sched::Domain, ObjDomain>, Def<sched::Sc, ObjSc>, Def<Thread, ObjThread>, Def<resource::Quota, ObjQuota>, Def<Scope, ObjScope>>;
+    Def<sched::ScDomain, ObjDomain>, Def<sched::Sc, ObjSc>, Def<Thread, ObjThread>, Def<resource::Quota, ObjQuota>, Def<Scope, ObjScope>>;
 using Objects = Types::objects;
 template<class T> inline constexpr ObjKind kind = Types::kind<T>;
 // Storage keys stay private to kernel owners; public identities never encode

@@ -29,6 +29,7 @@ static void finish_fault(
     arch::TrapCtx& context,
     sched::Dispatcher& dispatcher) noexcept {
     status_t status{STATUS_PEER_FAULT};
+    u32 fault{FAULT_UNKNOWN};
     switch (kind) {
     case mm::FaultKind::Ready:
     case mm::FaultKind::Materialized:
@@ -39,15 +40,14 @@ static void finish_fault(
     case mm::FaultKind::Pending:
         thread.park(false);
         return;
-    case mm::FaultKind::ResourceExhausted:
-    case mm::FaultKind::OutOfMemory: {
-        status = STATUS_NO_MEMORY;
-        break;
+    case mm::FaultKind::NoMapping: fault = FAULT_UNMAPPED; break;
+    case mm::FaultKind::Guard: fault = FAULT_GUARD; break;
+    case mm::FaultKind::AccessDenied: fault = FAULT_PERMS; break;
+    case mm::FaultKind::ResourceExhausted: fault = FAULT_QUOTA; status = STATUS_NO_MEMORY; break;
+    case mm::FaultKind::OutOfMemory: fault = FAULT_MEMORY; status = STATUS_NO_MEMORY; break;
+    case mm::FaultKind::BackingFailed: fault = FAULT_BACKING; break;
     }
-    default:
-        break;
-    }
-    thread.report({.origin=EXIT_FAULT, .kind=static_cast<u32>(kind), .status=status, .reserved=0,
+    thread.report({.origin=EXIT_FAULT, .kind=fault, .status=status, .reserved=0,
         .pc=context.pc(), .address=address.raw()});
     dispatcher.request_reschedule(sched::DispatchReason::Exit);
 }
@@ -93,7 +93,7 @@ static void handle_trap(const arch::TrapEvent& event, arch::TrapCtx& context) no
             case syscall::Disposition::Exit:
                 const status_t status = static_cast<status_t>(
                     context.arg(1));
-                thread->report({.origin=EXIT_NORMAL, .kind=0, .status=status, .reserved=0, .pc=0, .address=0});
+                thread->report({.origin=EXIT_NORMAL, .kind=FAULT_NONE, .status=status, .reserved=0, .pc=0, .address=0});
                 cpu.dispatcher().request_reschedule(sched::DispatchReason::Exit, status);
                 return;
             }
@@ -123,7 +123,15 @@ static void handle_trap(const arch::TrapEvent& event, arch::TrapCtx& context) no
                 finish_fault(*thread, kind, address, context, cpu.dispatcher());
             return;
         }
-        thread->report({.origin=EXIT_FAULT, .kind=static_cast<u32>(event.cause), .status=STATUS_PEER_FAULT, .reserved=0,
+        u32 fault{FAULT_UNKNOWN};
+        switch (event.cause) {
+        case Cause::Breakpoint: fault = FAULT_BREAKPOINT; break;
+        case Cause::Illegal: fault = FAULT_ILLEGAL; break;
+        case Cause::Misaligned: fault = FAULT_ALIGN; break;
+        case Cause::AccessFault: fault = FAULT_ACCESS; break;
+        default: break;
+        }
+        thread->report({.origin=EXIT_FAULT, .kind=fault, .status=STATUS_PEER_FAULT, .reserved=0,
             .pc=event.pc, .address=event.fault_addr});
         cpu.dispatcher().request_reschedule(sched::DispatchReason::Exit);
         return;

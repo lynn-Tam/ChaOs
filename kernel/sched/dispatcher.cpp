@@ -18,7 +18,7 @@ Dispatcher::Dispatcher(Cpu& cpu, Thread& idle, time::Clock& clock) noexcept
 auto Dispatcher::id() const noexcept -> CpuId { return cpu_.id; }
 
 auto Dispatcher::arm(
-    Deadline& deadline,
+    ScDeadline& deadline,
     u64 when) noexcept -> bool {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(Cpu::local() == &cpu_);
@@ -30,14 +30,14 @@ auto Dispatcher::arm(
     return true;
 }
 
-void Dispatcher::insert(Deadline& d, u64 when) noexcept {
+void Dispatcher::insert(ScDeadline& d, u64 when) noexcept {
     libk_assert(!d.armed());
     d.when_ = when;
     deadlines_.insert(d);
     d.owner_ = this;
 }
 
-void Dispatcher::disarm(Deadline& deadline) noexcept {
+void Dispatcher::disarm(ScDeadline& deadline) noexcept {
     libk_assert(!arch::interrupts_enabled());
     libk_assert(Cpu::local() == &cpu_);
     libk_assert(deadline.owner_ == this);
@@ -108,7 +108,7 @@ void Dispatcher::remove(Thread& t) noexcept {
     else { libk_assert(t.maintenance_hook_.is_linked()); maintenance_ready_.erase(t); }
     --ready_count_;
 }
-void Dispatcher::insert(Node& node) noexcept {
+void Dispatcher::insert(ScNode& node) noexcept {
     libk_assert(!node.hook.is_linked());
     auto& queue = node.parent ? node.parent->ready : ready_;
     node.service = std::max(node.service, node.parent ? node.parent->floor : fair_.load());
@@ -119,7 +119,7 @@ void Dispatcher::insert(Node& node) noexcept {
         if (!local.refill.armed() && !local.stopped && local.owner.accepting() && local.owner.config_.enabled) insert(*node.parent);
     }
 }
-void Dispatcher::erase(Node& node) noexcept {
+void Dispatcher::erase(ScNode& node) noexcept {
     auto& queue = node.parent ? node.parent->ready : ready_;
     queue.erase(node);
     if (node.parent && queue.empty()) {
@@ -128,7 +128,7 @@ void Dispatcher::erase(Node& node) noexcept {
         if (node.parent->hook.is_linked()) erase(*node.parent);
     }
 }
-void Dispatcher::domain_ready(Domain::Local& local, bool resched) noexcept {
+void Dispatcher::domain_ready(ScDomain::Local& local, bool resched) noexcept {
     libk_assert(local.cpu == id() && !arch::interrupts_enabled());
     local.waiting.store(false, std::memory_order_release);
     if (!local.owner.accepting() || !local.owner.config_.enabled) {
@@ -160,7 +160,7 @@ void Dispatcher::domain_ready(Domain::Local& local, bool resched) noexcept {
     }
     if (resched) request_reschedule(DispatchReason::RemoteWake);
 }
-void Dispatcher::post(Domain::Local& local) noexcept {
+void Dispatcher::post(ScDomain::Local& local) noexcept {
     auto ticket = object::ref<>::retain_alive(local.owner.close_work_.key());
     bool queued{};
     { sync::Lock guard{mail_lock_};
@@ -176,7 +176,7 @@ void Dispatcher::post(Domain::Local& local) noexcept {
 void Dispatcher::drain_domains() noexcept {
     libk_assert(arch::local()->depth == 0);
     for (;;) {
-        Domain::Local* local;
+        ScDomain::Local* local;
         object::ref<> ticket;
         { sync::Lock guard{mail_lock_};
           if (domains_.empty()) return;
@@ -188,9 +188,9 @@ void Dispatcher::drain_domains() noexcept {
         local->owner.post_close();
     }
 }
-auto Dispatcher::reserve(Node* branch, Sc* sc, u64 now) noexcept -> bool {
+auto Dispatcher::reserve(ScNode* branch, Sc* sc, u64 now) noexcept -> bool {
     libk_assert(!current_sc_ && !ticket_count_);
-    std::array<Node*, Domain::max_depth> path{};
+    std::array<ScNode*, ScDomain::max_depth> path{};
     usize depth{};
     for (auto* node = branch; node; node = node->parent) path[depth++] = node;
     auto duration = quantum_;
@@ -223,7 +223,7 @@ auto Dispatcher::reserve(Node* branch, Sc* sc, u64 now) noexcept -> bool {
             return false;
         }
     }
-    loan_ = sc && sc->config_.budget ? sc->budget_.reserve(now, duration) : Budget::Loan{};
+    loan_ = sc && sc->config_.budget ? sc->budget_.reserve(now, duration) : ScBudget::Loan{};
     duration_ = sc && sc->config_.budget ? loan_.amount : duration;
     libk_assert(duration_);
     current_sc_ = sc; current_branch_ = branch;
@@ -263,7 +263,7 @@ auto Dispatcher::select(u64& now) noexcept -> Thread* {
             for (auto* branch = current_branch_; branch; branch = branch->parent)
                 branch->domain->local(id()).active.store(true, std::memory_order_release);
             // A finite callback uses the already settled CPU boundary, never a
-            // Domain-owned Thread, stack or a maintenance execution loan.
+            // ScDomain-owned Thread, stack or a maintenance execution loan.
             (void)owner.ordinary_.run(1);
             now = clock_->rd_ticks(); charge_to(now); settle(now);
             for (auto* branch = current_branch_; branch; branch = branch->parent) {
@@ -475,7 +475,7 @@ void Dispatcher::drain_remote() noexcept {
         complete(*t);
         if (!finalize && t != current()) static_cast<void>(migrate(*t));
     }
-    // Domain mail requires a real boundary even when the receiving CPU is
+    // ScDomain mail requires a real boundary even when the receiving CPU is
     // idle with no timer armed. An IPI is a request, never the stop ACK.
     { sync::Lock guard{mail_lock_};
       if (!domains_.empty()) request_reschedule(DispatchReason::RemoteWake);
@@ -485,12 +485,12 @@ void Dispatcher::expire(u64 now) noexcept {
     // Completion only requests a wake; dispatch remains at the outer boundary.
     libk_assert(!arch::interrupts_enabled());
     for (;;) {
-        Deadline* const deadline = deadlines_.minimum();
+        ScDeadline* const deadline = deadlines_.minimum();
         if (!deadline || deadline->when_ > now) return;
         libk_assert(deadline->owner_ == this);
         deadlines_.erase(*deadline);
         deadline->owner_ = nullptr;
-        const Deadline::Fn cb = deadline->cb_;
+        const ScDeadline::Fn cb = deadline->cb_;
         libk_assert(cb);
         cb();
     }

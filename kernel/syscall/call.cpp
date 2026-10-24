@@ -546,7 +546,7 @@ template<usize op>
     if (facet == SCOPE_USAGE) {
         if (auto thread = target.as<Thread>()) return write(thread->get().info(inv.cpu.dispatcher().clock().rd_ticks()));
         if (auto quota = target.as<resource::Quota>()) return write(quota->get().info(0));
-        if (auto domain = target.as<sched::Domain>()) return write(domain->get().info(0));
+        if (auto domain = target.as<sched::ScDomain>()) return write(domain->get().info(0));
         return returned(STATUS_INVALID_OP);
     }
     if (facet == SCOPE_OPS) {
@@ -1101,7 +1101,7 @@ template<usize op>
         return write(info);
     };
     if constexpr (op == SYS_THREAD_INFO) return inspect.template operator()<Thread>();
-    if constexpr (op == SYS_DOMAIN_INFO) return inspect.template operator()<sched::Domain>();
+    if constexpr (op == SYS_DOMAIN_INFO) return inspect.template operator()<sched::ScDomain>();
     if constexpr (op == SYS_SC_INFO) return inspect.template operator()<sched::Sc>();
     if constexpr (op == SYS_SCOPE_INFO) return inspect.template operator()<object::Scope>();
     if constexpr (op == SYS_QUOTA_INFO) return inspect.template operator()<resource::Quota>();
@@ -1157,7 +1157,7 @@ template<usize op>
 
 template<usize op>
 [[nodiscard]] auto domain_configure(Call& inv) noexcept -> Result {
-    auto domain = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+    auto domain = inv.cspace.resolve<sched::ScDomain>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
     if (!domain) return returned(cap_status(domain.error()));
     if constexpr (op == SYS_DOMAIN_EXECUTION) {
         if (inv.trap.arg(1) > 1) return returned(STATUS_BAD_ARGS);
@@ -1168,13 +1168,13 @@ template<usize op>
     const auto budget = clock.ticks<time::ns>(inv.trap.arg(1));
     const auto period = clock.ticks<time::ns>(inv.trap.arg(2));
     if (!budget || !period || inv.trap.arg(3) > 65535) return returned(STATUS_BAD_ARGS);
-    std::optional<cap::Resolved<sched::Domain>> parent;
+    std::optional<cap::Resolved<sched::ScDomain>> parent;
     if (inv.trap.arg(5)) {
-        auto resolved = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(5)), cap::Rights::of(cap::Right::Control));
+        auto resolved = inv.cspace.resolve<sched::ScDomain>(handle_of(inv.trap.arg(5)), cap::Rights::of(cap::Right::Control));
         if (!resolved) return returned(cap_status(resolved.error()));
         parent = std::move(*resolved);
     }
-    const sched::Domain::Config config{.cpus=inv.trap.arg(4), .budget=*budget, .period=*period,
+    const sched::ScDomain::Config config{.cpus=inv.trap.arg(4), .budget=*budget, .period=*period,
         .weight=static_cast<u32>(inv.trap.arg(3))};
     const auto result = domain.value()->configure(config, parent ? &parent->object() : nullptr);
     return result ? returned(STATUS_OK, *result) : returned(result.error());
@@ -1182,8 +1182,8 @@ template<usize op>
 
 template<usize op>
 [[nodiscard]] auto domain_move(Call& inv) noexcept -> Result {
-    auto domain = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
-    auto parent = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Create));
+    auto domain = inv.cspace.resolve<sched::ScDomain>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Control));
+    auto parent = inv.cspace.resolve<sched::ScDomain>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Create));
     if (!domain) return returned(cap_status(domain.error()));
     if (!parent) return returned(cap_status(parent.error()));
     const auto result = domain->object().reparent(*domain, *parent);
@@ -1192,7 +1192,7 @@ template<usize op>
 
 template<usize op>
 [[nodiscard]] auto domain_close(Call& inv) noexcept -> Result {
-    auto domain = inv.cspace.resolve<sched::Domain>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Close));
+    auto domain = inv.cspace.resolve<sched::ScDomain>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Close));
     if (!domain) return returned(cap_status(domain.error()));
     return returned(STATUS_OK, domain.value()->close());
 }

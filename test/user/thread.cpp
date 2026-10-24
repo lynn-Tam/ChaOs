@@ -180,6 +180,8 @@ static void file_barriers() {
     (void)sys::notification_signal(ready);
     if (failure == 1) sys::exit(STATUS_INTERNAL);
     if (failure == 2) asm volatile(".word 0");
+    if (failure == 3) asm volatile("ld zero, 0(zero)" ::: "memory");
+    if (failure == 4) asm volatile("ebreak");
     for (;;) sys::yield();
 }
 [[noreturn]] static void raw_child(std::string_view mode) {
@@ -198,7 +200,8 @@ static void file_barriers() {
     const auto ready = sys::notification_create(env.alloc(), 1); check(ready.status == STATUS_OK); cap_owner notice{ready.value};
     ThreadInit init{.version=THREAD_START_VERSION, .flags=0, .entry=reinterpret_cast<word_t>(&raw_entry),
         .stack=stack->address + stack->size - 16,
-        .arguments={notice.selector(), mode == "raw-fault" ? word_t{1} : mode == "raw-trap" ? word_t{2} : word_t{0}},
+        .arguments={notice.selector(), mode == "raw-fault" ? word_t{1} : mode == "raw-trap" ? word_t{2}
+            : mode == "raw-page" ? word_t{3} : mode == "raw-break" ? word_t{4} : word_t{0}},
         .ipc={.memory=ipc->memory.selector(), .page=0, .address=ipc->address, .pages=1}};
     check(mem_write(start.selector(), 0, std::as_bytes(std::span{&init, 1})) == STATUS_OK);
     const auto made = sys::thread_create({env.quota, nested.selector()}, env.vspace, env.cspace, start.selector(), 0, 0);
@@ -213,9 +216,11 @@ static void execution_domain() {
     const int fd = open("/boot/thread-test.elf", O_RDONLY); check(fd >= 0);
     uint64_t bytes{}; check(!px_size(fd, &bytes));
     std::vector<std::byte> image(bytes); check(read(fd, image.data(), bytes) == ssize_t(bytes) && !close(fd));
-    for (const std::string_view mode : {"child", "limit", "raw", "raw-fault", "raw-trap"}) {
-        const bool limited = mode == "limit", raw = mode.starts_with("raw"), failure = mode == "raw-fault" || mode == "raw-trap";
-        const auto expected = mode == "raw-fault" ? STATUS_INTERNAL : mode == "raw-trap" ? STATUS_PEER_FAULT : limited ? STATUS_OK : STATUS_CANCELED;
+    for (const std::string_view mode : {"child", "limit", "raw", "raw-fault", "raw-trap", "raw-page", "raw-break"}) {
+        const auto fault = mode == "raw-trap" ? FAULT_ILLEGAL : mode == "raw-page" ? FAULT_UNMAPPED
+            : mode == "raw-break" ? FAULT_BREAKPOINT : FAULT_NONE;
+        const bool limited = mode == "limit", raw = mode.starts_with("raw"), failure = mode == "raw-fault" || fault != FAULT_NONE;
+        const auto expected = mode == "raw-fault" ? STATUS_INTERNAL : fault != FAULT_NONE ? STATUS_PEER_FAULT : limited ? STATUS_OK : STATUS_CANCELED;
         cap_owner external;
         if (raw) {
             const auto sc = sys::sc_create(rt_startup().alloc(), rt_startup().domain, 0, 0, 1024, (rt_startup().cpus >= 64 ? ~word_t{} : (word_t{1} << rt_startup().cpus) - 1));
@@ -269,8 +274,9 @@ static void execution_domain() {
             if (const auto result = child.result()) {
                 check(result->code == expected);
                 if (failure) check(result->thread && result->exit.status == expected
-                    && result->exit.origin == (mode == "raw-trap" ? EXIT_FAULT : EXIT_NORMAL));
-                if (mode == "raw-trap") check(result->exit.pc != 0);
+                    && result->exit.origin == (fault != FAULT_NONE ? EXIT_FAULT : EXIT_NORMAL)
+                    && result->exit.kind == fault);
+                if (fault != FAULT_NONE) check(result->exit.pc != 0);
                 check(child.retire(result->code) == STATUS_OK);
                 if (child.drained()) break;
             }
