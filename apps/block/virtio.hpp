@@ -34,36 +34,36 @@ public:
         const uint8_t* data{};
     };
 
-    [[nodiscard]] auto open(const rt_env& info, std::span<const ubus_msg> setup) noexcept -> status_t {
+    [[nodiscard]] auto open(const _env& info, std::span<const ubus_msg> setup) noexcept -> status_t {
         const auto resource = [&](std::string_view name) -> std::pair<cap_t, ubus_value> {
             for (const auto& message : setup) if (const auto value = message.data[name]) return {message.capability(value), value};
             return {};
         };
-        const auto space = sys::cap_duplicate(resource("dma").first, info.cspace,
+        const auto space = _cap_duplicate(resource("dma").first, info.cspace,
             RIGHT_MAP | RIGHT_UNMAP | RIGHT_INSPECT | RIGHT_OBSERVE | RIGHT_CLOSE);
         if (space.status != STATUS_OK) return space.status;
-        space_ = cap_owner{space.value};
-        const auto watched = space_watch_.open(rt_events(), space.value, 0, 0, WATCH_CHANGED);
+        space_ = _cap_owner{space.value};
+        const auto watched = space_watch_.open(&_events(), space.value, 0, 0, WATCH_CHANGED);
         if (watched != STATUS_OK) return watched;
-        events_ = rt_events();
+        events_ = &_events();
         for (size_t i = 0; i < std::size(regs_); ++i) {
             const auto name = i == 6 ? std::string{"pci.config"} : "bar" + std::to_string(i);
             const auto [cap, value] = resource(name);
             const auto buffer = value.as<ubus_buffer>();
             if (!buffer && i < 6) continue;
             if (!buffer || buffer->offset || !buffer->size || buffer->size > SIZE_MAX - 4095) return STATUS_BAD_ARGS;
-            const auto reg = sys::cap_duplicate(cap, info.cspace, RIGHT_MAP);
+            const auto reg = _cap_duplicate(cap, info.cspace, RIGHT_MAP);
             if (reg.status != STATUS_OK) return reg.status;
             sizes_[i] = buffer->size;
-            auto mapped = vm_area::map(rt_vm(), cap_owner{reg.value}, 0,
+            auto mapped = _vm_area::map(_vm(), _cap_owner{reg.value}, 0,
                 (buffer->size + 4095) & ~size_t{4095}, i == 6 ? VM_READ : VM_READ | VM_WRITE);
             if (!mapped) return mapped.error();
             regs_[i] = std::move(*mapped);
         }
-        const auto interrupt = sys::cap_duplicate(resource("irq").first, info.cspace, RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK);
+        const auto interrupt = _cap_duplicate(resource("irq").first, info.cspace, RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK);
         if (interrupt.status != STATUS_OK) return interrupt.status;
-        interrupt_ = cap_owner{interrupt.value};
-        const auto bound = sys::irq_set(interrupt.value, true);
+        interrupt_ = _cap_owner{interrupt.value};
+        const auto bound = _irq_set(interrupt.value, true);
         if (bound.status != STATUS_OK) return bound.status;
         const auto interrupt_watch = irq_watch_.open(events_, interrupt.value, SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_READ);
         if (interrupt_watch != STATUS_OK) return interrupt_watch;
@@ -77,7 +77,7 @@ public:
     // After close starts, BAR/IRQ views may be revoked. Do not submit,
     // observe or acknowledge again; only the IOSpace state remains usable.
     [[nodiscard]] auto close() noexcept -> status_t {
-        return io_close(space_.selector());
+        return _io_close_wait(space_.selector());
     }
 
     [[nodiscard]] auto submit(ubus_ticket ticket, blk_op operation,
@@ -165,23 +165,23 @@ public:
     }
 
     [[nodiscard]] auto acknowledge() noexcept -> status_t {
-        const auto state = sys::io_space_state(space_.selector());
+        const auto state = _io_space_state(space_.selector());
         if (state.status != STATUS_OK) return state.status;
         if (state.value != IO_SPACE_READY) return STATUS_BACKING_FAILED;
-        const auto fact = sys::source_info(space_.selector());
+        const auto fact = _source_info(space_.selector());
         if (fact.status != STATUS_OK) return fact.status;
         if (const auto status = space_watch_.arm(fact.value2).status; status != STATUS_OK) return status;
-        const auto delivered = sys::irq_observe(interrupt_.selector());
+        const auto delivered = _irq_observe(interrupt_.selector());
         if (delivered.status == STATUS_BUSY) return irq_watch_.arm().status;
         if (delivered.status != STATUS_OK) return delivered.status;
         (void)read<uint8_t>(isr_); // clear the device's level before unmasking PLIC
-        const auto result = sys::irq_ack(interrupt_.selector(), delivered.value2, delivered.value);
+        const auto result = _irq_ack(interrupt_.selector(), delivered.value2, delivered.value);
         return result.status == STATUS_OK ? irq_watch_.arm().status : result.status;
     }
 
 private:
-    cap_t events_{};
-    ev_watch irq_watch_, space_watch_;
+    _ev_port* events_{};
+    _ev_watch irq_watch_, space_watch_;
     size_t depth_{}, available_offset_{}, used_offset_{}, headers_{}, data_{};
     uint16_t queue_size_{};
     uint64_t iova_{};
@@ -213,7 +213,7 @@ private:
         dma_write<uint16_t>(target + 14, next);
     }
 
-    auto configure(const rt_env& info) noexcept -> status_t {
+    auto configure(const _env& info) noexcept -> status_t {
         std::array<std::pair<uintptr_t, size_t>, 6> bars;
         for (size_t i = 0; i < bars.size(); ++i) bars[i] = {regs_[i].address, sizes_[i]};
         const pci::cfg<blk_fence> cfg{regs_[6].address};
@@ -258,10 +258,10 @@ private:
         headers_ = (used_offset_ + 6 + queue_size_ * 8 + 4095) & ~size_t{4095};
         data_ = (headers_ + depth_ * 32 + 4095) & ~size_t{4095};
         const auto bytes = data_ + depth_ * MaxTransfer;
-        auto arena = vm_area::create(info.alloc(), rt_vm(), 0, bytes);
+        auto arena = _vm_area::create(info.alloc(), _vm(), 0, bytes);
         if (!arena) return arena.error();
         arena_ = std::move(*arena);
-        const auto mapping = io_call(info.alloc(), space_.selector(), IO_OP_MAP,
+        const auto mapping = _io_wait(info.alloc(), space_.selector(), IO_OP_MAP,
             {arena_.memory.selector(), 0, bytes / 4096, 0, VM_READ | VM_WRITE});
         if (mapping.status != STATUS_OK) return mapping.status;
         iova_ = mapping.value;
@@ -294,8 +294,8 @@ private:
     bool flush_supported_{};
     uintptr_t notify_{};
     uintptr_t isr_{};
-    cap_owner space_{};
-    cap_owner interrupt_{};
-    vm_area arena_{};
-    vm_area regs_[7]{};
+    _cap_owner space_{};
+    _cap_owner interrupt_{};
+    _vm_area arena_{};
+    _vm_area regs_[7]{};
 };

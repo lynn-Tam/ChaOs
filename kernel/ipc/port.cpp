@@ -152,7 +152,7 @@ auto Port::arm(u64 id, u64 seen) noexcept -> WaitResult {
             if (!bound.scope->find(bound.object, bound.view.kinds, bound.view.depth)) return STATUS_STALE;
         }
         sync::Lock guard{lock_};
-        if (closing_ || watch->event.watch_gen != id || watch->state != Watch::State::Live) return STATUS_STALE;
+        if (closing_ || watch->event.watch_gen != id || watch->erase || watch->state != Watch::State::Live) return STATUS_STALE;
         commit(); return STATUS_OK;
     }, &observed);
     return status == STATUS_OK ? observed : WaitResult{status};
@@ -251,7 +251,17 @@ void Port::finish(Watch& watch) noexcept {
 
 auto Port::unwatch(u64 id) noexcept -> status_t {
     Watch* watch;
-    { sync::Lock guard{lock_}; watch = find(id); if (!watch) return STATUS_STALE; ++watch->calls; }
+    Source::Publication publication;
+    {
+        sync::Lock guard{lock_};
+        watch = find(id);
+        if (!watch || watch->erase) return STATUS_STALE;
+        ++watch->calls; watch->erase = true;
+        // Logical removal owns all queued hints immediately; external Grant
+        // detach may finish later without exposing an unregistered event.
+        if (watch->queue.is_linked()) queue_.erase(*watch);
+        changed(); publication = update();
+    }
     close(*watch, true);
     { sync::Lock guard{lock_}; --watch->calls; }
     finish(*watch);
@@ -279,7 +289,7 @@ auto Port::records(u64 epoch, u64 last, u64 limit, PortRecords& result) const no
     auto* watch = last < limit ? index_.lower_bound(last + 1) : nullptr;
     for (usize step = 0; watch && watch->event.watch_gen <= limit && step < PORT_RECORDS; ++step) {
         result.next = watch->event.watch_gen;
-        if (watch->state != Watch::State::Prepared) {
+        if (!watch->erase && watch->state != Watch::State::Prepared) {
             auto event = watch->event;
             if (watch->queue.is_linked() || watch->pending > acknowledged_) event.flags |= PORT_EVENT_PENDING;
             result.events[result.count++] = event;

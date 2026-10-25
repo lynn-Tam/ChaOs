@@ -31,7 +31,7 @@
 constexpr usize root_stack_pages = 8;
 constexpr mm::va_t root_ipc_address{0x40000000};
 constexpr usize root_stack_size = root_stack_pages * mm::page_size;
-constexpr usize root_initial_bytes = 384;
+constexpr usize root_initial_bytes = 512;
 constexpr mm::va_t root_info_address{mm::UserEnd - 2 * mm::page_size};
 constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - root_stack_size};
 
@@ -60,7 +60,7 @@ constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - 
 }
 
 [[nodiscard]] static auto map_memory(mm::VSpace& vspace, CpuId cpu, object::ref<mm::Mem>& memory,
-                                     mm::va_t address, mm::Perms access) noexcept -> bool {
+                                     mm::va_t address, mm::Perms access, u64 claim = 0) noexcept -> bool {
     const mm::ObjectRange object{0, memory->page_count()};
     const auto mapped =
         vspace.map(mm::VmCtx{.local = cpu},
@@ -69,7 +69,7 @@ constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - 
                        .object = object,
                        .perms = access,
                    },
-                   memory, memory.get(), cap::MemLimit{object, access});
+                   memory, memory.get(), cap::MemLimit{object, access}, claim);
     return mapped && mapped.value().status == mm::VmStatus::Complete;
 }
 
@@ -109,6 +109,11 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
     const auto file = archive.find("init");
     const auto init = file ? libk::elf_view::parse(file->data) : libk::elf_view{};
     if (!init || init.machine() != 243) return std::unexpected(BootErr::InvalidBundle);
+    const auto abi = init.note(NATIVE_ABI_NAME, NATIVE_ABI_NOTE);
+    uint32_t version{};
+    if (abi.size() != sizeof(version)) return std::unexpected(BootErr::InvalidBundle);
+    ::memcpy(&version, abi.data(), sizeof(version));
+    if (version != NATIVE_ABI_VERSION) return std::unexpected(BootErr::InvalidBundle);
     std::optional<object::pending<mm::Mem>> bundle_pending;
     {
         auto adopted = pmm.adopt(std::move(reservation));
@@ -204,7 +209,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
     if (!vspace || !cspace) return std::unexpected(BootErr::OutOfMemory);
     auto& space = cspace->get();
     {
-        const mm::VRange stack_range{root_stack_address, root_stack_size};
+        const mm::VRange stack_range{mm::va_t{root_stack_address.raw() - mm::page_size}, root_stack_size + mm::page_size};
         const mm::VRange info_range{root_info_address, mm::page_size};
         for (size_t i = 0; i < init.segment_count(); ++i) {
             const auto seg = *init.segment(i);
@@ -243,11 +248,23 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         !create_mem(info, charge_pages(2), pmm, mm::page_size, anon) ||
         !create_mem(ipc_mem, charge_pages(2), pmm, mm::page_size, anon))
         return std::unexpected(BootErr::OutOfMemory);
+    const cap::VmLimit root_vm{{mm::va_t{mm::UserBegin}, mm::UserEnd - mm::UserBegin},
+        mm::Perms::of(mm::Perm::Read, mm::Perm::Write, mm::Perm::Execute)};
+    const auto claim = [&](word_t address, word_t bytes) -> std::expected<cap::VmLimit, status_t> {
+        auto publish = [](cap::VmLimit) noexcept -> status_t { return STATUS_OK; };
+        return vspace->get().reserve(VmAlloc{VM_ALLOC_VERSION, sizeof(VmAlloc), address, bytes,
+            mm::page_size, mm::UserBegin, mm::UserEnd, rw.raw()}, root_vm,
+            libk::delegate<status_t(cap::VmLimit)>::bind(publish));
+    };
+    const auto stack_region = claim(root_stack_address.raw() - mm::page_size, root_stack_size + mm::page_size);
+    const auto ipc_region = claim(root_ipc_address.raw(), mm::page_size);
+    if (!stack_region || !ipc_region || !vspace->get().guard(*stack_region,
+        {stack_region->range.base(), mm::page_size})) return std::unexpected(BootErr::MappingFailed);
     if (!map_memory(vspace->get(), cpu, stack, root_stack_address,
-                    mm::Perms::of(mm::Perm::Read, mm::Perm::Write)) ||
+                    mm::Perms::of(mm::Perm::Read, mm::Perm::Write), stack_region->claim()) ||
         !map_memory(vspace->get(), cpu, info, root_info_address, mm::Perms::of(mm::Perm::Read)) ||
         !map_memory(vspace->get(), cpu, ipc_mem, root_ipc_address,
-                    mm::Perms::of(mm::Perm::Read, mm::Perm::Write))) {
+                    mm::Perms::of(mm::Perm::Read, mm::Perm::Write), ipc_region->claim())) {
         return std::unexpected(BootErr::MappingFailed);
     }
 
@@ -353,8 +370,8 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             cap::Right::Unmap, cap::Right::Destroy, cap::Right::Protect, cap::Right::Inspect,
             cap::Right::Manage, cap::Right::Control, cap::Right::Observe, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
         const cap::VmLimit vm_limit{
-            .range = mm::VRange{mm::va_t{mm::UserBegin}, mm::UserEnd - mm::UserBegin},
-            .perms = mm::Perms::of(mm::Perm::Read, mm::Perm::Write, mm::Perm::Execute),
+            mm::VRange{mm::va_t{mm::UserBegin}, mm::UserEnd - mm::UserBegin},
+            mm::Perms::of(mm::Perm::Read, mm::Perm::Write, mm::Perm::Execute),
         };
         const cap::MemLimit bundle_limit{
             .range = mm::ObjectRange{0, bundle_pending->get().page_count()},
@@ -366,7 +383,8 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             .object_kinds = resource_kinds,
         };
 
-        cap_t vm_cap{}, cs_cap{}, pool_cap{}, scope_cap{}, event_cap{}, stack_cap{}, ipc_cap{};
+        cap_t vm_cap{}, cs_cap{}, pool_cap{}, scope_cap{}, event_cap{}, stack_cap{}, ipc_cap{}, stack_region_cap{}, ipc_region_cap{};
+        auto vm_ref = vspace->reference();
         auto events = create.template operator()<ipc::Port>(object::pool<ipc::Port>::slot_usage(), pmm, ipc::Port::Config{128, 16});
         if (!events) return std::unexpected(events.error());
         status_t ready;
@@ -391,6 +409,9 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
             !add_cap(info_page.sc, *sc, cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Control, cap::Right::Attach, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke)) ||
             !add_cap(info_page.domain, boot.domain, cap::Rights::from_raw(basic_rights.raw() | RIGHT_CREATE | RIGHT_CLOSE)))
             return std::unexpected(BootErr::CapabilityFailed);
+        const auto region_rights = cap::Rights::of(cap::Right::Inspect, cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Reserve, cap::Right::Map, cap::Right::Unmap, cap::Right::Protect);
+        if (!add_cap(stack_region_cap, vm_ref, region_rights, *stack_region) ||
+            !add_cap(ipc_region_cap, vm_ref, region_rights, *ipc_region)) return std::unexpected(BootErr::CapabilityFailed);
         const auto sp = root_stack_address.raw() + root_stack_size - root_initial_bytes;
         auto stack_page = stack->materialize(root_stack_pages - 1);
         if (!stack_page) return std::unexpected(BootErr::OutOfMemory);
@@ -407,9 +428,11 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         aux(4, AT_SYS_CSPACE, cs_cap); aux(5, AT_SYS_EVENTS, event_cap);
         aux(6, AT_SYS_CPUS, boot.cpus.count()); aux(7, AT_SYS_IPC, root_ipc_address.raw());
         aux(8, AT_SYS_BOOT, root_info_address.raw()); aux(9, AT_SYS_BOOT_SIZE, info_page.bytes);
-        aux(10, AT_SYS_SCOPE, scope_cap); aux(11, AT_SYS_DOMAIN, info_page.domain); aux(12, AT_SYS_STACK, root_stack_address.raw()); aux(13, AT_SYS_STACK_SIZE, root_stack_size);
+        aux(10, AT_SYS_SCOPE, scope_cap); aux(11, AT_SYS_DOMAIN, info_page.domain); aux(12, AT_SYS_STACK, stack_region->range.base().raw()); aux(13, AT_SYS_STACK_SIZE, stack_region->range.size());
         aux(14, AT_SYS_THREAD, info_page.thread); aux(15, AT_SYS_SC, info_page.sc);
-        aux(16, AT_SYS_STACK_MEM, stack_cap); aux(17, AT_SYS_IPC_MEM, ipc_cap); aux(18, AT_NULL, 0);
+        aux(16, AT_SYS_STACK_MEM, stack_cap); aux(17, AT_SYS_IPC_MEM, ipc_cap); aux(18, AT_SYS_ABI, NATIVE_ABI_VERSION);
+        aux(19, AT_SYS_STACK_REGION, stack_region_cap); aux(20, AT_SYS_IPC_REGION, ipc_region_cap);
+        aux(21, AT_SYS_GUARD_SIZE, mm::page_size); aux(22, AT_NULL, 0);
         ::memcpy(initial + root_initial_bytes - 16, "init", 5);
         return {};
     };

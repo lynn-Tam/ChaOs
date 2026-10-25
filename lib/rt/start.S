@@ -1,3 +1,5 @@
+#include <uapi/start.h>
+
 .section .text.start, "ax", @progbits
 .global _start
 .hidden _start
@@ -17,15 +19,22 @@ _start:
     call crt_start
 .size _start, . - _start
 
-.section .text.rt_thread_start, "ax", @progbits
-.global rt_thread_start
-.hidden rt_thread_start
-.type rt_thread_start, @function
-rt_thread_start:
+.section .text._thread_start, "ax", @progbits
+.global _thread_start
+.hidden _thread_start
+.type _thread_start, @function
+_thread_start:
     .option push
     .option norelax
     la gp, __global_pointer$
     .option pop
     mv tp, a1
-    tail rt_thread_boot
-.size rt_thread_start, . - rt_thread_start
+    tail _thread_boot
+.size _thread_start, . - _thread_start
+
+.section .note.native, "a", @note
+.balign 4
+.long 5, 4, NATIVE_ABI_NOTE
+.asciz NATIVE_ABI_NAME
+.balign 4
+.long NATIVE_ABI_VERSION

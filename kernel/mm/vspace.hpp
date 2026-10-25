@@ -164,6 +164,8 @@ class Map final : private libk::noncopyable_nonmovable {
     VRange range_{};
     Map* pending_next_{};
     MapId key_{};
+    u64 claim_{};
+    bool restore_{};
     ObjectRange object_{};
     Perms perms_{};
     Perms ceiling_{};
@@ -315,6 +317,7 @@ enum class VSpaceError : u8 {
     TranslationCorrupt,
     ResourceExhausted,
     Canceled,
+    Stale,
 };
 auto status(VSpaceError) noexcept -> status_t;
 
@@ -407,6 +410,7 @@ private:
         VRange range;
         std::optional<Perms> perms;
         bool clear{}, batch{}, stale{};
+        u64 claim{};
         Map *cursor{}, *first{}, *last{};
         Borrow* view{};
         va_t covered{}, page{};
@@ -482,11 +486,14 @@ class VSpace final : private libk::noncopyable_nonmovable {
     // callers cannot manufacture a second mapping identity truth.
     [[nodiscard]] auto bind_view(ViewReq&& request) noexcept -> std::expected<View, VSpaceError>;
 
-    [[nodiscard]] auto reserve(VRange range, bool guard = false) noexcept -> std::expected<void, VSpaceError>;
+    auto reserve(const VmAlloc&, cap::VmLimit, libk::delegate<status_t(cap::VmLimit)>) noexcept
+        -> std::expected<cap::VmLimit, status_t>;
+    auto guard(cap::VmLimit, VRange) noexcept -> std::expected<void, VSpaceError>;
+    [[nodiscard]] auto clear(VmCtx, cap::VmLimit) noexcept -> std::expected<VmStatus, VSpaceError>;
     [[nodiscard]] auto clear(VmCtx, VRange) noexcept -> std::expected<VmStatus, VSpaceError>;
 
     [[nodiscard]] auto map(VmCtx ctx, MapReq request, object::ref<> memory, Mem& object,
-                           cap::MemLimit auth) noexcept -> std::expected<MapResult, VSpaceError>;
+                           cap::MemLimit auth, u64 claim = 0) noexcept -> std::expected<MapResult, VSpaceError>;
 
     [[nodiscard]] auto map(VmCtx ctx, cap::VmLimit where, MapReq request, cap::Resolved<Mem>& memory) noexcept
         -> std::expected<MapResult, VSpaceError>;
@@ -536,9 +543,9 @@ class VSpace final : private libk::noncopyable_nonmovable {
 
     [[nodiscard]] auto map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& memory,
                                 cap::MemLimit mem_auth, Perms vspace_access,
-                                cap::Resolved<Mem>* capability) noexcept
+                                cap::Resolved<Mem>* capability, u64 claim = 0) noexcept
         -> std::expected<MapResult, VSpaceError>;
-    [[nodiscard]] auto edit(VmCtx, VRange, std::optional<Perms>, bool clear = false) noexcept
+    [[nodiscard]] auto edit(VmCtx, VRange, std::optional<Perms>, bool clear = false, u64 claim = 0) noexcept
         -> std::expected<VmStatus, VSpaceError>;
     auto advance_edit(VmCtx) noexcept -> std::expected<VmStatus, VSpaceError>;
     [[nodiscard]] static auto valid_user_range(VRange range) noexcept -> bool;
@@ -547,6 +554,9 @@ class VSpace final : private libk::noncopyable_nonmovable {
 
     [[nodiscard]] auto begin_edit(VRange range, bool must_be_empty) noexcept
         -> std::expected<void, VSpaceError>;
+    auto reserve_guard(VRange) noexcept -> std::expected<void, VSpaceError>;
+    auto reserved(VRange, u64) noexcept -> bool;
+    auto fill(Map&, u64, VmCtx = {}) noexcept -> std::expected<void, VSpaceError>;
     void end_edit() noexcept;
     struct EditDrop {
         void operator()(VSpace* space) const noexcept { space->end_edit(); }
@@ -612,6 +622,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
     bool editing_{};
     bool advancing_{}, again_{};
     LayoutTree layout_{};
+    u64 next_claim_{1};
     u64 mapped_{}, resident_{}, layout_epoch_{1}, observed_epoch_{};
     void link(Map&) noexcept;
     void unlink(Map&) noexcept;

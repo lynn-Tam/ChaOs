@@ -8,20 +8,20 @@ static uart_port* diagnostic;
 static void check(bool value, std::source_location location = std::source_location::current()) {
     if (!value) {
         if (diagnostic) (void)libk::fmt::format_to<"[ubus] check failed line={}\n">(*diagnostic, location.line());
-        sys::exit(-static_cast<status_t>(location.line()));
+        _thread_exit(-static_cast<status_t>(location.line()));
     }
 }
 static void expect(status_t status, std::source_location location = std::source_location::current()) {
     if (status != STATUS_OK) {
         if (diagnostic) (void)libk::fmt::format_to<"[ubus] failure line={} status={}\n">(*diagnostic, location.line(), status);
-        sys::exit(-static_cast<status_t>(location.line() * 100) + status);
+        _thread_exit(-static_cast<status_t>(location.line() * 100) + status);
     }
 }
 static auto provider() -> int {
     ubus_object object{"example.calculator", 3};
     bool done{};
     std::optional<ubus_request> delayed;
-    ubus_conn environment; expect(environment.bind(rt_startup().environment));
+    ubus_conn environment; expect(environment.bind(_startup().bootstrap));
     ubus_msg setup; expect(environment.invoke("Receive", {}, setup));
     const auto destination = setup.capability(setup.data["message"]["handoff"]);
     expect(object.add("sum", {{"a", ubus_type::U64}, {"b", ubus_type::U64}}, {{"value", ubus_type::U64}},
@@ -47,13 +47,13 @@ static auto provider() -> int {
         return STATUS_OK;
     }));
     expect(object.add("signal", {{"notice", ubus_type::Cap}}, {}, [](auto& request, auto&) {
-        return sys::notification_signal(request.capability(request.data["notice"])).status;
+        return _notification_signal(request.capability(request.data["notice"])).status;
     }));
     expect(object.add("stop", {}, {}, [&](auto&, auto&) { done = true; return STATUS_OK; }));
     expect(object.add("admin", {}, {}, [](auto&, auto&) { return STATUS_OK; }, 1));
     expect(object.add("notify", {{"notice", ubus_type::Cap}, {"text", ubus_type::String, false, 16000}}, {}, [](auto& request, auto&) {
         if (request.data["text"].template as<std::string_view>()->size() != 16000) return STATUS_BAD_ARGS;
-        return sys::notification_signal(request.capability(request.data["notice"])).status;
+        return _notification_signal(request.capability(request.data["notice"])).status;
     }, 0, true));
     const ubus_field samples_field{"samples", ubus_type::Vector, true, UINT64_MAX, {}, ubus_atom::U16};
     expect(object.add("shape", {
@@ -71,19 +71,19 @@ static auto provider() -> int {
     expect(ubus_send(destination, ready));
     while (!done) {
         const auto status = object.poll();
-        if (status == STATUS_WOULD_BLOCK) expect(ev_wait(rt_events()).status);
+        if (status == STATUS_WOULD_BLOCK) expect(_ev_wait(&_events()).status);
         else expect(status);
     }
     return STATUS_OK;
 }
 int main(int argc, char**) {
     if (argc > 1) return provider();
-    const auto& env = rt_startup();
+    const auto& env = _startup();
     auto firmware = fw_view::open(env); check(firmware.has_value());
     auto irq = firmware->irq(env); check(irq.has_value());
     auto console = fw_console::open(env, firmware->tree, irq->selector()); check(console.has_value());
-    const auto mapped = sys::cap_duplicate(console->memory.selector(), env.cspace, RIGHT_MAP); expect(mapped.status);
-    auto mapping = vm_area::map(rt_vm(), cap_owner{mapped.value}, 0, 4096, VM_READ | VM_WRITE); check(mapping.has_value());
+    const auto mapped = _cap_duplicate(console->memory.selector(), env.cspace, RIGHT_MAP); expect(mapped.status);
+    auto mapping = _vm_area::map(_vm(), _cap_owner{mapped.value}, 0, 4096, VM_READ | VM_WRITE); check(mapping.has_value());
     uart_port output{mapping->address + console->offset}; output.reset(); diagnostic = &output;
     // A caller may retire its Reply before dequeue or after deferral.
     // Neither transition retires the service that owns the request queue.
@@ -107,18 +107,18 @@ int main(int argc, char**) {
         ubus_msg response; expect(live.poll(response)); expect(response.status);
     }
     test_image image; open(image, env);
-    test_tasks tasks; tasks.open(env.alloc(), rt_root().domain, env.cpus);
-    ch_pair handoff; expect(handoff.open(env.alloc(), 1, 2));
-    const auto minted = sys::channel_mint(handoff.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
-    expect(minted.status); cap_owner sender{minted.value};
+    test_tasks tasks; tasks.open(env.alloc(), _root().domain, env.cpus);
+    _ch_pair handoff; expect(handoff.open(env.alloc(), 1, 2));
+    const auto minted = _channel_mint(handoff.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
+    expect(minted.status); _cap_owner sender{minted.value};
     {
         ubus_msg full;
         for (size_t i = 0; i < CHANNEL_MAX_CAPS; ++i) check(full.attach(sender.selector(), RIGHT_SEND).has_value());
-        const auto kept = sys::cap_duplicate(sender.selector(), env.cspace, RIGHT_SEND);
-        expect(kept.status); cap_owner owned{kept.value};
+        const auto kept = _cap_duplicate(sender.selector(), env.cspace, RIGHT_SEND);
+        expect(kept.status); _cap_owner owned{kept.value};
         const auto failed = full.give(std::move(owned));
         check(!failed && failed.error() == STATUS_NO_MEMORY && owned.selector() == kept.value);
-        check(cap_info(owned.selector()).has_value());
+        check(_cap_copy<CapInfo>(_cap_info(owned.selector())).has_value());
     }
     ubus_object environment{"fixture"};
     expect(environment.add("Receive", {}, {{"message", ubus_type::Record}}, [&](auto&, auto& response) {
@@ -130,16 +130,16 @@ int main(int argc, char**) {
     }));
     expect(environment.open()); auto endpoint = environment.connector(); check(bool(endpoint));
     const std::string_view argv[]{"provider", "--provider"};
-    const auto child = start(tasks, image, "provider", {.argv=argv, .environment=endpoint->selector(),
+    const auto child = start(tasks, image, "provider", {.argv=argv, .bootstrap=endpoint->selector(),
         .resources={.bytes=8 * 1024 * 1024, .caps=512, .slots=512, .pages=68}});
-    ubus_rx handoff_rx; expect(handoff_rx.open(handoff.ends[0].selector(), rt_events()));
+    ubus_rx handoff_rx; expect(handoff_rx.open(handoff.ends[0].selector(), &_events()));
     ubus_msg ready;
     for (;;) {
         const auto status = handoff_rx.receive(ready);
         if (status == STATUS_OK) break;
         check(status == STATUS_WOULD_BLOCK);
         const auto received = environment.poll();
-        if (received == STATUS_WOULD_BLOCK) expect(ev_wait(rt_events()).status); else expect(received);
+        if (received == STATUS_WOULD_BLOCK) expect(_ev_wait(&_events()).status); else expect(received);
     }
     auto connector = ready.take(ready.data["connector"]); check(bool(connector));
     ubus_conn connection;
@@ -176,29 +176,29 @@ int main(int argc, char**) {
     options = {}; options.put("limit", uint64_t{7}).array("samples", std::span{weights}).put("unknown", true);
     request = {}; request.data.put("options", options).put("values", values).put("none", nullptr);
     check(connection.invoke("shape", std::move(request), response) == STATUS_BAD_ARGS);
-    auto notice = sys::notification_create(env.alloc(), 7); expect(notice.status);
-    cap_owner notice_owner{notice.value};
+    auto notice = _notification_create(env.alloc(), 7); expect(notice.status);
+    _cap_owner notice_owner{notice.value};
     request = {};
     const auto notice_idx = request.attach(notice.value, RIGHT_SIGNAL);
     if (!notice_idx) return notice_idx.error();
     request.data.cap("notice", *notice_idx);
     expect(connection.invoke("signal", std::move(request), response));
-    check(sys::notification_take(notice.value).value == 7);
+    check(_notification_take(notice.value).value == 7);
     request = {};
     const auto cancel_idx = request.attach(notice.value, RIGHT_SIGNAL);
     if (!cancel_idx) return cancel_idx.error();
     request.data.cap("notice", *cancel_idx);
     request.data.put("text", large);
     expect(connection.notify("notify", std::move(request)));
-    expect(sys::wait_one(notice.value, 7).status);
-    check(sys::notification_take(notice.value).value == 7);
+    expect(_wait_one(notice.value, 7).status);
+    check(_notification_take(notice.value).value == 7);
     request = {}; request.data.put("text", large);
     expect(connection.begin("defer", std::move(request)));
     // A second connection triggers completion after the first request's stack
     // frame and raw packet have gone away, exercising owned deferred views.
     ubus_conn other; expect(other.bind(connector.selector()));
     expect(other.invoke("finish", {}, response));
-    while (connection.poll(response) == STATUS_WOULD_BLOCK) expect(ev_wait(rt_events()).status);
+    while (connection.poll(response) == STATUS_WOULD_BLOCK) expect(_ev_wait(&_events()).status);
     check(response.data["text"].as<std::string_view>() == large);
     request = {}; request.data.put("text", large);
     expect(connection.begin("defer", std::move(request)));

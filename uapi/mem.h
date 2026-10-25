@@ -20,6 +20,12 @@
 #include <stdint.h>
 #include <uapi/abi.h>
 
+#define VM_ALLOC_VERSION 1U
+struct VmAlloc {
+    uint32_t version, size;
+    uint64_t address, bytes, alignment, lower, upper, perms;
+};
+
 // Accepted operations keep their own lifetime; closing the result slot does not cancel.
 #define VM_OP_MAP 1U
 #define VM_OP_UNMAP 2U /* holes are already unmapped; reservations/guards require CLEAR */
@@ -72,7 +78,7 @@ struct VSpaceInfo {
 #define VM_RECORD_GUARD 2U
 #define VM_RECORD_COUNT 16U
 struct VmRecord {
-    uint64_t address, bytes, resident;
+    uint64_t address, bytes, resident, claim;
     uint32_t perms, kind;
 };
 struct VmRecords {

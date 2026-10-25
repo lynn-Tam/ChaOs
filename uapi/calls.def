@@ -30,7 +30,7 @@ CALL(VM_SUBMIT, 32, vm_submit, Create) /* a0=Quota, a1=VSpace, a2=VM operation, 
 CALL(OP_QUERY, 33, op_call, Call) /* a0=Op(Inspect); result, value, phase */
 CALL(OP_CANCEL, 34, op_call, Call) /* a0=Op(Control); TOO_LATE after commit */
 CALL(VM_SLICE, 35, vm_call, Call)
-CALL(VM_RESERVE, 36, vm_call, Call)
+CALL(VM_RESERVE, 36, vm_call, Call) /* a0=VSpace, a1=IPC VmAlloc offset; returns region selector/base */
 CALL(VM_GUARD, 37, vm_call, Call)
 
 /*

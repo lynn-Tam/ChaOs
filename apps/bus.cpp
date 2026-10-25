@@ -100,7 +100,7 @@ static auto argument(ubus_msg& request, ubus_value field, std::string_view name,
 }
 int main(int argc, char** argv) {
     ubus_conn directory, target;
-    auto status = directory.bind(rt_startup().environment);
+    auto status = directory.bind(_startup().bootstrap);
     if (status != STATUS_OK) return status;
     ubus_msg setup;
     status = directory.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
             if (!input) return STATUS_INVALID_CAP;
             if (arg == "--move") { if (!request.give(setup.take(value))) return STATUS_NO_MEMORY; }
             else {
-                const auto info = cap_info(input); if (!info) return info.error();
+                const auto info = _cap_copy<CapInfo>(_cap_info(input)); if (!info) return info.error();
                 if (!request.attach(input, info->view.rights)) return STATUS_NO_MEMORY;
             }
         } else {

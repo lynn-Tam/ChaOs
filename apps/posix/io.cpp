@@ -41,14 +41,14 @@ struct px_context {
     std::array<pending, IO_DEPTH> requests;
     request_id next{};
     io_tx output;
-    rt_cleanup cleanup;
+    _cleanup cleanup;
     ~px_context();
 };
 static thread_local px_context* px_current;
 static auto px_local() -> px_context& {
     if (!px_current) {
         px_current = new px_context;
-        rt_cleanup_defer(&px_current->cleanup, [](void* pointer) { delete static_cast<px_context*>(pointer); px_current = nullptr; }, px_current);
+        _cleanup_defer(&px_current->cleanup, [](void* pointer) { delete static_cast<px_context*>(pointer); px_current = nullptr; }, px_current);
     }
     return *px_current;
 }
@@ -56,11 +56,11 @@ static auto px_local() -> px_context& {
 // An open description shares only immutable authority and buffer slots. Each
 // in-flight call belongs to its submitting thread, including its Reply/Port.
 class px_session {
-    cap_owner endpoint_;
-    vm_area buffer_;
-    cap_desc descriptor_;
-    cap_owner exported_;
-    rt_mutex submit_;
+    _cap_owner endpoint_;
+    _vm_area buffer_;
+    _cap_desc descriptor_;
+    _cap_owner exported_;
+    _mutex submit_;
     uint32_t slots_{};
     uint64_t next_{}, loan_{};
     size_t limit_{}, depth_{}, stride_{};
@@ -71,20 +71,20 @@ class px_session {
     std::array<word_t, names.size()> tokens_{};
 public:
     ~px_session() {
-        if (exported_) (void)sys::cap_revoke(exported_.selector());
+        if (exported_) (void)_cap_revoke(exported_.selector());
         auto memory = std::move(buffer_.memory);
-        if (const auto status = buffer_.close(); status != STATUS_OK) sys::exit(status);
-        if (memory) (void)sys::object_destroy(memory.selector());
+        if (const auto status = buffer_.close(); status != STATUS_OK) _thread_exit(status);
+        if (memory) (void)_object_destroy(memory.selector());
         if (loan_) {
             // This may run after the exiting thread's TLS connections died.
             ubus_conn bus;
-            if (bus.bind(rt_startup().environment) == STATUS_OK) {
+            if (bus.bind(_startup().bootstrap) == STATUS_OK) {
                 ubus_msg q, r; q.data.put("action", "close").put("loan", loan_);
                 (void)bus.invoke("Resource", std::move(q), r);
             }
         }
     }
-    auto open(cap_owner endpoint, uint64_t access, uint64_t loan) -> status_t {
+    auto open(_cap_owner endpoint, uint64_t access, uint64_t loan) -> status_t {
         loan_ = loan;
         ubus_conn peer;
         auto status = peer.adopt(std::move(endpoint)); if (status != STATUS_OK) return status;
@@ -98,11 +98,10 @@ public:
         }
         auto authority = peer.release(); if (!authority) return authority.error();
         endpoint_ = std::move(*authority);
-        auto memory = vm_area::create(rt_startup().alloc(), rt_vm(), 0, depth_ * stride_);
+        auto memory = _vm_area::create(_startup().alloc(), _vm(), 0, depth_ * stride_);
         if (!memory) return memory.error();
         buffer_ = std::move(*memory);
-        const CapView view{.version=CAP_ATTENUATION_VERSION_CURRENT, .kind=ObjMem, .size=CAP_ATTENUATION_SIZE,
-            .rights=RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_REVOKE, .words={0, depth_ * stride_ / 4096, VM_READ | VM_WRITE}};
+        const auto view = _cap_mem(RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_REVOKE, 0, depth_ * stride_ / 4096, VM_READ | VM_WRITE);
         auto grant = descriptor_.derive(buffer_.memory.selector(), view); if (!grant) return grant.error();
         exported_ = std::move(*grant); access_ = access & (io_read | io_write); return STATUS_OK;
     }
@@ -146,8 +145,8 @@ public:
             std::lock_guard lock{submit_};
             if (status != STATUS_OK && !error_) {
                 error_ = status;
-                const auto revoked = sys::cap_revoke(exported_.selector()).status;
-                if (revoked != STATUS_OK) sys::exit(revoked);
+                const auto revoked = _cap_revoke(exported_.selector()).status;
+                if (revoked != STATUS_OK) _thread_exit(revoked);
             }
             slots_ &= ~(uint32_t{1} << local.slot);
         }
@@ -248,7 +247,7 @@ static auto px_result(int64_t value) noexcept -> int64_t {
     return -1;
 }
 
-static constinit rt_mutex table_mutex;
+static constinit _mutex table_mutex;
 static std::shared_ptr<const std::string> cwd = std::make_shared<const std::string>("/");
 static auto px_cwd() -> std::shared_ptr<const std::string> {
     std::lock_guard lock{table_mutex}; return cwd;
@@ -256,7 +255,7 @@ static auto px_cwd() -> std::shared_ptr<const std::string> {
 static auto px_absolute(std::string_view path) -> std::string { return libk::path_normal(path, *px_cwd()); }
 
 struct directory {
-    rt_mutex mutex;
+    _mutex mutex;
     ubus_data page;
     std::string path;
     size_t index{};
@@ -264,32 +263,32 @@ struct directory {
 };
 
 struct input_stream {
-    cap_owner channel;
+    _cap_owner channel;
     io_frame frame;
     bool ended{};
     uint64_t offset{};
 };
 struct output_stream {
-    cap_owner channel;
+    _cap_owner channel;
 };
 struct open_desc {
     size_t fds{}; // Table ownership is independent of in-flight I/O/completion references.
-    rt_mutex sequential;
+    _mutex sequential;
     std::variant<input_stream, output_stream, px_session> data;
     auto queue() noexcept -> px_session& { return std::get<px_session>(data); }
 };
 static std::vector<std::shared_ptr<open_desc>> fds(3);
 static bool initialized;
 static status_t init_status{};
-static constinit rt_mutex init_mutex;
+static constinit _mutex init_mutex;
 static auto files() -> status_t {
     if (px_local().rpc.endpoint()) {
-        const auto fact = sys::source_info(px_local().rpc.endpoint(), SOURCE_WRITE);
+        const auto fact = _source_info(px_local().rpc.endpoint(), SOURCE_WRITE);
         if (fact.status == STATUS_OK && !(fact.value & SOURCE_TERMINAL)) return STATUS_OK;
         (void)px_local().rpc.close();
     }
     if (!px_local().bus.endpoint()) {
-        const auto status = px_local().bus.bind(rt_startup().environment);
+        const auto status = px_local().bus.bind(_startup().bootstrap);
         if (status != STATUS_OK) return status;
     }
     ubus_msg request, response; request.data.put("name", "files");
@@ -341,7 +340,7 @@ static void pump() noexcept {
         }
     }
 }
-static auto wait() noexcept -> int32_t { return ev_wait(rt_events()).status; }
+static auto wait() noexcept -> int32_t { return _ev_wait(&_events()).status; }
 static auto take(pending& item) noexcept -> int64_t { const auto result = item.result; item = {}; return result; }
 static auto drain(const std::shared_ptr<open_desc>& target = {}) noexcept -> int32_t {
     for (;;) {
@@ -354,7 +353,7 @@ static auto drain(const std::shared_ptr<open_desc>& target = {}) noexcept -> int
 static auto finish(pending& item) noexcept -> int64_t {
     while (!item.ready) {
         pump(); if (item.ready) break;
-        const auto status = wait(); if (status != STATUS_OK) sys::exit(status);
+        const auto status = wait(); if (status != STATUS_OK) _thread_exit(status);
     }
     return take(item);
 }
@@ -430,9 +429,9 @@ auto px_init() noexcept -> status_t {
     std::lock_guard init{init_mutex};
     if (initialized) return STATUS_BUSY;
     if (init_status != STATUS_OK) return init_status;
-    const auto& env = rt_startup();
-    std::array<cap_owner, 3> streams;
-    auto status = px_local().bus.bind(env.environment); if (status != STATUS_OK) return status;
+    const auto& env = _startup();
+    std::array<_cap_owner, 3> streams;
+    auto status = px_local().bus.bind(env.bootstrap); if (status != STATUS_OK) return status;
     ubus_msg setup; status = px_local().bus.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
     init_status = STATUS_CLOSED; // Receive is consumed; a failed publication cannot repeat it.
     const std::array<std::string_view, 3> fields{"stdin", "stdout", "stderr"};
@@ -469,10 +468,10 @@ auto px_init() noexcept -> status_t {
 extern "C" int clock_gettime(clockid_t clock, timespec* time) {
     if (!time || (clock != CLOCK_MONOTONIC && clock != CLOCK_REALTIME)) return px_result(STATUS_BAD_ARGS);
     if (clock == CLOCK_REALTIME) return px_result(STATUS_INVALID_OP);
-    const auto frequency = sys::clock_frequency();
+    const auto frequency = _clock_frequency();
     if (frequency.status != STATUS_OK)
         return px_result(frequency.status);
-    const auto now = sys::clock_now();
+    const auto now = _clock_now();
     if (now.status != STATUS_OK)
         return px_result(now.status);
     const auto fraction =
@@ -489,7 +488,7 @@ extern "C" int32_t nanosleep(const timespec* delay, timespec* remaining) {
         return px_result(STATUS_BAD_ARGS);
     const auto ns = static_cast<unsigned __int128>(delay->tv_sec) * 1000000000 + delay->tv_nsec;
     if (ns > UINT64_MAX) return px_result(STATUS_BAD_ARGS);
-    rt_sleep_ns(uint64_t(ns));
+    _sleep_ns(uint64_t(ns));
     if (remaining) *remaining = {};
     return 0;
 }
@@ -523,7 +522,7 @@ extern "C" int open(const char* path, int flags, ...) {
         backend |= io_exclusive;
     if (flags & O_APPEND)
         backend |= io_append;
-    cap_owner object;
+    _cap_owner object;
     const auto absolute = px_absolute(path);
     auto status = files();
     uint64_t loan{};
@@ -583,7 +582,7 @@ extern "C" int32_t mkstemp(char* path) {
     for (size_t i = size - 6; i < size; ++i)
         if (path[i] != 'X')
             return px_result(STATUS_BAD_ARGS);
-    const auto now = sys::clock_now();
+    const auto now = _clock_now();
     if (now.status != STATUS_OK)
         return px_result(now.status);
     constexpr char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";

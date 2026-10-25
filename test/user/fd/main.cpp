@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-struct fd_image { cap_owner memory; uint64_t size; };
+struct fd_image { _cap_owner memory; uint64_t size; };
 static auto fd_map(ubus_conn& files, std::string_view path, word_t perms = VM_READ) -> std::expected<fd_image, status_t> {
     ubus_msg request, response; request.data.put("path", path).put("perms", perms);
     const auto status = files.invoke("Map", std::move(request), response);
@@ -45,9 +45,9 @@ static int cache() {
     }
     // Native Map sees accepted content without Sync, and cannot gain Execute
     // from this application's read-only Directory grant.
-    const auto& env = rt_startup();
+    const auto& env = _startup();
     ubus_conn bus, directory;
-    if (bus.bind(env.environment) != STATUS_OK) return 62;
+    if (bus.bind(env.bootstrap) != STATUS_OK) return 62;
     ubus_msg query, response; query.data.put("name", "read");
     if (bus.invoke("Get", std::move(query), response) != STATUS_OK
         || directory.bind(response.capability(response.data["connector"])) != STATUS_OK) return 62;
@@ -60,13 +60,13 @@ static int cache() {
     auto first = fd_map(directory, "fd-map");
     if (!first || first->size != 3)
         return 65;
-    auto old = vm_area::map(rt_vm(), std::move(first->memory), 0, 4096, VM_READ);
+    auto old = _vm_area::map(_vm(), std::move(first->memory), 0, 4096, VM_READ);
     if (!old || pwrite(file, "new", 3, 0) != 3)
         return 66;
     auto second = fd_map(directory, "fd-map");
     if (!second || second->size != 3)
         return 67;
-    auto fresh = vm_area::map(rt_vm(), std::move(second->memory), 0, 4096, VM_READ);
+    auto fresh = _vm_area::map(_vm(), std::move(second->memory), 0, 4096, VM_READ);
     if (!fresh || close(file))
         return 68;
     const auto* before = reinterpret_cast<const uint8_t*>(old->address);

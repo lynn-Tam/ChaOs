@@ -7,14 +7,14 @@ struct svc_output {
         while (size) {
             const auto count = std::min(size, size_t{80});
             ubus_msg message; message.data.put("data", std::as_bytes(std::span{bytes, count}));
-            if (const auto status = ubus_send(channel, message); status != STATUS_OK) sys::exit(status);
+            if (const auto status = ubus_send(channel, message); status != STATUS_OK) _thread_exit(status);
             bytes += count; size -= count;
         }
     }
 };
 int main(int argc, char** argv) {
     ubus_conn environment, owner;
-    auto status = environment.bind(rt_startup().environment); if (status != STATUS_OK) return status;
+    auto status = environment.bind(_startup().bootstrap); if (status != STATUS_OK) return status;
     ubus_msg setup; status = environment.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
     svc_output output{setup.capability(setup.data["message"]["stdout"])};
     auto root = setup.take(setup.data["message"]["scope"]); if (!root) return STATUS_DENIED;

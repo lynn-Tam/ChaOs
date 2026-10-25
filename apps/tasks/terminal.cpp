@@ -9,11 +9,11 @@ static ft_terminal* ft_active;
 ft_terminal::~ft_terminal() {
     if (ft_active == this) ft_active = nullptr;
 }
-auto ft_terminal::open(const rt_env& env, const ubus_msg& setup) -> status_t {
+auto ft_terminal::open(const _env& env, const ubus_msg& setup) -> status_t {
     if (ft_active) return STATUS_BUSY;
     const auto status = open_session(env, setup);
     if (status != STATUS_OK) return status;
-    port_ = rt_events();
+    port_ = &_events();
     ft_active = this;
     auto quirks = ftxui::Terminal::GetQuirks();
     quirks.SetColorSupport(ftxui::Terminal::Palette16);
@@ -22,10 +22,10 @@ auto ft_terminal::open(const rt_env& env, const ubus_msg& setup) -> status_t {
     return STATUS_OK;
 }
 auto ft_terminal::wait(uint64_t deadline) -> status_t {
-    return events_.empty() ? ev_wait(port_, deadline).status : STATUS_OK;
+    return events_.empty() ? _ev_wait(port_, deadline).status : STATUS_OK;
 }
 auto ft_terminal::read() -> std::expected<std::optional<ftxui::Event>, status_t> {
-    const auto now = sys::clock_now().value;
+    const auto now = _clock_now().value;
     bool received{};
     // Bound one input batch; leave further bytes with the terminal protocol.
     for (size_t i = 0; i < 64 && events_.empty(); ++i) {
@@ -34,7 +34,7 @@ auto ft_terminal::read() -> std::expected<std::optional<ftxui::Event>, status_t>
         if (byte < 0) return std::unexpected(byte);
         if (byte == 12) { if (const auto status = reset(); status != STATUS_OK) return std::unexpected(status); continue; }
         received = true;
-        input_at_ = rt_after_ms(50).value_or(UINT64_MAX);
+        input_at_ = _after(std::chrono::milliseconds{50}).value_or(UINT64_MAX);
         parser_.Add(static_cast<char>(byte));
     }
     // Drain queued sequence bytes before expiring Escape. Rendering/RPC may
@@ -102,13 +102,13 @@ void ft_terminal::print(std::string_view text) {
         const auto status = flush();
         if (status == STATUS_OK) break;
         if (status == STATUS_PENDING) continue;
-        if (status != STATUS_WOULD_BLOCK) sys::exit(status);
-        if (const auto ready = wait(); ready != STATUS_OK) sys::exit(ready);
+        if (status != STATUS_WOULD_BLOCK) _thread_exit(status);
+        if (const auto ready = wait(); ready != STATUS_OK) _thread_exit(ready);
     }
     frame_.clear(); (void)write(text);
 }
 void ft_print(std::string_view text) {
-    if (!ft_active) sys::exit(STATUS_INVALID_OP);
+    if (!ft_active) _thread_exit(STATUS_INVALID_OP);
     ft_active->print(text);
 }
 // Standalone components execute closures directly; this session has no animations.

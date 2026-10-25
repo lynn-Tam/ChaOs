@@ -1,7 +1,7 @@
 #include <vm.hpp>
 #include <mutex>
 #include <sync.hpp>
-#include <util.hpp>
+#include <thread.hpp>
 #include <algorithm>
 #include <cstddef>
 #include <new>
@@ -12,8 +12,8 @@
 #include <string.h>
 
 
-// Heap metadata precedes VA leases in the lock order; parking never allocates.
-static constinit rt_mutex heap_mutex;
+// Kernel address claims require no userspace metadata allocation.
+static constinit _mutex heap_mutex;
 constexpr size_t Align = alignof(std::max_align_t);
 constexpr size_t ChunkSize = 64 * 1024;
 struct Chunk;
@@ -24,7 +24,7 @@ struct alignas(std::max_align_t) Block {
     bool free;
 };
 struct Chunk {
-    vm_area map;
+    _vm_area map;
     Chunk *prev, *next;
 };
 struct Alloc { Block* block; size_t size; };
@@ -33,7 +33,7 @@ constexpr size_t Header = round(sizeof(Chunk), Align);
 static Chunk* chunks;
 static Chunk* spare;
 static CreateAuth pool;
-static vm_arena* vm;
+static _vm_space* vm;
 
 static auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
     std::lock_guard lock{heap_mutex};
@@ -52,10 +52,10 @@ static auto allocate(size_t n, size_t alignment = Align) noexcept -> void* {
         auto size = std::max(ChunkSize, minimum);
         // Anonymous pages materialize on touch; smaller VA gaps can still
         // satisfy a request when the preferred chunk cannot be reserved.
-        auto map = vm_area::create(pool, *vm, 0, size);
-        if (!map && size != minimum && map.error() == STATUS_NO_MEMORY) {
+        auto map = _vm_area::create(pool, *vm, 0, size);
+        if (!map && size != minimum && (map.error() == STATUS_NO_MEMORY || map.error() == STATUS_EXHAUSTED)) {
             size = minimum;
-            map = vm_area::create(pool, *vm, 0, size);
+            map = _vm_area::create(pool, *vm, 0, size);
         }
         if (!map) return nullptr;
         auto* c = std::construct_at(reinterpret_cast<Chunk*>(map->address), std::move(*map), nullptr, chunks);
@@ -102,11 +102,11 @@ static void release(void* p) noexcept {
 }
 static auto checked(size_t n, size_t alignment = Align) -> void* {
     if (auto* p = allocate(n, alignment)) return p;
-    sys::exit(STATUS_NO_MEMORY);
+    _thread_exit(STATUS_NO_MEMORY);
 }
 
 
-extern "C" void init_heap(CreateAuth pool_cap, vm_arena& arena) noexcept {
+extern "C" void init_heap(CreateAuth pool_cap, _vm_space& arena) noexcept {
     pool = pool_cap; vm = &arena;
 }
 extern "C" auto malloc(size_t n) noexcept -> void* { return allocate(n); }
@@ -145,14 +145,14 @@ void operator delete[](void* p, std::align_val_t) noexcept { release(p); }
 void operator delete(void* p, size_t, std::align_val_t) noexcept { release(p); }
 void operator delete[](void* p, size_t, std::align_val_t) noexcept { release(p); }
 const std::nothrow_t std::nothrow{};
-[[noreturn]] void std::__throw_bad_alloc() { sys::exit(STATUS_NO_MEMORY); }
-[[noreturn]] void std::__throw_bad_array_new_length() { sys::exit(STATUS_NO_MEMORY); }
-[[noreturn]] void std::__throw_logic_error(const char*) { sys::exit(STATUS_BAD_ARGS); }
-[[noreturn]] void std::__throw_length_error(const char*) { sys::exit(STATUS_BAD_ARGS); }
-[[noreturn]] void std::__throw_out_of_range_fmt(const char*, ...) { sys::exit(STATUS_BAD_ARGS); }
+[[noreturn]] void std::__throw_bad_alloc() { _thread_exit(STATUS_NO_MEMORY); }
+[[noreturn]] void std::__throw_bad_array_new_length() { _thread_exit(STATUS_NO_MEMORY); }
+[[noreturn]] void std::__throw_logic_error(const char*) { _thread_exit(STATUS_BAD_ARGS); }
+[[noreturn]] void std::__throw_length_error(const char*) { _thread_exit(STATUS_BAD_ARGS); }
+[[noreturn]] void std::__throw_out_of_range_fmt(const char*, ...) { _thread_exit(STATUS_BAD_ARGS); }
 
 // libstdc++ declares this cold path extern even in the freestanding headers.
 // Instantiate its supplied definition so string overlap keeps STL semantics.
 template void std::basic_string<char>::_M_replace_cold(char*, size_type, const char*, size_type, size_type);
 
-[[noreturn]] void std::__throw_bad_function_call() { sys::exit(STATUS_BAD_ARGS); }
+[[noreturn]] void std::__throw_bad_function_call() { _thread_exit(STATUS_BAD_ARGS); }

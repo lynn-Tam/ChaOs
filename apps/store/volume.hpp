@@ -16,10 +16,10 @@ struct st_extent { uint64_t offset{}; size_t size{}, skip{}, bytes{}; };
 class st_device {
     struct operation { st_cmd command; void* destination{}; };
     ubus_conn peer_;
-    ev_watch terminal_;
-    vm_area buffer_;
-    cap_desc descriptor_;
-    cap_owner exported_;
+    _ev_watch terminal_;
+    _vm_area buffer_;
+    _cap_desc descriptor_;
+    _cap_owner exported_;
     ubus_batch<operation, io_depth> calls_;
     uint64_t capacity_{}, next_{};
     size_t limit_{}, depth_{}, stride_{};
@@ -37,16 +37,15 @@ public:
         const auto limit = response.data["limit"].as<uint64_t>(), depth = response.data["depth"].as<uint64_t>();
         if (!sequence || !limit || *limit < 512 || *limit > io_limit || *limit % 512 || !depth || !*depth || *depth > io_depth) return STATUS_PEER_FAULT;
         capacity_ = *size; next_ = *sequence; limit_ = *limit; depth_ = *depth; stride_ = (limit_ + 4095) & ~size_t{4095};
-        const auto made = sys::memory_create(rt_startup().alloc(), depth_ * stride_, VM_READ | VM_WRITE);
+        const auto made = _memory_create(_startup().alloc(), depth_ * stride_, VM_READ | VM_WRITE);
         if (made.status != STATUS_OK) return made.status;
-        auto mapped = vm_area::map(rt_vm(), cap_owner{made.value}, 0, depth_ * stride_, VM_READ | VM_WRITE);
+        auto mapped = _vm_area::map(_vm(), _cap_owner{made.value}, 0, depth_ * stride_, VM_READ | VM_WRITE);
         if (!mapped) return mapped.error();
         buffer_ = std::move(*mapped);
-        const CapView view{.version=CAP_ATTENUATION_VERSION_CURRENT, .kind=ObjMem, .size=CAP_ATTENUATION_SIZE,
-            .rights=RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_REVOKE, .words={0, depth_ * stride_ / 4096, VM_READ | VM_WRITE}};
+        const auto view = _cap_mem(RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_REVOKE, 0, depth_ * stride_ / 4096, VM_READ | VM_WRITE);
         auto grant = descriptor_.derive(buffer_.memory.selector(), view); if (!grant) return grant.error();
         exported_ = std::move(*grant);
-        return terminal_.open(rt_events(), peer_.endpoint(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+        return terminal_.open(&_events(), peer_.endpoint(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
     }
     auto capacity() const -> uint64_t { return capacity_; }
     auto error() -> status_t {
@@ -96,7 +95,7 @@ public:
         for (;;) {
             const auto status = completion(result, id); if (status != STATUS_WOULD_BLOCK) return status;
             if (!calls_.next()) return STATUS_NOT_FOUND;
-            const auto wake = ev_wait(rt_events(), calls_.deadline()).status; if (wake != STATUS_OK) return wake;
+            const auto wake = _ev_wait(&_events(), calls_.deadline()).status; if (wake != STATUS_OK) return wake;
         }
     }
     auto wait(uint64_t id) -> status_t { st_done result; const auto status = wait(result, id); return status == STATUS_OK ? result.status : status; }

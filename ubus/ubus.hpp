@@ -13,21 +13,21 @@ inline constexpr size_t ubus_body_limit = 1u << 20, ubus_control_limit = 64u << 
 // received/explicitly offered slots; attach borrows a sender's slot until send.
 struct ubus_msg {
     ubus_data data;
-    std::array<cap_owner, CHANNEL_MAX_CAPS> caps;
+    std::array<_cap_owner, CHANNEL_MAX_CAPS> caps;
     std::array<CapXfer, CHANNEL_MAX_CAPS> transfers{};
     size_t count{};
     status_t status{};
     word_t tag{}, badge{}, deadline{};
     auto attach(cap_t cap, word_t rights) -> std::expected<size_t, status_t>;
-    auto offer(cap_owner&& cap, word_t rights) -> std::expected<size_t, status_t>;
-    auto give(cap_owner&& cap) -> std::expected<size_t, status_t>;
+    auto offer(_cap_owner&& cap, word_t rights) -> std::expected<size_t, status_t>;
+    auto give(_cap_owner&& cap) -> std::expected<size_t, status_t>;
     void commit();
     void forward(); // Move owned received capabilities on the next successful send.
     auto clone() const -> std::expected<ubus_msg, status_t>;
     // Select a value and its referenced capabilities, borrowing source slots.
     auto slice(ubus_value) const -> std::expected<ubus_msg, status_t>;
     auto capability(ubus_value value) const -> cap_t;
-    auto take(ubus_value value) -> cap_owner;
+    auto take(ubus_value value) -> _cap_owner;
 };
 
 struct ubus_field {
@@ -44,7 +44,7 @@ using ubus_schema = std::vector<ubus_field>;
 struct ubus_method;
 
 struct ubus_request : ubus_msg {
-    cap_owner reply, reply_body;
+    _cap_owner reply, reply_body;
     size_t reply_bytes{};
     auto reserve_reply(size_t) -> status_t;
     auto facet() const -> word_t { return badge ? badge - 1 : 0; }
@@ -66,7 +66,7 @@ struct ubus_method {
 struct ubus_wire {
     std::array<word_t, CHANNEL_MAX_WORDS> words{};
     std::array<CapXfer, CHANNEL_MAX_CAPS> caps{};
-    cap_owner body;
+    _cap_owner body;
     size_t size{}, count{}, capacity{};
     auto encode(const ubus_msg&, uint16_t kind, size_t maxcaps) -> status_t;
 };
@@ -77,23 +77,23 @@ auto ubus_receive(cap_t endpoint, ubus_request&, bool block = false) -> status_t
 auto ubus_receive_event(cap_t endpoint, ubus_msg&, bool block = false) -> status_t;
 
 class ubus_rx {
-    ch_rx input_;
+    _ch_rx input_;
     size_t body_limit_{ubus_body_limit};
 public:
     explicit operator bool() const { return bool(input_); }
-    auto open(cap_t channel, cap_t events = 0, size_t body_limit = ubus_body_limit) -> status_t {
+    auto open(cap_t channel, _ev_port* events = nullptr, size_t body_limit = ubus_body_limit) -> status_t {
         if (body_limit < sizeof(ubus_head) || body_limit > ubus_body_limit) return STATUS_BAD_ARGS;
         body_limit_ = body_limit; return input_.open(channel, events);
     }
     auto close() -> status_t { return input_.close(); }
     auto arm() -> status_t { return input_.arm(); }
-    auto receive(ubus_request&) -> sys::SysResult;
+    auto receive(ubus_request&) -> _sys_result;
     auto drop(word_t sequence) -> status_t { return input_.drop(sequence); }
     auto receive(ubus_msg&) -> status_t;
 };
 
 class ubus_call {
-    rpc_op rpc_;
+    _rpc_op rpc_;
     ubus_wire wire_;
     ubus_msg message_;
     cap_t peer_{};
@@ -101,7 +101,7 @@ public:
     auto active() const noexcept -> bool { return rpc_.active(); }
     auto pending() const noexcept -> bool { return rpc_.pending(); }
     auto sent() const noexcept -> bool { return rpc_.sent(); }
-    auto deadline() const noexcept -> word_t { return rpc_.deadline(); }
+    auto deadline() const noexcept -> std::optional<word_t> { return rpc_.deadline(); }
     auto begin(cap_t endpoint, ubus_msg message, bool drain = false) -> status_t;
     auto commit() -> status_t;
     auto poll(ubus_msg&) -> status_t;
@@ -114,9 +114,9 @@ class ubus_conn;
 // The complete method table is immutable once a connector is issued. Replacing
 // a table means replacing the object; old capabilities retain their old object.
 class ubus_object {
-    ch_pair channel_;
-    cap_owner budget_, scope_;
-    ev_watch closing_;
+    _ch_pair channel_;
+    _cap_owner budget_, scope_;
+    _ev_watch closing_;
     ubus_rx input_;
     std::vector<std::shared_ptr<const ubus_method>> methods_;
     std::string interface_;
@@ -135,12 +135,12 @@ public:
              word_t required = 0, bool notify = false) -> status_t;
     ~ubus_object();
     auto close() -> status_t;
-    auto open(size_t depth = 16, cap_t quota = 0, cap_owner scope = {}, size_t body_limit = ubus_control_limit) -> status_t;
+    auto open(size_t depth = 16, cap_t quota = 0, _cap_owner scope = {}, size_t body_limit = ubus_control_limit) -> status_t;
     auto scope() const -> cap_t { return scope_.selector(); }
-    auto connector(word_t facet = 0) -> std::expected<cap_owner, status_t>;
+    auto connector(word_t facet = 0) -> std::expected<_cap_owner, status_t>;
     // A returned object releases mint authority: its last remote handle closes
     // the sending side, so the owner can drain and reclaim the object.
-    auto handle(word_t facet = 0, word_t rights = RIGHT_SEND | RIGHT_DUPLICATE) -> std::expected<cap_owner, status_t>;
+    auto handle(word_t facet = 0, word_t rights = RIGHT_SEND | RIGHT_DUPLICATE) -> std::expected<_cap_owner, status_t>;
     auto poll() -> status_t;
     auto arm() -> status_t { return input_.arm(); }
     auto endpoint() const -> cap_t { return channel_.ends[0].selector(); }
@@ -150,20 +150,20 @@ public:
 // Bind negotiates a description and retains the same grant as its connector.
 // No second endpoint identity outlives or bypasses that grant's revocation.
 class ubus_conn {
-    cap_owner endpoint_;
+    _cap_owner endpoint_;
     ubus_data description_;
     ubus_call call_;
-    struct binding { std::string interface; uint64_t minimum, maximum, features; cap_owner endpoint; };
+    struct binding { std::string interface; uint64_t minimum, maximum, features; _cap_owner endpoint; };
     std::optional<binding> binding_;
     auto bound(ubus_msg&) -> status_t;
-    auto install(cap_owner, ubus_value, std::string_view, uint64_t, uint64_t, uint64_t) -> status_t;
+    auto install(_cap_owner, ubus_value, std::string_view, uint64_t, uint64_t, uint64_t) -> status_t;
 public:
     auto active() const -> bool { return call_.active(); }
     auto pending() const -> bool { return call_.pending(); }
     auto state() const -> status_t;
     auto close() -> status_t;
-    auto release() -> std::expected<cap_owner, status_t>;
-    auto adopt(cap_owner endpoint, std::string_view interface = {}, uint64_t minimum = 0,
+    auto release() -> std::expected<_cap_owner, status_t>;
+    auto adopt(_cap_owner endpoint, std::string_view interface = {}, uint64_t minimum = 0,
                uint64_t maximum = UINT64_MAX, uint64_t features = 0) -> status_t;
     auto begin_bind(cap_t connector, std::string_view interface = {}, uint64_t minimum = 0,
                     uint64_t maximum = UINT64_MAX, uint64_t features = 0, uint64_t deadline = 0) -> status_t;
@@ -222,7 +222,7 @@ public:
     }
     auto commit(ubus_ticket ticket) -> bool {
         if (!valid(ticket) || entries_[ticket.slot].cancelled) return false;
-        const auto peer = sys::source_info(entries_[ticket.slot].call.reply.selector(), SOURCE_WRITE);
+        const auto peer = _source_info(entries_[ticket.slot].call.reply.selector(), SOURCE_WRITE);
         if (peer.status != STATUS_OK || (peer.value & SOURCE_TERMINAL)) return false;
         entries_[ticket.slot].committed = true; return true;
     }
@@ -295,7 +295,7 @@ public:
         uint64_t due{};
         for (const auto& item : entries_) if (item && item->id) {
             const auto deadline = item->call.deadline();
-            if (deadline != UINT64_MAX && deadline && (!due || deadline < due)) due = deadline;
+            if (deadline && (!due || *deadline < due)) due = *deadline;
         }
         return due;
     }

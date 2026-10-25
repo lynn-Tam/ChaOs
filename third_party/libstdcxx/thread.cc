@@ -90,7 +90,7 @@ static inline int get_nprocs()
 }
 # define _GLIBCXX_NPROCS get_nprocs()
 #else
-# define _GLIBCXX_NPROCS rt_cpu_count()
+# define _GLIBCXX_NPROCS _cpu_count()
 #endif
 
 namespace std _GLIBCXX_VISIBILITY(default)
@@ -235,7 +235,7 @@ namespace this_thread
   __sleep_for(chrono::seconds __s, chrono::nanoseconds __ns)
   {
     const auto ns = static_cast<unsigned __int128>(__s.count()) * 1000000000 + __ns.count();
-    rt_sleep_ns(ns > UINT64_MAX ? UINT64_MAX : uint64_t(ns));
+    _sleep_ns(ns > UINT64_MAX ? UINT64_MAX : uint64_t(ns));
   }
 }
 _GLIBCXX_END_NAMESPACE_VERSION

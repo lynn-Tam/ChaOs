@@ -14,10 +14,13 @@ def main():
     timeout = 5
     fail_sector = None
     report = None
-    while extra_markers and extra_markers[0] in ("--bundle", "--disk", "--timeout", "--fail-sector", "--report"):
+    forbidden = []
+    while extra_markers and extra_markers[0] in ("--bundle", "--disk", "--timeout", "--fail-sector", "--report", "--forbid"):
         option = extra_markers.pop(0)
         value = extra_markers.pop(0)
-        if option == "--report":
+        if option == "--forbid":
+            forbidden.append(value)
+        elif option == "--report":
             report = value
         elif option == "--bundle":
             bundle = value
@@ -57,7 +60,7 @@ def main():
             text = output.decode(errors="replace")
             expected = [f"cpu: online={count}",
                         "runtime: entered", *extra_markers]
-            if any(marker not in text for marker in expected) or "KERNEL PANIC" in text or "DOUBLE PANIC" in text:
+            if any(marker not in text for marker in expected) or any(marker in text for marker in forbidden) or "KERNEL PANIC" in text or "DOUBLE PANIC" in text:
                 log = temporary / f"failed-{count}.log"
                 log.write_text(text)
                 print(text)

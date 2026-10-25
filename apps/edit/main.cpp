@@ -12,10 +12,10 @@
 #include <vector>
 
 class ed_terminal {
-    cap_t port_{};
+    _ev_port* port_{};
     ubus_conn control_;
     io_tx output_;
-    ch_pair subscription_;
+    _ch_pair subscription_;
     ubus_rx events_, input_;
     uint64_t focus_{};
     bool focused_{};
@@ -23,17 +23,17 @@ class ed_terminal {
     status_t status_{};
     std::deque<unsigned char> bytes_;
 public:
-    auto open(const rt_env& env, const ubus_msg& setup) -> status_t {
-        port_ = rt_events();
+    auto open(const _env& env, const ubus_msg& setup) -> status_t {
+        port_ = &_events();
         auto status = control_.bind(setup.capability(setup.data["message"]["terminal"]));
         if (status == STATUS_OK) status = subscription_.open(env.alloc(), 8, 0);
         if (status == STATUS_OK) status = events_.open(subscription_.ends[0].selector(), port_);
         if (status == STATUS_OK) status = input_.open(setup.capability(setup.data["message"]["stdin"]), port_);
         if (status != STATUS_OK) return status;
-        const auto sender = sys::channel_mint(subscription_.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
+        const auto sender = _channel_mint(subscription_.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
         if (sender.status != STATUS_OK) return sender.status;
         ubus_msg request, response;
-        const auto events_idx = request.offer(cap_owner{sender.value}, RIGHT_SEND);
+        const auto events_idx = request.offer(_cap_owner{sender.value}, RIGHT_SEND);
         if (!events_idx) return events_idx.error();
         request.data.cap("events", *events_idx);
         return control_.invoke("Fullscreen", std::move(request), response);
@@ -87,7 +87,7 @@ public:
                 if (received != STATUS_WOULD_BLOCK) return received;
             }
             if (!block) return STATUS_WOULD_BLOCK;
-            if (const auto wake = ev_wait(port_, deadline); wake.status != STATUS_OK) return wake.status;
+            if (const auto wake = _ev_wait(port_, deadline); wake.status != STATUS_OK) return wake.status;
         }
     }
 };
@@ -348,20 +348,20 @@ class ed_file {
     ubus_conn document_;
     uint64_t next_{};
 public:
-    auto open(cap_owner object) -> status_t { return document_.adopt(std::move(object)); }
+    auto open(_cap_owner object) -> status_t { return document_.adopt(std::move(object)); }
     auto load(ed_buffer& text, ubus_conn& environment) -> status_t {
         ubus_msg response;
         auto status = document_.invoke("Stat", {}, response); if (status != STATUS_OK) return status;
         const auto size = response.data["size"].as<uint64_t>(); if (!size || *size > (UINT64_MAX - 2 * 1024 * 1024) / 4) return STATUS_BAD_ARGS;
         next_ = response.data["sequence"].as<uint64_t>().value_or(0);
         const auto need = (*size * 4 + 2 * 1024 * 1024 + 4095) & ~uint64_t{4095};
-        status = sys::quota_info(rt_startup().quota).status; if (status != STATUS_OK) return status;
-        const auto budget = *reinterpret_cast<const QuotaInfo*>(rt_current().ipc);
+        status = _quota_info(_startup().quota).status; if (status != STATUS_OK) return status;
+        const auto budget = *reinterpret_cast<const QuotaInfo*>(_ipc());
         if (need > budget.memory_limit) {
             ubus_msg request; request.data.put("bytes", need).put("caps", budget.cap_limit);
             status = environment.invoke("Resource", std::move(request), response); if (status != STATUS_OK) return status;
         }
-        auto buffer = vm_area::create(rt_startup().alloc(), rt_vm(), 0, 4096); if (!buffer) return buffer.error();
+        auto buffer = _vm_area::create(_startup().alloc(), _vm(), 0, 4096); if (!buffer) return buffer.error();
         uint64_t offset{};
         for (;;) {
             ubus_msg request;
@@ -378,7 +378,7 @@ public:
     auto save(const ed_buffer& text) -> status_t {
         if (!document_.token("Save")) return STATUS_DENIED;
         const auto size = (std::max(text.size(), size_t{1}) + 4095) & ~size_t{4095};
-        auto buffer = vm_area::create(rt_startup().alloc(), rt_vm(), 0, size); if (!buffer) return buffer.error();
+        auto buffer = _vm_area::create(_startup().alloc(), _vm(), 0, size); if (!buffer) return buffer.error();
         ::memcpy(reinterpret_cast<void*>(buffer->address), text.before(), text.cursor());
         ::memcpy(reinterpret_cast<void*>(buffer->address + text.cursor()), text.after(), text.after_size());
         ubus_msg request, response;
@@ -390,10 +390,10 @@ public:
 };
 
 int main(int argc, char** argv) {
-    const auto& env = rt_startup();
+    const auto& env = _startup();
     if (argc != 2) return STATUS_BAD_ARGS;
     ubus_conn environment;
-    auto status = environment.bind(env.environment); if (status != STATUS_OK) return status;
+    auto status = environment.bind(env.bootstrap); if (status != STATUS_OK) return status;
     ubus_msg setup;
     status = environment.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
     ed_terminal terminal;

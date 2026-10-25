@@ -6,23 +6,26 @@ static auto mgr_inspect(cap_t, cap_t, ubus_value, ubus_msg&) -> status_t;
 static auto mgr_revoke(cap_t, ubus_value, ubus_msg&) -> status_t;
 static auto mgr_changes(cap_t, cap_t, ubus_value, ubus_msg&) -> status_t;
 
-static auto mgr_row(proc_task* task, uint64_t child_id, uint64_t run_id, std::string_view name,
+static auto mgr_row(_proc* task, mgr_child::cpu_sample& sample, uint64_t child_id, uint64_t run_id, std::string_view name,
              mgr_state state, bool control, uint64_t started) -> ubus_data {
     ubus_data row;
     row.put("child_id", child_id).put("run_id", run_id).put("name", name).put("state", mgr_state_name(state)).put("control", control);
     if (task) {
         if (started) row.put("started", started);
-        if (sys::domain_info(task->domain()).status == STATUS_OK) {
-            const auto runtime = reinterpret_cast<const DomainInfo*>(rt_current().ipc)->runtime;
+        if (_domain_info(task->domain()).status == STATUS_OK) {
+            const auto runtime = reinterpret_cast<const DomainInfo*>(_ipc())->runtime;
             row.put("runtime", runtime);
         }
-        if (const auto facts = sys::source_info(task->scope()); facts.status == STATUS_OK) row.put("scope_state", facts.value);
-        if (const auto cpu = task->cpu_info(sys::clock_frequency().value)) row.array("cpu", std::span{cpu->second}).put("sampled", cpu->first);
-        if (const auto memory = task->memory_info()) row.put("resident", memory->resident);
-        if (const auto quota = task->resource_info())
-            row.put("committed", quota->memory_limit - quota->memory_available).put("limit", quota->memory_limit)
-                .put("caps_used", quota->cap_limit - quota->caps_available).put("caps_limit", quota->cap_limit)
-                .put("quota_state", uint64_t(quota->state));
+        if (const auto facts = _source_info(task->scope()); facts.status == STATUS_OK) row.put("scope_state", facts.value);
+        if (const auto cpu = sample.sample(*task, _clock_frequency().value)) row.array("cpu", std::span{cpu->second}).put("sampled", cpu->first);
+        if (_vspace_info(task->vspace()).status == STATUS_OK)
+            row.put("resident", reinterpret_cast<const VSpaceInfo*>(_ipc())->resident);
+        if (_quota_info(task->quota()).status == STATUS_OK) {
+            const auto& quota = *reinterpret_cast<const QuotaInfo*>(_ipc());
+            row.put("committed", quota.memory_limit - quota.memory_available).put("limit", quota.memory_limit)
+                .put("caps_used", quota.cap_limit - quota.caps_available).put("caps_limit", quota.cap_limit)
+                .put("quota_state", uint64_t(quota.state));
+        }
     }
     return row;
 }
@@ -30,7 +33,7 @@ static auto mgr_text(ubus_value value) -> std::string_view { return value.as<std
 static auto mgr_name(std::string_view text) -> bool {
     return !text.empty() && text.size() <= 255 && text.find('\0') == text.npos;
 }
-auto mgr_recipe(std::string_view name, std::string_view program, proc_quota q) -> ubus_msg {
+auto mgr_recipe(std::string_view name, std::string_view program, _proc_limits q) -> ubus_msg {
     ubus_data limits;
     limits.put("bytes", q.bytes).put("caps", q.caps).put("kinds", q.kinds).put("slots", q.slots).put("pages", q.pages)
         .put("watches", q.watches).put("hints", q.hints).put("children", bool(q.quota_perms & RIGHT_SPLIT));
@@ -38,8 +41,8 @@ auto mgr_recipe(std::string_view name, std::string_view program, proc_quota q) -
     if (q.max_caps) limits.put("max_caps", q.max_caps);
     ubus_msg recipe; recipe.data.put("name", name).put("program", program).put("resources", limits); return recipe;
 }
-static auto mgr_quota(ubus_value limits) -> std::expected<proc_quota, status_t> {
-    proc_quota q{.bytes=4 * 1024 * 1024, .caps=256, .slots=256, .pages=36};
+static auto mgr_quota(ubus_value limits) -> std::expected<_proc_limits, status_t> {
+    _proc_limits q{.bytes=4 * 1024 * 1024, .caps=256, .slots=256, .pages=36};
     q.bytes = limits["bytes"].as<uint64_t>().value_or(q.bytes);
     q.caps = limits["caps"].as<uint64_t>().value_or(q.caps);
     q.kinds = limits["kinds"].as<uint64_t>().value_or(q.kinds);
@@ -108,7 +111,7 @@ auto mgr::access(word_t facet, std::string_view method) -> status_t {
         return control ? STATUS_OK : STATUS_DENIED;
     return STATUS_DENIED;
 }
-auto mgr::issue(word_t parent, word_t rights, uint64_t target, uint64_t run_id, bool independent, word_t* issued) -> std::expected<cap_owner, status_t> {
+auto mgr::issue(word_t parent, word_t rights, uint64_t target, uint64_t run_id, bool independent, word_t* issued) -> std::expected<_cap_owner, status_t> {
     if (!target && (rights & mgr_control)) rights |= mgr_create;
     if (!independent) for (const auto& [facet, view] : facets_)
         if (view.parent == parent && view.rights == rights && view.target == target && view.run_id == run_id && live(facet))
@@ -125,10 +128,10 @@ auto mgr::issue(word_t parent, word_t rights, uint64_t target, uint64_t run_id, 
     auto cap = object_.connector(facet); if (!cap) return cap;
     struct facet entry{.parent=parent, .target=target, .run_id=run_id, .rights=rights};
     if (independent) {
-        const auto info = cap_info(cap->selector());
+        const auto info = _cap_copy<CapInfo>(_cap_info(cap->selector()));
         if (!info) return std::unexpected(info.error());
         entry.grant = info->grant_id;
-        const auto status = entry.drained.grant(rt_events(), rt_startup().scope,
+        const auto status = entry.drained.grant(&_events(), _startup().scope,
             cspace_id_, object_.issuer(), entry.grant, 0);
         if (status != STATUS_OK) return std::unexpected(status);
     }
@@ -189,11 +192,11 @@ auto mgr::attach(ubus_conn& parent) -> status_t {
 }
 static auto mgr_own(ubus_msg& message) -> status_t {
     for (size_t i = 0; i < message.count; ++i) if (!message.caps[i]) {
-        const auto info = cap_info(message.transfers[i].source); if (!info) return info.error();
+        const auto info = _cap_copy<CapInfo>(_cap_info(message.transfers[i].source)); if (!info) return info.error();
         const auto rights = message.transfers[i].rights ? message.transfers[i].rights : info->view.rights;
-        const auto cap = sys::cap_duplicate(message.transfers[i].source, rt_startup().cspace, rights);
+        const auto cap = _cap_duplicate(message.transfers[i].source, _startup().cspace, rights);
         if (cap.status != STATUS_OK) return cap.status;
-        message.caps[i] = cap_owner{cap.value};
+        message.caps[i] = _cap_owner{cap.value};
     }
     return STATUS_OK;
 }
@@ -223,7 +226,7 @@ auto mgr::configure(ubus_msg recipe, bool spawn, bool validate) -> std::expected
         if (!text || text->find('\0') != text->npos) return std::unexpected(STATUS_BAD_ARGS);
     }
     const auto cpu = recipe.data["cpu"].as<uint32_t>();
-    if ((recipe.data["cpu"] && !cpu) || (cpu && *cpu >= rt_startup().cpus)) return std::unexpected(STATUS_BAD_ARGS);
+    if ((recipe.data["cpu"] && !cpu) || (cpu && *cpu >= _startup().cpus)) return std::unexpected(STATUS_BAD_ARGS);
     const auto reserved = std::ranges::count_if(pending_, [&](const auto& operation) {
         return (operation->operation == pending::Configure || operation->operation == pending::Spawn)
             && operation->name != name && !find(operation->name);
@@ -233,7 +236,7 @@ auto mgr::configure(ubus_msg recipe, bool spawn, bool validate) -> std::expected
     if (const auto status = mgr_own(recipe); status != STATUS_OK) return std::unexpected(status);
     if (!child) {
         child = std::make_shared<mgr_child>(++next_, std::string{name});
-        const auto& env = rt_startup(); child->auth = {env.alloc(), static_cast<uint32_t>(env.cpus), env.domain};
+        const auto& env = _startup(); child->auth = {env.alloc(), env.domain};
         children_.push_back(child);
     } else {
         child->loading = {}; child->source = {}; child->snapshots.clear(); ++child->version;
@@ -255,12 +258,12 @@ auto mgr::start(mgr_child& child) -> status_t {
     child.desired = true; child.result = STATUS_OK;
     // The owner resolves the image and any per-execution grants before native
     // construction. Asynchronous loading remains owned by this deployment.
-    auto image = [&]() -> std::expected<proc_image, status_t> {
+    auto image = [&]() -> std::expected<_proc_image, status_t> {
         if (const auto buffer = child.recipe_.data["image"].as<ubus_buffer>()) {
             const auto cap = child.recipe_.capability(child.recipe_.data["image"]);
-            const auto copy = sys::cap_duplicate(cap, rt_startup().cspace, RIGHT_MAP);
+            const auto copy = _cap_duplicate(cap, _startup().cspace, RIGHT_MAP);
             if (copy.status != STATUS_OK) return std::unexpected(copy.status);
-            return proc_image::map(child.source, cap_owner{copy.value}, buffer->offset, buffer->size);
+            return _proc_image::map(child.source, _cap_owner{copy.value}, buffer->offset, buffer->size);
         }
         return child.loading ? child.loading() : load_(child);
     }();
@@ -268,37 +271,40 @@ auto mgr::start(mgr_child& child) -> status_t {
     if (!image && image.error() == STATUS_WOULD_BLOCK) { child.state = mgr_state::Loading; return STATUS_WOULD_BLOCK; }
     if (!image) return fail(image.error());
     if (!child.scope) {
-        const auto created = sys::scope_create(child.auth.alloc);
+        const auto created = _scope_create(child.auth.alloc);
         if (created.status != STATUS_OK) return fail(created.status);
-        child.scope = cap_owner{created.value};
+        child.scope = _cap_owner{created.value};
     }
     child.environment = ++next_badge_ * 4;
     child.root_version = 0;
     child.received = false;
     auto door = object_.connector(child.environment);
     if (!door) return fail(door.error());
-    child.task = std::make_unique<proc_task>();
     std::vector<std::string_view> args{child.recipe_.data["argv0"].as<std::string_view>().value_or(child.name)}, env;
     for (const auto arg : child.recipe_.data["argv"].values()) args.push_back(*arg.as<std::string_view>());
     for (const auto entry : child.recipe_.data["env"].values()) env.push_back(*entry.as<std::string_view>());
     const auto resources = *mgr_quota(child.recipe_.data["resources"]);
-    const auto cpu = child.recipe_.data["cpu"].as<uint32_t>().value_or((child.child_id - 1) % rt_startup().cpus);
+    const auto cpu = child.recipe_.data["cpu"].as<uint32_t>();
     auto auth = child.auth; auth.alloc.scope = child.scope.selector();
-    auto status = proc_spawn(*child.task, auth, *image,
-        {.argv=args, .envp=env, .environment=door->selector(), .resources=resources, .cpu=cpu, .events=rt_events()});
+    auto prepared = _proc_create(auth, *image,
+        {.argv=args, .envp=env, .bootstrap=door->selector(), .resources=resources, .cpu=cpu, .events=&_events()});
+    if (!prepared) return fail(prepared.error());
+    child.task = std::make_unique<_proc>(std::move(*prepared));
+    child.cpu = {};
+    auto status = STATUS_OK;
     if (child.task->scope()) {
-        const auto identity = sys::object_info(child.task->scope());
-        if (identity.status == STATUS_OK) child.run_id = reinterpret_cast<const ObjectInfo*>(rt_current().ipc)->object_id;
+        const auto identity = _object_info(child.task->scope());
+        if (identity.status == STATUS_OK) child.run_id = reinterpret_cast<const ObjectInfo*>(_ipc())->object_id;
         else if (status == STATUS_OK) status = identity.status;
     }
     child.started = 0;
     if (status == STATUS_OK) {
-        const auto started = sys::clock_now().value;
+        const auto started = _clock_now().value;
         status = child.task->start();
         if (status == STATUS_OK) child.started = started;
     }
     child.state = status == STATUS_OK ? mgr_state::Running : mgr_state::Draining;
-    if (status != STATUS_OK) { child.result = status; (void)child.task->retire(status); child.desired = false; }
+    if (status != STATUS_OK) { child.result = status; (void)child.task->retire(); child.desired = false; }
     ++epoch_; return status;
 }
 void mgr::withdraw(mgr_child& child) {
@@ -310,11 +316,11 @@ auto mgr::erase(uint64_t id) -> status_t {
     auto child = find(id); if (!child) return STATUS_NOT_FOUND;
     if (child->task) return STATUS_BUSY;
     if (child->scope) {
-        const auto closed = sys::scope_close(child->scope.selector()); if (closed.status != STATUS_OK) return closed.status;
-        const auto fact = sys::source_info(child->scope.selector()); if (fact.status != STATUS_OK) return fact.status;
+        const auto closed = _scope_close(child->scope.selector()); if (closed.status != STATUS_OK) return closed.status;
+        const auto fact = _source_info(child->scope.selector()); if (fact.status != STATUS_OK) return fact.status;
         if (!(fact.value & STATE_DRAINED)) {
             const auto status = child->retired ? child->retired.arm(fact.value2).status
-                : child->retired.open(rt_events(), child->scope.selector(), STATE_DRAINED);
+                : child->retired.open(&_events(), child->scope.selector(), STATE_DRAINED);
             return status == STATUS_OK ? STATUS_WOULD_BLOCK : status;
         }
     }
@@ -328,13 +334,14 @@ auto mgr::action(mgr_child& child, std::string_view action) -> status_t {
     if (action == "start" || action == "restart") {
         if (!child.task) { child.loading = {}; return start(child); }
         child.desired = true;
-        if (action == "start" && !child.task->closing()) return STATUS_OK;
+        if (action == "start" && !child.task->stopping()) return STATUS_OK;
         child.relaunch = true;
     } else if (action == "stop") { child.desired = false; child.relaunch = false; }
     else if (action == "remove") { child.desired = false; child.relaunch = false; child.removing = true; }
     else return STATUS_BAD_ARGS;
     if (!child.task) { child.loading = {}; child.state = mgr_state::Idle; return STATUS_OK; }
-    const auto status = child.task->retire();
+    auto status = child.task->stop();
+    if (status == STATUS_OK && child.auto_retire) status = child.task->retire();
     if (status == STATUS_OK) { child.state = mgr_state::Draining; withdraw(child); ++epoch_; }
     return status;
 }
@@ -374,7 +381,7 @@ auto mgr::resolve(mgr_child* source, std::string_view name, ubus_msg& response, 
     }
     const auto directory = source ? source->recipe_.capability(rule["directory"]) : 0;
     if ((rule["parent"] || directory) && !local) {
-        const auto endpoint = directory ? directory : rt_startup().environment;
+        const auto endpoint = directory ? directory : _startup().bootstrap;
         if (!wait || !endpoint) return STATUS_NOT_FOUND;
         if (!wait->relay) {
             wait->relay = std::make_unique<ubus_conn>();
@@ -438,18 +445,18 @@ auto mgr::resolve(mgr_child* source, std::string_view name, ubus_msg& response, 
     wait->provider = provider->child_id; wait->provider_version = provider->version; wait->run_id = provider->state == mgr_state::Loading ? 0 : provider->run_id;
     return STATUS_WOULD_BLOCK;
 }
-auto mgr::lookup(std::string_view name) -> std::expected<cap_owner, status_t> {
+auto mgr::lookup(std::string_view name) -> std::expected<_cap_owner, status_t> {
     ubus_msg result;
     const auto status = resolve(nullptr, name, result, nullptr);
     if (status != STATUS_OK) return std::unexpected(status);
     const auto cap = result.transfers[0].source;
-    const auto copied = sys::cap_duplicate(cap, rt_startup().cspace, result.transfers[0].rights);
+    const auto copied = _cap_duplicate(cap, _startup().cspace, result.transfers[0].rights);
     if (copied.status != STATUS_OK) return std::unexpected(copied.status);
-    return cap_owner{copied.value};
+    return _cap_owner{copied.value};
 }
 auto mgr::defer(std::unique_ptr<pending> wait, ubus_request& request) -> status_t {
     if (const auto status = admit(request); status != STATUS_OK) return status;
-    const auto status = wait->terminal.open(rt_events(), request.reply.selector(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+    const auto status = wait->terminal.open(&_events(), request.reply.selector(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
     // Port is authoritative for native watch capacity; do not mirror its slots.
     if (status != STATUS_OK) return status == STATUS_NO_MEMORY ? STATUS_EXHAUSTED : status;
     wait->authority = request.facet();
@@ -464,7 +471,7 @@ auto mgr::deliver(mgr_child& child, ubus_msg& response) -> status_t {
     for (size_t i = 0; i < response.count; ++i) {
         const auto cap = response.transfers[i].source;
         if (!cap) return STATUS_CLOSED;
-        const auto info = cap_info(cap); if (!info) return info.error();
+        const auto info = _cap_copy<CapInfo>(_cap_info(cap)); if (!info) return info.error();
         response.transfers[i] = info->view.rights & RIGHT_DUPLICATE ? CapXfer{cap, info->view.rights, CAP_COPY, 0}
             : CapXfer{cap, 0, CAP_MOVE, 0};
     }
@@ -523,20 +530,20 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
     if (method == "Attach") {
         if (request.data["version"].as<uint64_t>().value_or(0) != source->root_version) return STATUS_STALE;
         if (source->root_scope) {
-            const auto facts = sys::source_info(source->root_scope.selector());
+            const auto facts = _source_info(source->root_scope.selector());
             if (facts.status != STATUS_OK) return facts.status;
             if (!(facts.value & STATE_DRAINED)) return STATUS_BUSY;
         }
         auto observe = request.take(request.data["observe"]), manage = request.take(request.data["manage"]);
         auto scope = request.take(request.data["scope"]);
-        const auto boundary = cap_info(scope.selector());
+        const auto boundary = _cap_copy<CapInfo>(_cap_info(scope.selector()));
         if (!boundary || boundary->view.kind != ObjScope || (boundary->view.rights & (RIGHT_INSPECT | RIGHT_DUPLICATE)) != (RIGHT_INSPECT | RIGHT_DUPLICATE)) return STATUS_BAD_RIGHTS;
         for (const auto cap : {observe.selector(), manage.selector()}) if (cap) {
-            const auto info = cap_info(cap);
+            const auto info = _cap_copy<CapInfo>(_cap_info(cap));
             if (!info || info->view.kind != ObjChannel || (info->view.rights & (RIGHT_SEND | RIGHT_DUPLICATE)) != (RIGHT_SEND | RIGHT_DUPLICATE)) return STATUS_BAD_RIGHTS;
-            const auto member = sys::scope_query(scope.selector(), info->object_id, SCOPE_INFO);
+            const auto member = _scope_query(scope.selector(), info->object_id, SCOPE_INFO);
             if (member.status != STATUS_OK) return member.status;
-            if (reinterpret_cast<const ScopeObject*>(rt_current().ipc)->gate != OBJECT_OPEN) return STATUS_CLOSED;
+            if (reinterpret_cast<const ScopeObject*>(_ipc())->gate != OBJECT_OPEN) return STATUS_CLOSED;
         }
         if (!observe) return STATUS_BAD_ARGS;
         source->observe = std::move(observe); source->manage = std::move(manage); source->root_scope = std::move(scope);
@@ -565,7 +572,7 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
             wait->control = *control;
         }
         wait->relay = std::make_unique<ubus_conn>();
-        auto status = wait->relay->begin_bind(rt_startup().environment, {}, 0, UINT64_MAX, 0, request.deadline);
+        auto status = wait->relay->begin_bind(_startup().bootstrap, {}, 0, UINT64_MAX, 0, request.deadline);
         if (status != STATUS_OK) return status;
         // Keep staged data in the original request; only the immutable copy
         // is committed outside this execution. No child starts before ack.
@@ -648,11 +655,11 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
         if (used >= source->capacity() || publications_.size() >= capacity_ || next_publication_ == UINT64_MAX) return STATUS_EXHAUSTED;
         auto connector = request.take(request.data["connector"]);
         if (!connector) return STATUS_BAD_ARGS;
-        const auto info = cap_info(connector.selector());
+        const auto info = _cap_copy<CapInfo>(_cap_info(connector.selector()));
         if (!info || info->view.kind != ObjChannel || (info->view.rights & (RIGHT_SEND | RIGHT_DUPLICATE)) != (RIGHT_SEND | RIGHT_DUPLICATE)) return STATUS_BAD_RIGHTS;
         publication pub{++next_publication_, source->child_id, source->run_id, request.data["version"].as<uint64_t>().value_or(1),
             std::string{name}, std::string{mgr_text(request.data["interface"])}, std::move(connector), {}};
-        const auto watched = pub.terminal.open(rt_events(), pub.connector.selector(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+        const auto watched = pub.terminal.open(&_events(), pub.connector.selector(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
         if (watched != STATUS_OK) return watched;
         response.data.put("instance", pub.id);
         publications_.emplace(pub.id, std::move(pub)); ++epoch_; return STATUS_OK;
@@ -666,7 +673,7 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
     if (method == "List") {
         ubus_data items{ubus_type::Array};
         if (observe) for (const auto& child : children_) {
-            auto row = mgr_row(child->task.get(), child->child_id, child->run_id, child->name, child->state, admin, child->started);
+            auto row = mgr_row(child->task.get(), child->cpu, child->child_id, child->run_id, child->name, child->state, admin, child->started);
             ubus_data actions{ubus_type::Array};
             if (admin && child->state != mgr_state::Draining) {
                 if (child->task || child->desired) actions.push("stop");
@@ -701,7 +708,7 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
             for (const auto field : route.values())
                 if (field.name() != "connector" && field.name() != "directory" && field.name() != "name") return STATUS_DENIED;
             const auto cap = request.capability(route["connector"] ? route["connector"] : route["directory"]);
-            const auto info = cap_info(cap);
+            const auto info = _cap_copy<CapInfo>(_cap_info(cap));
             if (!info || info->view.kind != ObjChannel || (info->view.rights & (RIGHT_SEND | RIGHT_DUPLICATE)) != (RIGHT_SEND | RIGHT_DUPLICATE)) return STATUS_BAD_RIGHTS;
         }
         if (recoverable_) {
@@ -762,7 +769,7 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
             return STATUS_NOT_FOUND;
         }
         if (part == "overview") {
-            auto row = mgr_row(child->task.get(), child->child_id, child->run_id, child->name, child->state, admin, child->started);
+            auto row = mgr_row(child->task.get(), child->cpu, child->child_id, child->run_id, child->name, child->state, admin, child->started);
             ubus_data args{ubus_type::Array};
             args.push(child->recipe_.data["argv0"].as<std::string_view>().value_or(child->name));
             for (const auto arg : child->recipe_.data["argv"].values()) args.push(arg);
@@ -798,7 +805,7 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
         }
         if (operation == "close") {
             if (!number) return STATUS_BAD_ARGS;
-            return sys::quota_close(target).status;
+            return _quota_close(target).status;
         }
         if (!memory || !caps) return STATUS_BAD_ARGS;
         if (operation == "lend") {
@@ -806,13 +813,13 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
             if (const auto status = admit(request); status != STATUS_OK) return status;
             const auto count = std::ranges::count_if(loans_, [&](const auto& pair) { return pair.second.source == child->child_id; });
             if (uint64_t(count) >= child->capacity()) return STATUS_EXHAUSTED;
-            const auto made = sys::quota_create({target, rt_startup().scope}, *memory, *caps,
+            const auto made = _quota_create({target, _startup().scope}, *memory, *caps,
                 request.data["kinds"].as<uint64_t>().value_or(mgr_quota(child->recipe_.data["resources"])->kinds),
                 request.data["max_bytes"].as<uint64_t>().value_or(*memory), request.data["max_caps"].as<uint64_t>().value_or(*caps));
             if (made.status != STATUS_OK) return made.status;
-            loan item{child->child_id, child->run_id, facet, cap_owner{made.value}, {}};
-            const auto status = item.drained.open(rt_events(), made.value, STATE_DRAINED);
-            if (status != STATUS_OK) { (void)sys::quota_close(made.value); return status; }
+            loan item{child->child_id, child->run_id, facet, _cap_owner{made.value}, {}};
+            const auto status = item.drained.open(&_events(), made.value, STATE_DRAINED);
+            if (status != STATUS_OK) { (void)_quota_close(made.value); return status; }
             const auto quota_idx = response.attach(made.value, RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE);
             if (!quota_idx) return quota_idx.error();
             response.data.put("loan", ++next_loan_).put("bytes", *memory).put("caps", *caps)
@@ -820,7 +827,7 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
             loans_.emplace(next_loan_, std::move(item)); return STATUS_OK;
         }
         if (!operation.empty() && operation != "resize") return STATUS_BAD_ARGS;
-        const auto status = sys::quota_resize(target, *memory, *caps, number ? child->task->quota() : child->auth.alloc.quota).status;
+        const auto status = _quota_resize(target, *memory, *caps, number ? child->task->quota() : child->auth.alloc.quota).status;
         if (status == STATUS_OK) { response.data.put("bytes", *memory).put("caps", *caps); ++epoch_; }
         return status;
     }
@@ -829,15 +836,15 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
         if (status != STATUS_WOULD_BLOCK) return status;
         auto wait = std::make_unique<pending>(); wait->operation = pending::Changed;
         wait->provider = child->child_id; wait->run_id = child->run_id;
-        auto watched = wait->changes[0].open(rt_events(), child->task->scope(), 0,
+        auto watched = wait->changes[0].open(&_events(), child->task->scope(), 0,
             *request.data["epoch"].as<uint64_t>(), WATCH_CHANGED);
         if (watched == STATUS_OK && request.data["selector"].as<uint64_t>().value_or(0)) {
             auto object = request.data["object"].as<uint64_t>().value_or(0);
             if (!object) {
-                const auto info = sys::object_info(child->task->cspace()); if (info.status != STATUS_OK) return info.status;
-                object = reinterpret_cast<const ObjectInfo*>(rt_current().ipc)->object_id;
+                const auto info = _object_info(child->task->cspace()); if (info.status != STATUS_OK) return info.status;
+                object = reinterpret_cast<const ObjectInfo*>(_ipc())->object_id;
             }
-            watched = wait->changes[1].grant(rt_events(), child->task->scope(), object,
+            watched = wait->changes[1].grant(&_events(), child->task->scope(), object,
                 *request.data["selector"].as<uint64_t>(), request.data["selected"].as<uint64_t>().value_or(0),
                 request.data["grant"].as<uint64_t>().value_or(0));
         }
@@ -856,13 +863,13 @@ auto mgr::request(std::string_view method, ubus_request& request, ubus_msg& resp
         }
         return mgr_inspect(child->task->scope(), child->task->cspace(), request.data.view(), response);
     }
-    if (method == "CloseCap") return admin ? sys::cap_close(request.data["selector"].as<cap_t>().value_or(0), child->task->cspace()).status : STATUS_DENIED;
+    if (method == "CloseCap") return admin ? _cap_close(request.data["selector"].as<cap_t>().value_or(0), child->task->cspace()).status : STATUS_DENIED;
     if (method == "Revoke") return admin ? mgr_revoke(child->task->cspace(), request.data.view(), response) : STATUS_DENIED;
     return STATUS_INVALID_OP;
 }
 auto mgr::poll() -> status_t {
     for (auto& [id, entry] : facets_) if (entry.grant && !entry.closed && entry.drained.pending()) {
-        const auto state = sys::grant_source(rt_startup().scope, cspace_id_, object_.issuer(), entry.grant);
+        const auto state = _grant_source(_startup().scope, cspace_id_, object_.issuer(), entry.grant);
         // Port terminal delivery releases the Source pin; the native node may
         // already be reclaimed when this sample runs. IDs are never reused.
         if (state.status == STATUS_NOT_FOUND || state.status == STATUS_CLOSED
@@ -889,12 +896,12 @@ auto mgr::poll() -> status_t {
             continue;
         }
         if (!child.task->pending()) continue;
-        const auto progress = child.task->step();
-        if (!progress) { if (proc_retryable(progress.error())) continue; return progress.error(); }
+        const auto progress = child.task->poll();
+        if (progress != STATUS_OK) { if ((progress == STATUS_BUSY || progress == STATUS_RETRY)) continue; return progress; }
         const auto result = child.task->result();
-        if (result) { const auto status = child.task->retire(result->code); if (status != STATUS_OK) return status; }
-        if (child.task->closing() && child.state != mgr_state::Draining) { child.state = mgr_state::Draining; withdraw(child); ++epoch_; }
-        if (child.task->drained()) {
+        if (result && child.auto_retire) { const auto status = child.task->retire(); if (status != STATUS_OK) return status; }
+        if (child.task->stopping() && child.state != mgr_state::Draining) { child.state = mgr_state::Draining; withdraw(child); ++epoch_; }
+        if (child.task->retired()) {
             const bool failed = child.result != STATUS_OK;
             if (!failed) child.result = result->code;
             child.task.reset(); child.inbox.clear(); child.startup = {}; child.environment = 0;
@@ -910,17 +917,17 @@ auto mgr::poll() -> status_t {
     for (auto it = loans_.begin(); it != loans_.end();) {
         auto& item = it->second;
         const auto child = find(item.source);
-        const bool closing = !child || !child->task || child->run_id != item.run_id || child->task->closing();
+        const bool closing = !child || !child->task || child->run_id != item.run_id || child->task->stopping();
         if (!closing && !item.drained.pending()) { ++it; continue; }
-        const auto facts = sys::source_info(item.quota.selector());
+        const auto facts = _source_info(item.quota.selector());
         if (facts.status != STATUS_OK) return facts.status;
         if (closing && (facts.value & STATE_OPEN)) {
-            const auto status = sys::quota_close(item.quota.selector()).status;
+            const auto status = _quota_close(item.quota.selector()).status;
             if (status != STATUS_OK) return status;
         }
         if (facts.value & STATE_DRAINED) {
             const auto status = item.drained.close(); if (status != STATUS_OK) return status;
-            const auto retired = sys::object_destroy(item.quota.selector()).status; if (retired != STATUS_OK) return retired;
+            const auto retired = _object_destroy(item.quota.selector()).status; if (retired != STATUS_OK) return retired;
             it = loans_.erase(it); continue;
         }
         if (const auto status = item.drained.arm(facts.value2).status; status != STATUS_OK) return status;
@@ -928,9 +935,9 @@ auto mgr::poll() -> status_t {
     }
     std::erase_if(publications_, [&](auto& row) {
         if (!row.second.terminal.pending()) return false;
-        const auto live = sys::source_info(row.second.connector.selector(), SOURCE_WRITE);
+        const auto live = _source_info(row.second.connector.selector(), SOURCE_WRITE);
         if (live.status == STATUS_OK && !(live.value & SOURCE_TERMINAL)) {
-            if (const auto status = row.second.terminal.arm(live.value2).status; status != STATUS_OK) sys::exit(status);
+            if (const auto status = row.second.terminal.arm(live.value2).status; status != STATUS_OK) _thread_exit(status);
             return false;
         }
         ++epoch_; return true;
@@ -958,7 +965,7 @@ auto mgr::poll() -> status_t {
         const bool committing = wait.operation >= pending::Configure && wait.introduced;
         if (!committing && wait.request.deadline && (!deadline_ || wait.request.deadline < deadline_)) deadline_ = wait.request.deadline;
         if (wait.terminal.pending()) {
-            const auto peer = sys::source_info(wait.request.reply.selector(), SOURCE_WRITE);
+            const auto peer = _source_info(wait.request.reply.selector(), SOURCE_WRITE);
             if (peer.status != STATUS_OK || (peer.value & SOURCE_TERMINAL)) {
                 if (!committing) { it = pending_.erase(it); continue; }
                 if (const auto status = wait.terminal.close(); status != STATUS_OK) return status;
@@ -968,7 +975,7 @@ auto mgr::poll() -> status_t {
             ubus_msg response;
             if (!wait.introduced) {
                 auto admitted = access(wait.authority, {});
-                if (admitted == STATUS_OK) admitted = rt_admit(wait.request.deadline);
+                if (admitted == STATUS_OK) admitted = _deadline_status(wait.request.deadline);
                 if (admitted != STATUS_OK) {
                     response.status = admitted;
                     const auto sent = wait.request.respond(std::move(response)); if (sent != STATUS_OK) return sent;
@@ -1018,7 +1025,7 @@ auto mgr::poll() -> status_t {
         auto* source = wait.source ? environment(wait.environment) : nullptr;
         ubus_msg response;
         auto status = access(wait.authority, {});
-        if (status == STATUS_OK) status = rt_admit(wait.request.deadline);
+        if (status == STATUS_OK) status = _deadline_status(wait.request.deadline);
         if (status == STATUS_OK && wait.source && (!source || source->version != wait.version)) status = STATUS_STALE;
         if (status == STATUS_OK && wait.provider) {
             const auto target = find(wait.provider);
@@ -1072,8 +1079,8 @@ auto mgr::poll() -> status_t {
                 if (status == STATUS_WOULD_BLOCK) for (const auto& candidate : pending_) {
                     auto& sender = *candidate;
                     if (sender.operation != pending::Send || sender.provider != source->child_id || sender.run_id != source->run_id || !sender.request.reply) continue;
-                    const auto live = sys::source_info(sender.request.reply.selector(), SOURCE_WRITE);
-                    if (live.status != STATUS_OK || (live.value & SOURCE_TERMINAL) || rt_admit(sender.request.deadline) != STATUS_OK) continue;
+                    const auto live = _source_info(sender.request.reply.selector(), SOURCE_WRITE);
+                    if (live.status != STATUS_OK || (live.value & SOURCE_TERMINAL) || _deadline_status(sender.request.deadline) != STATUS_OK) continue;
                     response.data.put("message", sender.request.data["message"]);
                     for (size_t i = 0; i < sender.request.count; ++i) {
                         const auto index = response.give(std::move(sender.request.caps[i]));
@@ -1106,17 +1113,13 @@ auto mgr::poll() -> status_t {
     for (const auto& child : children_) if (!child->task && child->desired && child->state == mgr_state::Idle
         && std::ranges::none_of(pending_, [&](const auto& operation) {
             return operation->operation >= pending::Configure && operation->name == child->name;
-        })) deadline_ = sys::clock_now().value;
-    for (const auto& child : children_) if (child->task && child->task->polling()) {
-        const auto due = rt_after_ms(1).value_or(0);
-        if (!deadline_ || due < deadline_) deadline_ = due;
-    }
+        })) deadline_ = _clock_now().value;
     return object_.arm();
 }
 auto mgr::recover(std::function<std::expected<ubus_msg, status_t>(ubus_msg)> restore) -> status_t {
-    if (!rt_startup().environment) return STATUS_OK;
+    if (!_startup().bootstrap) return STATUS_OK;
     ubus_conn journal;
-    auto status = journal.bind(rt_startup().environment); if (status != STATUS_OK) return status;
+    auto status = journal.bind(_startup().bootstrap); if (status != STATUS_OK) return status;
     if (!journal.token("Restore")) return STATUS_OK;
     std::string after;
     for (;;) {
@@ -1147,12 +1150,12 @@ auto mgr::recover(std::function<std::expected<ubus_msg, status_t>(ubus_msg)> res
 auto mgr::open() -> status_t {
     facets_.emplace(mgr_observe, facet{.rights=mgr_observe});
     facets_.emplace(mgr_observe | mgr_control, facet{.rights=mgr_observe | mgr_control | mgr_create | mgr_debug});
-    const auto identity = sys::object_info(rt_startup().scope);
+    const auto identity = _object_info(_startup().scope);
     if (identity.status != STATUS_OK) return identity.status;
-    identity_ = reinterpret_cast<const ObjectInfo*>(rt_current().ipc)->object_id;
-    const auto space = sys::object_info(rt_startup().cspace);
+    identity_ = reinterpret_cast<const ObjectInfo*>(_ipc())->object_id;
+    const auto space = _object_info(_startup().cspace);
     if (space.status != STATUS_OK) return space.status;
-    cspace_id_ = reinterpret_cast<const ObjectInfo*>(rt_current().ipc)->object_id;
+    cspace_id_ = reinterpret_cast<const ObjectInfo*>(_ipc())->object_id;
     const auto add = [&](std::string name, ubus_schema input, ubus_schema output, word_t required = 0) {
         const auto method = name;
         return object_.add(std::move(name), std::move(input), std::move(output),
@@ -1197,9 +1200,9 @@ auto mgr::open() -> status_t {
         const auto status = mgr_method(object_, name, [this, name](auto& q, auto& r) { return request(name, q, r); });
         if (status != STATUS_OK) return status;
     }
-    const auto scope = sys::scope_create(rt_startup().alloc());
+    const auto scope = _scope_create(_startup().alloc());
     if (scope.status != STATUS_OK) return scope.status;
-    return object_.open(32, 0, cap_owner{scope.value}, 2 * ubus_control_limit);
+    return object_.open(32, 0, _cap_owner{scope.value}, 2 * ubus_control_limit);
 }
 
 static auto mgr_method(ubus_object& object, std::string name, ubus_handler handler) -> status_t {
@@ -1223,7 +1226,7 @@ static auto mgr_cap_view(const CapView& view) -> ubus_data {
     return row;
 }
 static auto mgr_revoke(cap_t cspace, ubus_value query, ubus_msg& result) -> status_t {
-    const auto status = sys::cap_revoke(*query["selector"].as<cap_t>(), cspace,
+    const auto status = _cap_revoke(*query["selector"].as<cap_t>(), cspace,
         CAP_REVOKE_ASYNC, query["selected"].as<uint64_t>().value_or(0));
     if (status.status != STATUS_OK && status.status != STATUS_PENDING) return status.status;
     result.data.put("state", status.value);
@@ -1234,9 +1237,9 @@ static auto mgr_inspect(cap_t scope, cap_t cspace, ubus_value query, ubus_msg& r
     auto cursor = query["cursor"].as<uint64_t>().value_or(0), epoch = query["epoch"].as<uint64_t>().value_or(0);
     auto object = query["object"].as<uint64_t>().value_or(0);
     const auto selector = query["selector"].as<cap_t>().value_or(0), selected = query["selected"].as<uint64_t>().value_or(0);
-    const auto ipc = reinterpret_cast<void*>(rt_current().ipc);
+    const auto ipc = reinterpret_cast<void*>(_ipc());
     if (!object) {
-        const auto status = sys::object_info(facet == "caps" || facet == "grants" ? cspace : scope).status;
+        const auto status = _object_info(facet == "caps" || facet == "grants" ? cspace : scope).status;
         if (status != STATUS_OK) return status;
         ObjectInfo info; ::memcpy(&info, ipc, sizeof(info)); object = info.object_id;
     }
@@ -1246,7 +1249,7 @@ static auto mgr_inspect(cap_t scope, cap_t cspace, ubus_value query, ubus_msg& r
     if (!kind) return STATUS_BAD_ARGS;
     uint32_t object_kind{};
     if (kind == SCOPE_USAGE) {
-        const auto info = sys::scope_query(scope, object, SCOPE_INFO);
+        const auto info = _scope_query(scope, object, SCOPE_INFO);
         if (info.status != STATUS_OK) return info.status;
         object_kind = reinterpret_cast<const ScopeObject*>(ipc)->kind;
     }
@@ -1260,7 +1263,7 @@ static auto mgr_inspect(cap_t scope, cap_t cspace, ubus_value query, ubus_msg& r
     do {
         if (++pages > 128 || items.bytes().size() > 64 * 1024) return STATUS_EXHAUSTED;
         if (kind == SCOPE_GRANTS) { const GrantQuery request{selector, selected, cursor, epoch}; ::memcpy(ipc, &request, sizeof(request)); }
-        const auto status = sys::scope_query(scope, object, kind, cursor, epoch);
+        const auto status = _scope_query(scope, object, kind, cursor, epoch);
         next = generation = 0; more = false;
 #define FIELD(field) row.put(#field, info.field)
         if (kind == SCOPE_OPS && status.value2) {
@@ -1322,18 +1325,68 @@ static auto mgr_inspect(cap_t scope, cap_t cspace, ubus_value query, ubus_msg& r
 
 
 static auto mgr_changes(cap_t scope, cap_t cspace, ubus_value query, ubus_msg& response) -> status_t {
-    const auto source = sys::source_info(scope);
+    const auto source = _source_info(scope);
     if (source.status != STATUS_OK) return source.status;
     if (source.value & (STATE_CLOSING | STATE_DRAINED)) return STATUS_CLOSED;
     const auto selector = query["selector"].as<uint64_t>().value_or(0);
     auto object = query["object"].as<uint64_t>().value_or(0);
     if (selector && !object) {
-        const auto info = sys::object_info(cspace); if (info.status != STATUS_OK) return info.status;
-        object = reinterpret_cast<const ObjectInfo*>(rt_current().ipc)->object_id;
+        const auto info = _object_info(cspace); if (info.status != STATUS_OK) return info.status;
+        object = reinterpret_cast<const ObjectInfo*>(_ipc())->object_id;
     }
-    const auto branch = selector ? sys::grant_source(scope, object, selector, query["selected"].as<uint64_t>().value_or(0)) : sys::SysResult{};
+    const auto branch = selector ? _grant_source(scope, object, selector, query["selected"].as<uint64_t>().value_or(0)) : _sys_result{};
     if (branch.status != STATUS_OK) return branch.status;
     response.data.put("epoch", source.value2).put("grant", branch.value2);
     return source.value2 != *query["epoch"].as<uint64_t>() || branch.value2 != query["grant"].as<uint64_t>().value_or(0)
         ? STATUS_OK : STATUS_WOULD_BLOCK;
+}
+
+auto mgr_child::cpu_sample::sample(const _proc& task, word_t interval) -> std::expected<std::pair<uint64_t, std::vector<uint64_t>>, status_t> {
+    const auto now = _clock_now().value;
+    // Coalesce observers into one sample per second. The timestamp travels with
+    // the data; a cached sample is never relabeled with a newer clock value.
+    if (at && now - at < interval) {
+        if (status != STATUS_OK) return std::unexpected(status);
+        return value;
+    }
+    at = now;
+    const auto collect = [&]() -> std::expected<std::vector<uint64_t>, status_t> {
+        const auto ipc = reinterpret_cast<void*>(_ipc());
+        const auto identity = _object_info(task.vspace());
+        if (identity.status != STATUS_OK) return std::unexpected(identity.status);
+        const auto vm = reinterpret_cast<const ObjectInfo*>(ipc)->object_id;
+        std::vector<std::array<uint64_t, 2>> threads;
+        ScopeCursor cursor{};
+        for (;;) {
+            const auto scan = _scope_members(task.scope(), cursor);
+            if (scan.status != STATUS_OK) return std::unexpected(scan.status);
+            ScopeMembers page; ::memcpy(&page, ipc, sizeof(page));
+            for (const auto& member : std::span{page.records, page.count}) {
+                if (member.kind != ObjThread) continue;
+                const auto linked = _scope_query(task.scope(), member.object_id, SCOPE_LINKS);
+                if (linked.status != STATUS_OK) return std::unexpected(linked.status);
+                LinkRecords links; ::memcpy(&links, ipc, sizeof(links));
+                if (links.more) return std::unexpected(STATUS_EXHAUSTED);
+                if (std::ranges::none_of(std::span{links.records, links.count}, [&](const auto& link) {
+                    return link.kind == LINK_ROOT && link.object_id == vm;
+                })) continue;
+                const auto sampled = _scope_query(task.scope(), member.object_id, SCOPE_USAGE);
+                if (sampled.status != STATUS_OK) return std::unexpected(sampled.status);
+                threads.push_back({member.object_id, reinterpret_cast<const ThreadInfo*>(ipc)->runtime});
+            }
+            cursor = page.next;
+            if (!page.more) break;
+        }
+        const auto final = _scope_info(task.scope());
+        if (final.status != STATUS_OK) return std::unexpected(final.status);
+        if (reinterpret_cast<const ScopeInfo*>(ipc)->epoch != cursor.version) return std::unexpected(STATUS_STALE);
+        std::ranges::sort(threads);
+        std::vector<uint64_t> result; result.reserve(threads.size() * 2);
+        for (const auto& thread : threads) result.insert(result.end(), thread.begin(), thread.end());
+        return result;
+    };
+    auto result = collect(); status = result ? STATUS_OK : result.error();
+    if (!result) return std::unexpected(result.error());
+    value = {_clock_now().value, std::move(*result)};
+    return value;
 }

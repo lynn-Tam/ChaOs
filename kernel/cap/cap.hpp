@@ -109,7 +109,21 @@ struct Limit final {
     friend constexpr auto operator==(Limit, Limit) noexcept -> bool = default;
 };
 using MemLimit = Limit<mm::ObjectRange>;
-using VmLimit = Limit<mm::VRange>;
+struct VmLimit final {
+    static constexpr u64 max_claim = UINT64_MAX >> 8;
+    mm::VRange range{};
+    constexpr VmLimit() noexcept = default;
+    constexpr VmLimit(mm::VRange range, mm::Perms perms, u64 claim = 0) noexcept
+        : range(range), attrs_((claim << 8) | perms.raw()) {}
+    auto perms() const noexcept -> mm::Perms { return mm::Perms::from_raw(attrs_ & 0xff); }
+    auto claim() const noexcept -> u64 { return attrs_ >> 8; }
+    friend constexpr auto operator==(VmLimit, VmLimit) noexcept -> bool = default;
+private:
+    // Keep every capability view compact: permissions and a non-reused claim
+    // generation share one word. Exhaustion is reported before publication.
+    u64 attrs_{};
+};
+static_assert(sizeof(VmLimit) == sizeof(MemLimit));
 
 struct QuotaLimit final {
     resource::Capacity budget{};

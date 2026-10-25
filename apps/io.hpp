@@ -10,6 +10,7 @@ enum : uint64_t { io_read = 1, io_write = 2, io_create = 4, io_truncate = 8, io_
 enum : int32_t { io_exists = -256, io_not_dir, io_is_dir, io_not_empty, io_name_long, io_too_large, io_no_space, io_cross_device };
 
 #include <ubus/ubus.hpp>
+#include <vm.hpp>
 
 inline constexpr size_t io_stream_limit = 4096, io_inline = 48;
 struct io_frame { status_t status{}; size_t size{}; char data[io_stream_limit]{}; };
@@ -21,7 +22,7 @@ struct io_frame { status_t status{}; size_t size{}; char data[io_stream_limit]{}
 // may revoke an unread payload. Receivers discard that frame,
 // preserving the stream and distinguishing abandonment from EOF.
 class io_tx {
-    cap_owner memory_;
+    _cap_owner memory_;
     ubus_call call_;
 public:
     auto active() const -> bool { return call_.active(); }
@@ -38,11 +39,11 @@ public:
                 return tag ? ubus_notify(endpoint, message, block) : ubus_send(endpoint, message, block);
             }
             if (!memory_) {
-                const auto created = sys::memory_create(rt_startup().alloc(), io_stream_limit, VM_READ | VM_WRITE);
+                const auto created = _memory_create(_startup().alloc(), io_stream_limit, VM_READ | VM_WRITE);
                 if (created.status != STATUS_OK) return created.status;
-                memory_ = cap_owner{created.value};
+                memory_ = _cap_owner{created.value};
             }
-            auto status = mem_write(memory_.selector(), 0, std::as_bytes(std::span{frame.data, frame.size}));
+            auto status = _mem_write(memory_.selector(), 0, std::as_bytes(std::span{frame.data, frame.size})).status;
             if (status != STATUS_OK) return status;
             const auto index = message.attach(memory_.selector(), RIGHT_MAP | RIGHT_DUPLICATE);
             if (!index) return index.error();
@@ -66,8 +67,8 @@ inline auto io_decode(ubus_request& request, io_frame& frame) -> status_t {
         if (!request.reply || bytes || request.count != 1 || buffer->size > io_stream_limit
             || buffer->offset > UINT64_MAX - buffer->size) status = STATUS_BAD_ARGS;
         else {
-            status = mem_read(request.capability(request.data["buffer"]), buffer->offset,
-                std::as_writable_bytes(std::span{frame.data, size_t(buffer->size)}));
+            status = _mem_read(request.capability(request.data["buffer"]), buffer->offset,
+                std::as_writable_bytes(std::span{frame.data, size_t(buffer->size)})).status;
             if (status == STATUS_OK) frame.size = buffer->size;
             else if (status == STATUS_CLOSED || status == STATUS_INVALID_CAP || status == STATUS_DENIED) status = STATUS_CANCELED;
         }

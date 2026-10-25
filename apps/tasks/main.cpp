@@ -74,11 +74,11 @@ static void ts_sample(ts_item& item, ubus_value row) {
         same = item.threads[i] == (*samples)[i] && item.threads[i + 1] <= (*samples)[i + 1];
         if (same) elapsed += (*samples)[i + 1] - item.threads[i + 1];
     }
-    item.cpu = same ? std::optional{elapsed * 1000 / (tick - item.tick) / rt_startup().cpus} : std::nullopt;
+    item.cpu = same ? std::optional{elapsed * 1000 / (tick - item.tick) / _startup().cpus} : std::nullopt;
     item.threads.assign(samples->begin(), samples->end()); item.tick = tick;
 }
 struct ts_scope {
-    cap_owner cap;
+    _cap_owner cap;
     ubus_conn connection;
     std::weak_ptr<ts_item> parent;
     std::vector<std::shared_ptr<ts_item>> items;
@@ -91,7 +91,7 @@ class ts_view {
     ubus_msg setup_;
     std::shared_ptr<ts_scope> root_{std::make_shared<ts_scope>()};
     ubus_conn environment_, devices_;
-    cap_owner device_cap_;
+    _cap_owner device_cap_;
     std::vector<ubus_data> devices_data_;
     std::vector<std::pair<std::shared_ptr<ts_item>, size_t>> rows_;
     std::string selection_, device_selection_, filter_, notice_, device_error_;
@@ -175,7 +175,7 @@ class ts_view {
         return q.kind == DeviceGet ? environment_ : q.kind == DeviceBind || q.kind == Devices ? devices_ : q.scope->connection;
     }
     void begin(query q) {
-        q.message.deadline = rt_after_ms(800).value_or(0);
+        q.message.deadline = _after(std::chrono::milliseconds{800}).value_or(0);
         if (connection(q).active()) return;
         const uint64_t version = q.kind == Bind ? 3 : 1;
         const auto status = q.kind == Bind || q.kind == DeviceBind
@@ -263,7 +263,7 @@ class ts_view {
         if (!terminal_.focused()) return;
         if (intent_ && !connection(*intent_).active()) { auto q = std::move(*intent_); intent_.reset(); begin(std::move(q)); }
         if (frozen_ || menu_) return;
-        const auto now = sys::clock_now().value;
+        const auto now = _clock_now().value;
         if (now >= refresh_) {
             refresh_ = refresh_ ? refresh_ + ((now - refresh_) / frequency_ + 1) * frequency_ : now + frequency_;
             ++round_; if (detail_) dirty_ = true;
@@ -469,9 +469,9 @@ class ts_view {
 public:
     ts_view() { input_ = ftxui::Input(&filter_, "Search"); ui_ = ftxui::Renderer([this] { return render(); }); }
     auto run() -> status_t {
-        const auto& env = rt_startup();
-        frequency_ = sys::clock_frequency().value;
-        auto status = environment_.bind(env.environment);
+        const auto& env = _startup();
+        frequency_ = _clock_frequency().value;
+        auto status = environment_.bind(env.bootstrap);
         if (status == STATUS_OK) status = environment_.invoke("Receive", {}, setup_);
         if (status == STATUS_OK) status = terminal_.open(env, setup_);
         if (status != STATUS_OK) return status;
@@ -484,7 +484,7 @@ public:
                 dirty_ |= terminal_.redraw(); if (!*e) break; key(**e);
             }
             if (quit_) break;
-            if (!frozen_) now_ = sys::clock_now().value;
+            if (!frozen_) now_ = _clock_now().value;
             bool progress = poll(); next(); progress |= poll();
             if (terminal_.focused() && dirty_) {
                 status = terminal_.present(ui_);

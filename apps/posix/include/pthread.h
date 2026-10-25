@@ -73,9 +73,9 @@ int pthread_setspecific(pthread_key_t, const void*);
 void* pthread_getspecific(pthread_key_t);
 // Cancellation and realtime deadlines require mechanisms this target does not provide.
 int pthread_cancel(pthread_t);
-void px_cleanup_push(rt_cleanup*, void (*)(void*), void*);
-void px_cleanup_pop(rt_cleanup*, int);
-#define pthread_cleanup_push(function, argument) do { rt_cleanup px_cleanup_; px_cleanup_push(&px_cleanup_, function, argument);
+void px_cleanup_push(_cleanup*, void (*)(void*), void*);
+void px_cleanup_pop(_cleanup*, int);
+#define pthread_cleanup_push(function, argument) do { _cleanup px_cleanup_; px_cleanup_push(&px_cleanup_, function, argument);
 #define pthread_cleanup_pop(execute) px_cleanup_pop(&px_cleanup_, execute); } while (0)
 #ifdef __cplusplus
 }

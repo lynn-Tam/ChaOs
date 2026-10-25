@@ -323,7 +323,7 @@ channel_test_user = executable(
   link_language: 'c', implicit_include_directories: false, build_by_default: false)
 process_client_user = executable(
   'process-client.elf', files('test/user/process/main.cpp'),
-  dependencies: [proc_dep, ubus_dep], c_args: user_c_args, cpp_args: user_cpp_args + ['-I' + join_paths(root, 'apps/posix/include')],
+  dependencies: [proc_dep, ubus_dep, io_dep], c_args: user_c_args, cpp_args: user_cpp_args + ['-I' + join_paths(root, 'apps/posix/include')],
   link_with: [proc, ubus, cxx_runtime], link_whole: [crt, user_entry, posix], link_args: user_link_args + ['-Wl,--gc-sections'], link_language: 'c', implicit_include_directories: false, build_by_default: false,
 )
 
@@ -407,8 +407,11 @@ run_target('audit-kernel-symbols', command: [sh, audit_symbols, nm, ar, kernel, 
 run_target('audit-symbols', command: [sh, audit_symbols, nm, ar, kernel_debug, 'any', (trace_enabled ? '1' : '0'), arch, core, test_entry, trace, sync, panic, test_configs['debug'], test_module])
 run_target('audit-kernel-stack', command: [sh, audit_stack, meson.current_build_dir(), '1792', kernel])
 run_target('audit-boot-stack', command: [sh, audit_stack, meson.current_build_dir(), '2048', kernel_debug])
-user_images = [store_user]
+user_images = [store_user, fdcheck_user, demand_user, process_client_user, channel_test_user, mgr_test, ubus_test, exec_test]
 foreach name, image : bins
+  user_images += [image]
+endforeach
+foreach name, image : probes
   user_images += [image]
 endforeach
 run_target('audit-user', command: [sh, audit_user, nm, readelf] + user_images)
@@ -425,7 +428,7 @@ run_target('run-process-matrix', command: [find_program('python3'), files('tools
   qemu, kernel_debug, '1,2,4', '--bundle', process_test_bundle, '--timeout', '45',
   '[process] direct spawn, retention, deadlines and reuse ok'])
 run_target('run-thread-matrix', command: [find_program('python3'), files('tools/build/run-io-platform.py'),
-  qemu, kernel, '1,2,4', '--bundle', bundles['thread-test'], '--timeout', '45',
+  qemu, kernel, '1,2,4', '--bundle', bundles['thread-test'], '--timeout', '45', '--report', '[api]', '--forbid', '[threads] failed',
   '[threads] execution pause, resume, paused retirement and admission rollback ok'])
 run_target('run-thread-console', command: [find_program('python3'), files('tools/build/run-console.py'),
   qemu, kernel, storage_test_bundle, '4', 'threads'])

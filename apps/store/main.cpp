@@ -1,6 +1,6 @@
 #include <libk/path.hpp>
 #include <vm.hpp>
-#include <util.hpp>
+#include <thread.hpp>
 #include <string_view>
 #include <string.h>
 #include <utility>
@@ -21,9 +21,9 @@ static uint64_t epoch{1};
 static st_device backend;
 static st_vol volume;
 static std::array<uint8_t, io_limit> scratch;
-static cap_t events;
+static _ev_port* events;
 static CreateAuth store_memory;
-static cap_desc descriptor;
+static _cap_desc descriptor;
 static uint8_t expected_id[st_volume_id_size]{};
 static bool require_id{};
 
@@ -138,13 +138,13 @@ static auto find(const entry& entry) -> inode* {
     if (seek < 0) {
         const auto status = volume.error(seek);
         if (volume.failed())
-            sys::exit(status);
+            _thread_exit(status);
         return {request.id, status, 0};
     }
     const auto result = write ? lfs_file_write(volume.fs(), &file.state, data, request.length)
                               : lfs_file_read(volume.fs(), &file.state, data, request.length);
     if (volume.failed())
-        sys::exit(volume.error(result));
+        _thread_exit(volume.error(result));
     if (result > 0 && implicit)
         logical = offset + result;
     return {request.id, volume.error(result < 0 ? result : 0),
@@ -152,7 +152,7 @@ static auto find(const entry& entry) -> inode* {
 }
 
 struct st_open final {
-    vm_ptr<st_open> next;
+    _vm_ptr<st_open> next;
     inode* file{};
     ubus_object object;
     ubus_queue<st_cmd, io_depth + 1> queue; // One control credit beyond the negotiated data depth.
@@ -273,17 +273,17 @@ struct st_open final {
         const auto memory = call->capability(call->data["buffer"]);
         auto& bytes = scratch;
         if (request.operation == st_op::Write) {
-            const auto status = mem_read(memory, request.buffer_offset, std::as_writable_bytes(std::span{bytes}.first(request.length)));
+            const auto status = _mem_read(memory, request.buffer_offset, std::as_writable_bytes(std::span{bytes}.first(request.length))).status;
             if (status != STATUS_OK) return {request.id, status};
             ++epoch;
         }
         auto result = ::transfer(*file, request, bytes.data(), offset, request.sequential, readable, writable, append);
         if (result.status == STATUS_OK && request.operation == st_op::Read)
-            result.status = mem_write(memory, request.buffer_offset, std::as_bytes(std::span{bytes}.first(result.bytes)));
+            result.status = _mem_write(memory, request.buffer_offset, std::as_bytes(std::span{bytes}.first(result.bytes))).status;
         return result;
     }
 };
-static vm_ptr<st_open> opens;
+static _vm_ptr<st_open> opens;
 static std::deque<ubus_request> syncs;
 static st_open* sync_head;
 static std::vector<std::pair<st_open*, uint64_t>> sync_targets;
@@ -387,7 +387,7 @@ class st_reader final {
             finish(read, STATUS_CANCELED);
             return true;
         }
-        if (const auto status = rt_admit(read.deadline); status != STATUS_OK) {
+        if (const auto status = _deadline_status(read.deadline); status != STATUS_OK) {
             finish(read, status);
             return true;
         }
@@ -440,14 +440,14 @@ static void completed(read_job& read, status_t status) noexcept {
     if (open.failed || queue.cancelled(pending.ticket)) status = STATUS_CANCELED;
     if (status == STATUS_OK) {
         auto* call = queue.call(pending.ticket);
-        status = mem_write(call->capability(call->data["buffer"]), request->buffer_offset,
-            std::as_bytes(std::span{pending.payload}.first(read.done)));
+        status = _mem_write(call->capability(call->data["buffer"]), request->buffer_offset,
+            std::as_bytes(std::span{pending.payload}.first(read.done))).status;
     }
     if (request->sequential) {
         if (status == STATUS_OK) open.offset += read.done;
         open.busy = false;
     }
-    if (!open.finish(pending.ticket, status, status == STATUS_OK ? read.done : 0)) sys::exit(STATUS_INTERNAL);
+    if (!open.finish(pending.ticket, status, status == STATUS_OK ? read.done : 0)) _thread_exit(STATUS_INTERNAL);
     pending.open = nullptr; pending.read = {};
 }
 static auto slot() noexcept -> pending* {
@@ -465,12 +465,12 @@ static auto reading() noexcept -> bool {
 static auto pump_reads() noexcept -> bool {
     const auto polled = reader.poll();
     if (!polled)
-        sys::exit(polled.error());
+        _thread_exit(polled.error());
     bool progress = *polled;
     for (auto& pending : reads) {
         const auto submitted = reader.submit(pending.read);
         if (!submitted)
-            sys::exit(submitted.error());
+            _thread_exit(submitted.error());
         progress |= *submitted;
     }
     return progress;
@@ -480,7 +480,7 @@ static void drain_reads() noexcept {
         (void) pump_reads();
         if (reading())
             if (const auto rc = reader.wait(); rc != STATUS_OK)
-                sys::exit(rc);
+                _thread_exit(rc);
     }
 }
 // The capability designates the selected directory entry. Replacement preserves
@@ -505,7 +505,7 @@ auto st_open::save(ubus_request& request) -> status_t {
     auto bytes = std::as_writable_bytes(std::span{scratch});
     for (uint64_t at = 0; at < buffer.size && status == STATUS_OK;) {
         const auto count = std::min<uint64_t>(bytes.size(), buffer.size - at);
-        status = mem_read(request.capability(request.data["buffer"]), buffer.offset + at, std::span{bytes}.first(count));
+        status = _mem_read(request.capability(request.data["buffer"]), buffer.offset + at, std::span{bytes}.first(count)).status;
         if (status != STATUS_OK) break;
         const auto written = lfs_file_write(volume.fs(), &replacement->state, bytes.data(), count);
         status = written < 0 ? volume.error(written) : uint64_t(written) == count ? STATUS_OK : STATUS_BACKING_FAILED;
@@ -540,7 +540,7 @@ static auto start_read(st_open& open, ubus_ticket ticket, pending& pending) noex
         (file.flags & (LFS_F_INLINE | LFS_F_WRITING)))
         return false;
     if (const auto rc = backend.drain_writes(); rc != STATUS_OK)
-        sys::exit(rc);
+        _thread_exit(rc);
     const auto available = offset < file.ctz.size ? file.ctz.size - offset : 0;
     pending.open = &open; pending.ticket = ticket;
     pending.read = {.object = reinterpret_cast<uintptr_t>(open.file), .offset = offset,
@@ -573,7 +573,7 @@ static auto snapshot(const char* path, word_t perms, ubus_msg& response) -> stat
     if (size <= 0)
         return size < 0 ? volume.error(size) : STATUS_BAD_ARGS;
     const auto bytes = (uint64_t(size) + 4095) & ~uint64_t{4095};
-    auto made = vm_area::create(store_memory, rt_vm(), 0, bytes, VM_READ | VM_WRITE | (perms & VM_EXECUTE), VM_READ | VM_WRITE);
+    auto made = _vm_area::create(store_memory, _vm(), 0, bytes, VM_READ | VM_WRITE | (perms & VM_EXECUTE), VM_READ | VM_WRITE);
     if (!made) return made.error();
     auto staging = std::move(*made);
     status_t status = STATUS_OK;
@@ -595,11 +595,10 @@ static auto snapshot(const char* path, word_t perms, ubus_msg& response) -> stat
     ::memset(reinterpret_cast<void*>(staging.address + size), 0, bytes - size);
     status = staging.detach();
     if (status == STATUS_OK)
-        status = sys::memory_seal(staging.memory.selector()).status;
+        status = _memory_seal(staging.memory.selector()).status;
     if (status != STATUS_OK)
         return status;
-    const CapView view{.version=CAP_ATTENUATION_VERSION_CURRENT, .kind=ObjMem, .size=CAP_ATTENUATION_SIZE,
-        .rights=RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_DELEGATE, .words={0, bytes / 4096, perms}};
+    const auto view = _cap_mem(RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_DELEGATE, 0, bytes / 4096, perms);
     auto exported = descriptor.derive(staging.memory.selector(), view, store_memory.quota);
     if (!exported) return exported.error();
     const auto index = response.offer(std::move(*exported), view.rights); if (!index) return STATUS_NO_MEMORY;
@@ -608,7 +607,7 @@ static auto snapshot(const char* path, word_t perms, ubus_msg& response) -> stat
 
 static auto control(std::string_view method, ubus_request& request, ubus_msg& response) -> status_t {
     drain_reads();
-    if (const auto status = rt_admit(request.deadline); status != STATUS_OK) return status;
+    if (const auto status = _deadline_status(request.deadline); status != STATUS_OK) return status;
     if (method == "DeviceId") {
         uint8_t id[20]{};
         const auto status = backend.identify(id);
@@ -650,7 +649,7 @@ static auto control(std::string_view method, ubus_request& request, ubus_msg& re
             || ((flags & ~(io_read | io_write)) && !(flags & io_write))) return STATUS_BAD_ARGS;
         if ((flags & io_write) && !(request.facet() & io_modify)) return STATUS_DENIED;
         const auto budget = request.capability(request.data["budget"]);
-        auto storage = vm_new<st_open>({budget ? budget : rt_startup().quota, rt_startup().scope});
+        auto storage = _vm_new<st_open>({budget ? budget : _startup().quota, _startup().scope});
         if (!storage) return storage.error();
         auto opened = std::move(*storage);
         if (method == "Document") opened->document = path;
@@ -716,8 +715,8 @@ static auto control(std::string_view method, ubus_request& request, ubus_msg& re
 }
 
 int main(int argc, char** argv) {
-    const auto& info = rt_startup();
-    events = rt_events();
+    const auto& info = _startup();
+    events = &_events();
     if (argc > 2) return STATUS_BAD_ARGS;
     if (argc == 2) {
         const std::string_view text{argv[1]}; if (text.size() != sizeof(expected_id) * 2) return STATUS_BAD_ARGS;
@@ -727,7 +726,7 @@ int main(int argc, char** argv) {
         require_id = true;
     }
     ubus_conn bus, block;
-    auto status = bus.bind(info.environment); if (status != STATUS_OK) return status;
+    auto status = bus.bind(info.bootstrap); if (status != STATUS_OK) return status;
     ubus_msg setup;
     status = bus.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
     const auto message = setup.data["message"];
@@ -769,7 +768,7 @@ int main(int argc, char** argv) {
             [name](auto& request, auto& response) {
                 if (name == "Capacity") { response.data.put("bytes", backend.capacity()); return STATUS_OK; }
                 const auto status = control(name, request, response);
-                if (volume.failed()) sys::exit(volume.error(-1));
+                if (volume.failed()) _thread_exit(volume.error(-1));
                 reap(); return status;
             }, item.rights);
         if (status != STATUS_OK) return status;
@@ -788,8 +787,8 @@ int main(int argc, char** argv) {
     for (;;) {
         // Report the failed barrier before retiring the poisoned filesystem.
         // Its metadata/cache must never serve a later operation after I/O EIO.
-        if (volume.failed()) sys::exit(volume.error(0));
-        if (const auto status = backend.error(); status != STATUS_OK) sys::exit(status);
+        if (volume.failed()) _thread_exit(volume.error(0));
+        if (const auto status = backend.error(); status != STATUS_OK) _thread_exit(status);
         bool again = pump_reads();
         for (size_t count = 0; count < io_depth; ++count) {
             const auto status = directory.poll();
@@ -821,14 +820,14 @@ int main(int argc, char** argv) {
                 if (!pending) break;
                 ubus_ticket ticket{};
                 if (queue->admit(ticket) != ubus_admission::Ready) break;
-                auto status = queue->cancelled(ticket) ? STATUS_CANCELED : rt_admit(queue->request(ticket)->deadline);
+                auto status = queue->cancelled(ticket) ? STATUS_CANCELED : _deadline_status(queue->request(ticket)->deadline);
                 if (status != STATUS_OK) {
                     if (!opened.finish(ticket, status, 0)) return STATUS_INTERNAL;
                     again = true; continue;
                 }
                 if (start_read(opened, ticket, *pending)) { again = true; continue; }
                 drain_reads();
-                status = queue->cancelled(ticket) ? STATUS_CANCELED : rt_admit(queue->request(ticket)->deadline);
+                status = queue->cancelled(ticket) ? STATUS_CANCELED : _deadline_status(queue->request(ticket)->deadline);
                 if (status == STATUS_OK && !queue->commit(ticket)) status = STATUS_CANCELED;
                 const auto completion = status == STATUS_OK ? opened.transfer(ticket) : st_done{ticket.id, status};
                 if (queue->request(ticket)->operation == st_op::Close) opened.stopped = true;
@@ -860,6 +859,6 @@ int main(int argc, char** argv) {
         }
         reap();
         if (const auto rc = directory.arm(); rc != STATUS_OK) return rc;
-        if (!again) if (const auto rc = ev_wait(events).status; rc != STATUS_OK) return rc;
+        if (!again) if (const auto rc = _ev_wait(events).status; rc != STATUS_OK) return rc;
     }
 }

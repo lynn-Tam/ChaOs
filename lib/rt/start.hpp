@@ -7,30 +7,15 @@
 extern "C" char** environ;
 
 // Native execution context only. The runtime never interprets the environment.
-struct rt_env {
-    cap_t quota{}, scope{}, vspace{}, cspace{}, domain{}, environment{}, lifecycle{};
+struct _env {
+    cap_t quota{}, scope{}, vspace{}, cspace{}, domain{}, bootstrap{}, lifecycle{};
     auto alloc() const noexcept -> CreateAuth { return {quota, scope}; }
-    word_t cpus{};
+    word_t cpus{}, frequency{};
     std::span<const std::byte> boot{};
 };
-auto rt_startup() noexcept -> const rt_env&;
-auto rt_root() noexcept -> const RootInfo&;
+auto _startup() noexcept -> const _env&;
+auto _root() noexcept -> const RootInfo&;
 
-struct rt_context {
-    word_t ipc{};
-    cap_t events{}, park{};
-    uint64_t tid{1};
-    void* thread{};
-    rt_wait_node waiter;
-};
-extern thread_local rt_context rt_local;
-inline auto rt_current() noexcept -> rt_context& { return rt_local; }
-auto rt_events() noexcept -> cap_t;
-
-inline constexpr word_t rt_life_version = 2;
-struct rt_bootstrap {
-    uintptr_t stack{};
-    size_t stack_size{};
-    cap_t thread{}, sc{}, stack_memory{}, ipc_memory{};
-};
-auto rt_initial() noexcept -> const rt_bootstrap&;
+struct _ev_port;
+auto _events() noexcept -> _ev_port&;
+auto _ipc() noexcept -> word_t;

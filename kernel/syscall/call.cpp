@@ -982,6 +982,27 @@ auto vm_call(Call& inv) noexcept -> Result {
         std::get_if<cap::VmLimit>(&effective.data);
     libk_assert(where != nullptr);
     mm::VSpace& space = target.value().object();
+    if constexpr (op == SYS_VM_RESERVE) {
+        if (!effective.rights.contains(cap::Right::Delegate)) return returned(STATUS_BAD_RIGHTS);
+        VmAlloc request{};
+        auto* ipc = inv.target->ipc_buffer();
+        if (!ipc || trap.arg(2) || trap.arg(3) || trap.arg(4) || trap.arg(5)
+            || !ipc->read(trap.arg(1), std::span{reinterpret_cast<byte*>(&request), sizeof(request)}))
+            return returned(STATUS_BAD_ARGS);
+        cap::Handle handle{};
+        auto publish = [&](cap::VmLimit limit) noexcept -> status_t {
+            const auto rights = effective.rights.intersect(cap::Rights::of(cap::Right::Reserve,
+                cap::Right::Map, cap::Right::Unmap, cap::Right::Protect,
+                cap::Right::Inspect, cap::Right::Duplicate, cap::Right::Delegate));
+            auto created = cspace.transfer(vspace_handle, cspace, cap::XferOp::Derive,
+                cap::View{rights, limit});
+            if (!created) return cap_status(created.error());
+            handle = *created; return STATUS_OK;
+        };
+        auto result = space.reserve(request, *where, libk::delegate<status_t(cap::VmLimit)>::bind(publish));
+        if (!result && result.error() == STATUS_RETRY) return vm_wait(inv, space);
+        return returned(result ? STATUS_OK : result.error(), handle.raw(), result ? result->range.base().raw() : 0);
+    }
     const auto range = range_of(trap.arg(1), trap.arg(2));
     if (!range) {
         return returned(STATUS_BAD_ARGS);
@@ -992,16 +1013,14 @@ auto vm_call(Call& inv) noexcept -> Result {
         if (!access || !rights || trap.arg(5) != 0) {
             return returned(STATUS_BAD_ARGS);
         }
-        const cap::View slice{*rights, cap::VmLimit{*range,*access}};
+        const cap::View slice{*rights, cap::VmLimit{*range,*access,where->claim()}};
         auto created = cspace.transfer(vspace_handle, cspace, cap::XferOp::Derive, slice);
         return returned(created ? STATUS_OK : cap_status(created.error()),
             created ? created->raw() : 0);
     }
-    if constexpr (op == SYS_VM_RESERVE || op == SYS_VM_GUARD) {
+    if constexpr (op == SYS_VM_GUARD) {
         if (!where->range.contains(*range)) return returned(STATUS_DENIED);
-        auto reserved = op == SYS_VM_RESERVE
-            ? space.reserve(*range)
-            : space.reserve(*range,true);
+        auto reserved = space.guard(*where, *range);
         if (!reserved && reserved.error() == mm::VSpaceError::Contended) return vm_wait(inv, space);
         return returned(reserved ? STATUS_OK : mm::status(reserved.error()));
     }

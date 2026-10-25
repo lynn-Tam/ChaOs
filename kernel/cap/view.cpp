@@ -18,7 +18,11 @@ auto describe(ObjKind kind, View view) noexcept -> CapView {
             if constexpr (std::is_same_v<T, MemLimit>) w[0] = limit.range.base();
             else w[0] = limit.range.base().raw();
             w[1] = limit.range.size();
-            if constexpr (!std::is_same_v<T, PhysLimit>) w[2] = limit.perms.raw();
+            if constexpr (!std::is_same_v<T, PhysLimit>) {
+                if constexpr (std::is_same_v<T, VmLimit>) w[2] = limit.perms().raw();
+                else w[2] = limit.perms.raw();
+            }
+            if constexpr (std::is_same_v<T, VmLimit>) w[3] = limit.claim();
         } else if constexpr (std::is_same_v<T, QuotaLimit>) {
             w[0] = limit.budget.memory; w[1] = limit.budget.caps; w[2] = limit.object_kinds;
         } else if constexpr (std::is_same_v<T, ScopeLimit>) {
@@ -106,7 +110,7 @@ constexpr Rights irq_rights = Rights::of(
         && !limit.range.empty()
         && (limit.range.base().raw() & (mm::page_size - 1)) == 0
         && (limit.range.size() & (mm::page_size - 1)) == 0
-        && mm::valid_perms(limit.perms);
+        && mm::valid_perms(limit.perms());
 }
 
 [[nodiscard]] static auto valid(QuotaLimit limit) noexcept -> bool {
@@ -156,7 +160,7 @@ static auto contains(MemLimit a, MemLimit b) noexcept -> bool {
 }
 static auto contains(VmLimit a, VmLimit b) noexcept -> bool {
     return a.range.contains(b.range)
-        && a.perms.contains(b.perms);
+        && a.perms().contains(b.perms()) && (!a.claim() || a.claim() == b.claim());
 }
 static auto contains(QuotaLimit a, QuotaLimit b) noexcept -> bool {
     return a.budget.contains(b.budget) && (b.object_kinds & ~a.object_kinds) == 0;
@@ -396,7 +400,7 @@ auto make_attenuation_ceiling(
     }
 
     case ObjVSpace: {
-        if (!words_zero(descriptor, 3)) {
+        if (!words_zero(descriptor, 4)) {
             return std::unexpected(AttenuationError::InvalidWord);
         }
         const auto base = usize_value(descriptor.words[0]);
@@ -406,7 +410,7 @@ auto make_attenuation_ceiling(
         if (!base || !size || !access || *base == 0 || *size == 0
             || (*base % mm::page_size) != 0
             || (*size % mm::page_size) != 0
-            || upper == nullptr) {
+            || upper == nullptr || descriptor.words[3] != upper->claim()) {
             return std::unexpected(AttenuationError::InvalidRange);
         }
         const mm::VRange range{
@@ -416,7 +420,7 @@ auto make_attenuation_ceiling(
         }
         return (View{
             child_rights,
-            VmLimit{range, *access}});
+            VmLimit{range, *access, upper->claim()}});
     }
 
     case ObjScope: {

@@ -304,7 +304,7 @@ template<usize op> [[gnu::noinline]] auto vm_submit(Call& inv) noexcept -> Resul
     if (!buffer || !buffer->read(inv.trap.arg(3), std::span<byte>{reinterpret_cast<byte*>(&request), sizeof(request)}))
         return returned(STATUS_BAD_ARGS);
     const auto required = kind == VM_OP_MAP ? cap::Right::Map : kind == VM_OP_UNMAP ? cap::Right::Unmap
-        : kind == VM_OP_PROTECT ? cap::Right::Protect : cap::Right::Destroy;
+        : kind == VM_OP_PROTECT ? cap::Right::Protect : cap::Right::Unmap;
     auto target = inv.cspace.resolve<mm::VSpace>(handle_of(inv.trap.arg(1)), cap::Rights::of(required));
     if (!target) return returned(cap_status(target.error()));
     const auto view = target->view();
@@ -333,7 +333,7 @@ template<usize op> [[gnu::noinline]] auto vm_submit(Call& inv) noexcept -> Resul
             result = mapped ? std::expected<mm::VmStatus, mm::VSpaceError>{mapped->status} : std::unexpected(mapped.error());
         } else if (kind == VM_OP_UNMAP) result = space.unmap(ctx, *where, *range);
         else if (kind == VM_OP_PROTECT) result = space.protect(ctx, *where, *range, *perms);
-        else result = space.clear(ctx, *range);
+        else result = space.clear(ctx, *where);
         return result ? STATUS_OK : mm::status(result.error());
     });
     if (outcome.status != STATUS_RETRY) return outcome;
@@ -908,6 +908,9 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto thread_create(Call& inv
         const cap::CSpaceError error = !pool ? pool.error() : !vspace ? vspace.error() : cspace.error();
         return returned(cap_status(error));
     }
+    const auto view = vspace->view();
+    const auto* limit = std::get_if<cap::VmLimit>(&view.data);
+    if (!limit || !vspace->object().can_destroy_object(*limit)) return returned(STATUS_DENIED);
     auto start = start_snapshot(inv, handle_of(trap.arg(3)), trap.arg(4));
     if (!start || !inv.cpu.cpus->get(CpuId{trap.arg(5)})) {
         return returned(start ? STATUS_BAD_ARGS : start.error());

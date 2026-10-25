@@ -72,6 +72,8 @@ struct CapView {
     uint16_t kind;
     uint32_t size;
     uint64_t rights;
+    // VSpace v2: [base, bytes, perms, claim, 0, 0]. Typed attenuation keeps
+    // the source claim; claim zero is administrative, not an acquired region.
     uint64_t words[6];
 };
 
@@ -97,7 +99,7 @@ static_assert(offsetof(CapView, words) == 16);
 #define CAP_ATTENUATION_WORD4_OFFSET 48U
 #define CAP_ATTENUATION_WORD5_OFFSET 56U
 #define CAP_ATTENUATION_SIZE 64U
-#define CAP_ATTENUATION_VERSION_CURRENT 1U
+#define CAP_ATTENUATION_VERSION_CURRENT 2U
 
 /* Capability-family fields with a stable public encoding. */
 #define CAP_CHANNEL_SIDE_A 0U

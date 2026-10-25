@@ -4,6 +4,7 @@
 #include <span>
 #include <optional>
 #include <bit>
+#include <string_view>
 
 namespace libk {
 static_assert(std::endian::native == std::endian::little);
@@ -26,6 +27,7 @@ class elf_view {
     static_assert(sizeof(header) == 64);
     std::span<const std::byte> bytes_;
     header h_{};
+    std::span<const elf_seg> segments_;
 public:
     auto bytes() const noexcept { return bytes_; }
     auto entry() const noexcept { return h_.entry; }
@@ -33,12 +35,37 @@ public:
     auto segment_count() const noexcept { return h_.phnum; }
     auto segment(size_t i) const noexcept -> std::optional<elf_seg> {
         if (i >= h_.phnum) return {};
+        if (!segments_.empty()) return segments_[i];
         elf_seg s;
         __builtin_memcpy(&s, bytes_.data() + h_.phoff + i * sizeof(s), sizeof(s));
         return s;
     }
     explicit operator bool() const noexcept { return !bytes_.empty(); }
-    static auto parse(std::span<const std::byte> bytes) noexcept -> elf_view {
+    static auto segment_capacity(std::span<const std::byte> bytes) noexcept -> size_t {
+        if (bytes.size() < sizeof(header)) return 0;
+        header h; __builtin_memcpy(&h, bytes.data(), sizeof(h));
+        return h.phnum && h.phnum != 0xffff && h.phoff <= bytes.size()
+            && h.phnum <= (bytes.size() - h.phoff) / sizeof(elf_seg) ? h.phnum : 0;
+    }
+    auto note(std::string_view name, uint32_t type) const noexcept -> std::span<const std::byte> {
+        for (size_t i = 0; i < segment_count(); ++i) {
+            const auto s = *segment(i);
+            if (s.type != 4) continue;
+            auto bytes = bytes_.subspan(s.offset, s.file_size);
+            while (bytes.size() >= 12) {
+                uint32_t h[3]; __builtin_memcpy(h, bytes.data(), sizeof(h));
+                const uint64_t names = (uint64_t(h[0]) + 3) & ~uint64_t{3};
+                const uint64_t desc = (uint64_t(h[1]) + 3) & ~uint64_t{3};
+                if (names > bytes.size() - 12 || desc > bytes.size() - 12 - names) return {};
+                if (h[2] == type && h[0] == name.size() + 1
+                    && !__builtin_memcmp(bytes.data() + 12, name.data(), name.size())
+                    && bytes[12 + name.size()] == std::byte{}) return bytes.subspan(12 + names, h[1]);
+                bytes = bytes.subspan(12 + names + desc);
+            }
+        }
+        return {};
+    }
+    static auto parse(std::span<const std::byte> bytes, std::span<elf_seg> snapshot = {}) noexcept -> elf_view {
         elf_view v;
         if (bytes.size() < sizeof(header)) return {};
         __builtin_memcpy(&v.h_, bytes.data(), sizeof(header));
@@ -48,6 +75,11 @@ public:
             h.ehsize != sizeof(header) || h.phsize != sizeof(elf_seg) || !h.phnum || h.phnum == 0xffff ||
             h.phoff > bytes.size() || h.phnum > (bytes.size() - h.phoff) / sizeof(elf_seg)) return {};
         v.bytes_ = bytes;
+        if (!snapshot.empty()) {
+            if (h.phnum > snapshot.size()) return {};
+            __builtin_memcpy(snapshot.data(), bytes.data() + h.phoff, h.phnum * sizeof(elf_seg));
+            v.segments_ = snapshot.first(h.phnum);
+        }
         bool entry{};
         std::optional<elf_seg> tls;
         for (size_t i = 0; i < h.phnum; ++i) {
@@ -55,6 +87,7 @@ public:
             // Static TLS is initialized by the CRT; dynamic images remain unsupported.
             if (s.type == 2 || s.type == 3) return {};
             if (s.type == 7) { if (tls) return {}; tls = s; }
+            if (s.type == 4 && (s.offset > bytes.size() || s.file_size > bytes.size() - s.offset)) return {};
             if (s.type != 1 && s.type != 7) continue;
             if (s.file_size > s.size || s.offset > bytes.size() || s.file_size > bytes.size() - s.offset ||
                 s.size > UINT64_MAX - s.va || (s.flags & ~7u) || (s.flags & 3u) == 3u ||

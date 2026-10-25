@@ -7,6 +7,7 @@ PHDRS
     rodata PT_LOAD FLAGS(4);
     data PT_LOAD FLAGS(6);
     tls PT_TLS FLAGS(4);
+    abi PT_NOTE FLAGS(4);
 }
 
 SECTIONS
@@ -17,6 +18,8 @@ SECTIONS
         KEEP(*(.text.start))
         *(.text .text.*)
     } :text
+
+    .note.native : ALIGN(0x1000) { KEEP(*(.note.native)) } :rodata :abi
 
     .rodata : ALIGN(0x1000) {
         *(.rodata .rodata.*)

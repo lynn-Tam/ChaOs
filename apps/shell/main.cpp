@@ -28,7 +28,7 @@ public:
     void write(const char* data, size_t size) const {
         while (size) {
             sh_chunk chunk; chunk.size = std::min(size, sizeof(chunk.data)); ::memcpy(chunk.data, data, chunk.size);
-            const auto status = sh_send(output_, chunk); if (status != STATUS_OK) sys::exit(status);
+            const auto status = sh_send(output_, chunk); if (status != STATUS_OK) _thread_exit(status);
             data += chunk.size; size -= chunk.size;
         }
     }
@@ -38,25 +38,25 @@ public:
 
 struct sh_stage {
     std::shared_ptr<mgr_child> child;
-    auto task() const -> proc_task* { return child ? child->task.get() : nullptr; }
+    auto task() const -> _proc* { return child ? child->task.get() : nullptr; }
     std::optional<status_t> result;
     bool end{};
-    cap_owner end_sender;
-    ev_watch end_ready;
+    _cap_owner end_sender;
+    _ev_watch end_ready, domain_ready;
 };
 enum class sh_state { Running, Suspending, Suspended, Terminating, Done };
 struct sh_pipeline {
     uint64_t id;
     std::string command;
     std::vector<sh_stage> stages;
-    std::vector<std::unique_ptr<ch_pair>> pipes;
-    ch_pair input, output;
+    std::vector<std::unique_ptr<_ch_pair>> pipes;
+    _ch_pair input, output;
     ubus_object terminal;
-    cap_owner input_sender, terminal_sender, terminal_connector;
-    ev_watch terminal_ready;
+    _cap_owner input_sender, terminal_sender, terminal_connector;
+    _ev_watch terminal_ready;
     std::optional<ubus_msg> focus_event;
     std::optional<bool> execution;
-    ev_watch input_ready;
+    _ev_watch input_ready;
     ubus_rx output_rx;
     std::deque<sh_chunk> pending_input;
     sh_state state{sh_state::Running};
@@ -66,11 +66,11 @@ struct sh_pipeline {
 };
 
 class sh_shell {
-    const rt_env& env_;
+    const _env& env_;
     ubus_rx input_;
     ubus_conn bus_, files_;
     ubus_msg setup_;
-    vm_area source_;
+    _vm_area source_;
     cap_t input_cap_{}, output_cap_{};
     mgr owner_{[this](mgr_child& child) { return image(child.program()); }};
     std::deque<std::unique_ptr<sh_pipeline>> pipelines_;
@@ -78,7 +78,7 @@ class sh_shell {
     struct output { sh_chunk frame; uint64_t owner{}, focus{}; std::unique_ptr<io_tx> tx; };
     std::deque<output> output_;
     std::unique_ptr<io_tx> output_tx_;
-    ev_watch output_ready_;
+    _ev_watch output_ready_;
     std::string line_;
     std::string cwd_{"/"};
     std::vector<status_t> result_;
@@ -97,7 +97,7 @@ class sh_shell {
             for (;;) {
                 const auto status = owner_.erase(stage.child->child_id);
                 if (status == STATUS_OK || status == STATUS_NOT_FOUND) break;
-                if (status != STATUS_WOULD_BLOCK) sys::exit(status);
+                if (status != STATUS_WOULD_BLOCK) _thread_exit(status);
                 pump();
             }
             stage.child = nullptr;
@@ -176,7 +176,7 @@ class sh_shell {
             else { line_.push_back(byte); enqueue({&byte, 1}); }
         }
     }
-    auto image(std::string_view path) -> std::expected<proc_image, status_t> {
+    auto image(std::string_view path) -> std::expected<_proc_image, status_t> {
         ubus_msg query, response;
         auto status = files_.state();
         if (status != STATUS_OK) {
@@ -189,7 +189,7 @@ class sh_shell {
         query = {}; query.data.put("path", path).put("perms", word_t{VM_READ | VM_EXECUTE});
         status = files_.invoke("Map", std::move(query), response); if (status != STATUS_OK) return std::unexpected(status);
         const auto buffer = response.data["buffer"].as<ubus_buffer>(); if (!buffer) return std::unexpected(STATUS_PEER_FAULT);
-        return proc_image::map(source_, response.take(response.data["buffer"]), buffer->offset, buffer->size, VM_READ | VM_EXECUTE);
+        return _proc_image::map(source_, response.take(response.data["buffer"]), buffer->offset, buffer->size, VM_READ | VM_EXECUTE);
     }
     auto launch(sh_stage& stage, sh_pipeline& job, size_t index, std::span<const std::string_view> argv) -> status_t {
         const auto config = setup_.data["message"];
@@ -227,16 +227,16 @@ class sh_shell {
             std::tuple{"stdin", index ? job.pipes[index - 1]->ends[1].selector() : job.input.ends[1].selector(), word_t{RIGHT_RECEIVE}, word_t{0}},
             std::tuple{"stdout", index + 1 < job.stages.size() ? job.pipes[index]->ends[0].selector() : job.output.ends[0].selector(), word_t{RIGHT_SEND}, word_t{1}},
             std::tuple{"stderr", job.output.ends[0].selector(), word_t{RIGHT_SEND}, word_t{1}}}) {
-            const auto copy = badge ? sys::channel_mint(source, env_.cspace, badge, rights) : sys::cap_duplicate(source, env_.cspace, rights);
+            const auto copy = badge ? _channel_mint(source, env_.cspace, badge, rights) : _cap_duplicate(source, env_.cspace, rights);
             if (copy.status != STATUS_OK) return copy.status;
-            const auto cap_idx = payload.give(cap_owner{copy.value});
+            const auto cap_idx = payload.give(_cap_owner{copy.value});
             if (!cap_idx) return cap_idx.error();
             payload.data.cap(name, *cap_idx);
         }
         if (job.stages.size() == 1) {
-            const auto cap = sys::cap_duplicate(job.terminal_connector.selector(), env_.cspace, RIGHT_SEND | RIGHT_DUPLICATE);
+            const auto cap = _cap_duplicate(job.terminal_connector.selector(), env_.cspace, RIGHT_SEND | RIGHT_DUPLICATE);
             if (cap.status != STATUS_OK) return cap.status;
-            const auto term_idx = payload.offer(cap_owner{cap.value}, RIGHT_SEND | RIGHT_DUPLICATE);
+            const auto term_idx = payload.offer(_cap_owner{cap.value}, RIGHT_SEND | RIGHT_DUPLICATE);
             if (!term_idx) return term_idx.error();
             payload.data.cap("terminal", *term_idx);
         }
@@ -247,14 +247,14 @@ class sh_shell {
     }
 
 public:
-    explicit sh_shell(const rt_env& env) : env_(env) {
-        auto status = bus_.bind(env.environment); if (status != STATUS_OK) sys::exit(status);
-        status = bus_.invoke("Receive", {}, setup_); if (status != STATUS_OK) sys::exit(status);
+    explicit sh_shell(const _env& env) : env_(env) {
+        auto status = bus_.bind(env.bootstrap); if (status != STATUS_OK) _thread_exit(status);
+        status = bus_.invoke("Receive", {}, setup_); if (status != STATUS_OK) _thread_exit(status);
         input_cap_ = setup_.capability(setup_.data["message"]["stdin"]);
         output_cap_ = setup_.capability(setup_.data["message"]["stdout"]);
-        status = input_.open(input_cap_, rt_events()); if (status != STATUS_OK) sys::exit(status);
-        status = owner_.open(); if (status != STATUS_OK) sys::exit(status);
-        if (const auto status = owner_.attach(bus_); status != STATUS_OK) sys::exit(status);
+        status = input_.open(input_cap_, &_events()); if (status != STATUS_OK) _thread_exit(status);
+        status = owner_.open(); if (status != STATUS_OK) _thread_exit(status);
+        if (const auto status = owner_.attach(bus_); status != STATUS_OK) _thread_exit(status);
     }
     void prompt() {
         if (!line_start_ && !prompt_visible_) enqueue("\n");
@@ -282,8 +282,8 @@ public:
         for (auto& stage : job.stages) if (stage.task()) (void)stage.task()->retire();
     }
     void pump(bool sleep = true) {
-        bool polling{}, progress{};
-        if (const auto status = owner_.poll(); status != STATUS_OK) sys::exit(status);
+        bool progress{};
+        if (const auto status = owner_.poll(); status != STATUS_OK) _thread_exit(status);
         auto deadline = owner_.deadline();
         for (auto& entry : pipelines_) {
             auto& job = *entry;
@@ -291,31 +291,37 @@ public:
             for (size_t i = 0; i < job.stages.size(); ++i) {
                 auto& stage = job.stages[i];
                 if (stage.task()) {
-                    if (job.execution && !stage.task()->closing()) {
-                        const auto state = stage.task()->execution_info();
+                    if (job.execution && !stage.task()->stopping()) {
+                        const auto facts = _source_info(stage.task()->domain());
+                        const auto state = _cap_copy<DomainInfo>(_domain_info(stage.task()->domain()));
                         const bool applied = state && state->requested == state->applied
                             && bool(state->flags & DOMAIN_ENABLED) == *job.execution && state->status == STATUS_OK;
                         suspended &= applied;
                         if (state && state->phase == DOMAIN_OPEN && !applied) {
-                            const auto status = stage.task()->execution(*job.execution).status;
+                            const auto status = _domain_execution(stage.task()->domain(), *job.execution).status;
                             if (status != STATUS_OK && status != STATUS_BUSY) terminate(job);
                         }
-                    }
-                    polling |= stage.task()->polling();
-                }
+                        if (!applied) {
+                            auto status = stage.domain_ready ? STATUS_OK
+                                : stage.domain_ready.open(&_events(), stage.task()->domain(), 0, 0, WATCH_CHANGED);
+                            if (status == STATUS_OK) status = facts.status == STATUS_OK ? stage.domain_ready.arm(facts.value2).status : facts.status;
+                            if (status != STATUS_OK) terminate(job);
+                        } else if (const auto status = stage.domain_ready.close(); status != STATUS_OK) _thread_exit(status);
+                    } else if (const auto status = stage.domain_ready.close(); status != STATUS_OK) _thread_exit(status);
+                } else if (const auto status = stage.domain_ready.close(); status != STATUS_OK) _thread_exit(status);
                 if (stage.child && !stage.task() && !stage.result) {
                     stage.result = stage.child->result; stage.end = i + 1 < job.stages.size(); progress = true;
-                    if (i) (void)sys::channel_close(job.pipes[i - 1]->ends[0].selector());
+                    if (i) (void)_channel_close(job.pipes[i - 1]->ends[0].selector());
                 }
                 if (stage.end) {
                     const auto status = sh_send(stage.end_sender.selector(), {.status = *stage.result}, false);
                     if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
                         const auto armed = stage.end_ready ? stage.end_ready.arm().status
-                            : stage.end_ready.open(rt_events(), stage.end_sender.selector(), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
-                        if (armed != STATUS_OK) sys::exit(armed);
+                            : stage.end_ready.open(&_events(), stage.end_sender.selector(), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+                        if (armed != STATUS_OK) _thread_exit(armed);
                     } else {
                         stage.end = false; progress = true;
-                        if (const auto closed = stage.end_ready.close(); closed != STATUS_OK) sys::exit(closed);
+                        if (const auto closed = stage.end_ready.close(); closed != STATUS_OK) _thread_exit(closed);
                     }
                 }
                 done &= !stage.task() && !stage.end;
@@ -336,11 +342,11 @@ public:
                 const auto status = ubus_send(job.terminal_sender.selector(), *job.focus_event, false);
                 if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
                     const auto armed = job.terminal_ready ? job.terminal_ready.arm().status
-                        : job.terminal_ready.open(rt_events(), job.terminal_sender.selector(), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
-                    if (armed != STATUS_OK) sys::exit(armed);
+                        : job.terminal_ready.open(&_events(), job.terminal_sender.selector(), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+                    if (armed != STATUS_OK) _thread_exit(armed);
                 } else {
                     job.focus_event.reset();
-                    if (const auto closed = job.terminal_ready.close(); closed != STATUS_OK) sys::exit(closed);
+                    if (const auto closed = job.terminal_ready.close(); closed != STATUS_OK) _thread_exit(closed);
                     if (status != STATUS_OK) job.terminal_sender = {};
                     progress = true;
                 }
@@ -364,14 +370,14 @@ public:
                 const auto status = sh_send(job.input_sender.selector(), job.pending_input.front(), false);
                 if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
                     const auto armed = job.input_ready ? job.input_ready.arm().status
-                        : job.input_ready.open(rt_events(), job.input_sender.selector(), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
-                    if (armed != STATUS_OK) sys::exit(armed);
+                        : job.input_ready.open(&_events(), job.input_sender.selector(), SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+                    if (armed != STATUS_OK) _thread_exit(armed);
                     break;
                 }
                 job.pending_input.pop_front(); progress = true;
             }
             if (job.pending_input.empty())
-                if (const auto status = job.input_ready.close(); status != STATUS_OK) sys::exit(status);
+                if (const auto status = job.input_ready.close(); status != STATUS_OK) _thread_exit(status);
             if (done && job.output_empty && job.state != sh_state::Done) {
                 leave(job); job.state = sh_state::Done; progress = true;
             }
@@ -385,7 +391,7 @@ public:
             sh_chunk frame;
             const auto status = io_recv(input_, frame);
             if (status == STATUS_WOULD_BLOCK) break;
-            if (status != STATUS_OK) sys::exit(status);
+            if (status != STATUS_OK) _thread_exit(status);
             progress = true;
             for (size_t i = 0; i < frame.size; ++i) input(frame.data[i]);
         }
@@ -396,28 +402,23 @@ public:
             const auto status = next.tx->send(output_cap_, next.frame, false);
             if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
                 if (next.tx->active()) {
-                    if (const auto closed = output_ready_.close(); closed != STATUS_OK) sys::exit(closed);
+                    if (const auto closed = output_ready_.close(); closed != STATUS_OK) _thread_exit(closed);
                     break;
                 }
                 const auto armed = output_ready_ ? output_ready_.arm().status
-                    : output_ready_.open(rt_events(), output_cap_, SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
-                if (armed != STATUS_OK) sys::exit(armed);
+                    : output_ready_.open(&_events(), output_cap_, SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+                if (armed != STATUS_OK) _thread_exit(armed);
                 break;
             }
-            if (status != STATUS_OK) sys::exit(status);
+            if (status != STATUS_OK) _thread_exit(status);
             output_tx_ = std::move(next.tx); output_.pop_front(); progress = true;
         }
         if (output_.empty())
-            if (const auto status = output_ready_.close(); status != STATUS_OK) sys::exit(status);
+            if (const auto status = output_ready_.close(); status != STATUS_OK) _thread_exit(status);
         (void)input_.arm();
         for (auto& entry : pipelines_) { (void)entry->terminal.arm(); (void)entry->output_rx.arm(); }
         if (sleep && !command_ && !progress) {
-            // Successful executions use Exit/Scope/Quota notifications.
-            if (polling) {
-                const auto next = rt_after_ms(1).value_or(0);
-                if (next && (!deadline || next < deadline)) deadline = next;
-            }
-            (void)ev_wait(rt_events(), deadline);
+            (void)_ev_wait(&_events(), deadline);
         }
     }
     auto read() -> std::string {
@@ -437,13 +438,13 @@ public:
         if (status == STATUS_OK) status = job.output.open(env_.alloc(), 8, 3);
         if (status == STATUS_OK) status = job.terminal.open(8);
         if (status == STATUS_OK) {
-            const auto input = sys::channel_mint(job.input.ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
-            job.input_sender = cap_owner{input.value}; status = input.status;
+            const auto input = _channel_mint(job.input.ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
+            job.input_sender = _cap_owner{input.value}; status = input.status;
         }
         if (status == STATUS_OK) status = job.terminal.add("Fullscreen", {{"events", ubus_type::Cap}}, {},
             [this, &job](auto& request, auto&) {
                 auto endpoint = request.take(request.data["events"]);
-                const auto state = sys::source_info(endpoint.selector(), SOURCE_WRITE);
+                const auto state = _source_info(endpoint.selector(), SOURCE_WRITE);
                 if (state.status != STATUS_OK || (state.value & SOURCE_TERMINAL)) return STATUS_BAD_ARGS;
                 if (const auto status = job.terminal_ready.close(); status != STATUS_OK) return status;
                 job.terminal_sender = std::move(endpoint); job.fullscreen = true;
@@ -463,13 +464,13 @@ public:
             auto connector = job.terminal.connector();
             if (!connector) status = connector.error(); else job.terminal_connector = std::move(*connector);
         }
-        if (status == STATUS_OK) status = job.output_rx.open(job.output.ends[1].selector(), rt_events());
+        if (status == STATUS_OK) status = job.output_rx.open(job.output.ends[1].selector(), &_events());
         for (size_t i = 1; i < job.stages.size() && status == STATUS_OK; ++i) {
-            auto& pipe = job.pipes.emplace_back(std::make_unique<ch_pair>());
+            auto& pipe = job.pipes.emplace_back(std::make_unique<_ch_pair>());
             status = pipe->open(env_.alloc(), 4, 3);
             if (status == STATUS_OK) {
-                const auto end = sys::channel_mint(pipe->ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
-                job.stages[i - 1].end_sender = cap_owner{end.value}; status = end.status;
+                const auto end = _channel_mint(pipe->ends[0].selector(), env_.cspace, 1, RIGHT_SEND);
+                job.stages[i - 1].end_sender = _cap_owner{end.value}; status = end.status;
             }
         }
         if (status != STATUS_OK) return status;
@@ -522,7 +523,7 @@ public:
             return target->state == sh_state::Done ? collect(*target) : STATUS_OK;
         }
         while (target->state != sh_state::Done) {
-            if (deadline && sys::clock_now().value >= deadline) return STATUS_TIMED_OUT;
+            if (deadline && _clock_now().value >= deadline) return STATUS_TIMED_OUT;
             pump();
         }
         const auto result = collect(*target);
@@ -658,7 +659,7 @@ static void command(sh_shell& shell, std::string text) {
             id = *number;
             if (name == "wait" && split != tail.npos) {
                 const auto duration = libk::parse<uint64_t>(tail.substr(split + 1));
-                const auto time = duration ? rt_after_ms(*duration) : std::nullopt;
+                const auto time = duration ? _after(std::chrono::milliseconds{*duration}) : std::nullopt;
                 if (!time) { error(console, STATUS_BAD_ARGS); return; }
                 deadline = *time;
             }
@@ -685,7 +686,7 @@ static void command(sh_shell& shell, std::string text) {
 }
 
 int main() {
-    const auto& info = rt_startup();
+    const auto& info = _startup();
     sh_shell shell{info};
     shell.prompt();
     for (;;) {

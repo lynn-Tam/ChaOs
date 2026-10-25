@@ -5,7 +5,7 @@ static std::array<uint8_t, io_limit> scratch;
 static ubus_object directory{"io.block"};
 struct blk_cmd { blk_op kind; uint64_t offset{}; ubus_buffer buffer{}; uint64_t deadline{}; };
 struct blk_client {
-    vm_ptr<blk_client> next;
+    _vm_ptr<blk_client> next;
     ubus_object object;
     ubus_queue<blk_cmd, blk_dev::Depth> queue;
     std::optional<ubus_request> closing;
@@ -13,10 +13,10 @@ struct blk_client {
     void stop() { stopped = failed = true; queue.stop(); }
     void finish(ubus_ticket ticket, status_t status, uint64_t count = 0) {
         ubus_msg reply; reply.status = status; reply.data.put("bytes", count);
-        if (!queue.finish(ticket, std::move(reply))) sys::exit(STATUS_INTERNAL);
+        if (!queue.finish(ticket, std::move(reply))) _thread_exit(STATUS_INTERNAL);
     }
 };
-static vm_ptr<blk_client> clients;
+static _vm_ptr<blk_client> clients;
 struct blk_pending { blk_client* client{}; ubus_ticket ticket{}; uint64_t gen{}; };
 static std::array<blk_pending, blk_dev::Depth> pending;
 struct blk_flush { blk_client* client{}; ubus_ticket ticket{}; bool submitted{}; };
@@ -24,7 +24,7 @@ static blk_flush flush;
 
 static auto open(ubus_request& request, ubus_msg& response) -> status_t {
     const auto budget = request.capability(request.data["budget"]);
-    auto storage = vm_new<blk_client>({budget ? budget : rt_startup().quota, rt_startup().scope});
+    auto storage = _vm_new<blk_client>({budget ? budget : _startup().quota, _startup().scope});
     if (!storage) return storage.error();
     auto client = std::move(*storage);
     auto& object = client->object;
@@ -66,9 +66,9 @@ static auto slot() -> size_t {
     return index;
 }
 int main() {
-    const auto& env = rt_startup();
+    const auto& env = _startup();
     ubus_conn parent;
-    auto status = parent.bind(env.environment); if (status != STATUS_OK) return status;
+    auto status = parent.bind(env.bootstrap); if (status != STATUS_OK) return status;
     std::vector<ubus_msg> setup;
     bool more{};
     do {
@@ -119,8 +119,8 @@ int main() {
             if (status == STATUS_OK && (command->kind == blk_op::Read || command->kind == blk_op::Identify)) {
                 if (completion.size > command->buffer.size) return STATUS_INTERNAL;
                 auto* call = client.queue.call(operation.ticket);
-                status = mem_write(call->capability(call->data["buffer"]), command->buffer.offset,
-                    std::as_bytes(std::span{completion.data, completion.size}));
+                status = _mem_write(call->capability(call->data["buffer"]), command->buffer.offset,
+                    std::as_bytes(std::span{completion.data, completion.size})).status;
             }
             client.finish(operation.ticket, status, status == STATUS_OK ? completion.size : 0);
             if (flush.client == operation.client && flush.submitted && flush.ticket.id == operation.ticket.id) flush = {};
@@ -128,7 +128,7 @@ int main() {
         }
         if (flush.client && !flush.submitted) {
             auto& client = *flush.client;
-            status = client.failed || client.queue.cancelled(flush.ticket) ? STATUS_CANCELED : rt_admit(client.queue.request(flush.ticket)->deadline);
+            status = client.failed || client.queue.cancelled(flush.ticket) ? STATUS_CANCELED : _deadline_status(client.queue.request(flush.ticket)->deadline);
             if (status != STATUS_OK) { client.finish(flush.ticket, status); flush = {}; }
             else if (!device.active()) {
                 const auto index = slot();
@@ -148,14 +148,14 @@ int main() {
                 ubus_ticket ticket;
                 if (client->queue.admit(ticket) != ubus_admission::Ready) continue;
                 const auto& command = *client->queue.request(ticket);
-                status = client->queue.cancelled(ticket) ? STATUS_CANCELED : rt_admit(command.deadline);
+                status = client->queue.cancelled(ticket) ? STATUS_CANCELED : _deadline_status(command.deadline);
                 if (status == STATUS_OK && command.kind == blk_op::Flush) { flush = {client, ticket, false}; again = true; break; }
                 auto& operation = pending[index];
                 if (status == STATUS_OK && !client->queue.commit(ticket)) status = STATUS_CANCELED;
                 if (status == STATUS_OK && command.kind == blk_op::Write) {
                     auto* call = client->queue.call(ticket);
-                    status = mem_read(call->capability(call->data["buffer"]), command.buffer.offset,
-                        std::as_writable_bytes(std::span{scratch}.first(command.buffer.size)));
+                    status = _mem_read(call->capability(call->data["buffer"]), command.buffer.offset,
+                        std::as_writable_bytes(std::span{scratch}.first(command.buffer.size))).status;
                 }
                 if (status == STATUS_OK) status = device.submit({index, ++operation.gen}, command.kind,
                     command.offset, command.buffer.size, command.kind == blk_op::Write ? scratch.data() : nullptr);
@@ -179,7 +179,7 @@ int main() {
         status = directory.arm(); if (status != STATUS_OK) return status;
         if (!again) {
             const auto due = flush.client && !flush.submitted ? flush.client->queue.request(flush.ticket)->deadline : 0;
-            status = ev_wait(rt_events(), due).status;
+            status = _ev_wait(&_events(), due).status;
             if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
         }
     }

@@ -12,7 +12,7 @@ inline constexpr auto mgr_state_name(mgr_state state) -> std::string_view {
     return names[std::to_underlying(state)];
 }
 // Native and public deployments use the same complete recipe at admission.
-auto mgr_recipe(std::string_view name, std::string_view program, proc_quota = {}) -> ubus_msg;
+auto mgr_recipe(std::string_view name, std::string_view program, _proc_limits = {}) -> ubus_msg;
 
 // One deployment owns its environment, immutable recipe and current execution.
 // Scope is always owned, never an optional external lifetime patch.
@@ -34,22 +34,28 @@ public:
     const uint64_t child_id;
     const std::string name;
     uint64_t run_id{}, version{1}, environment{};
-    proc_auth auth{};
-    cap_owner scope;
-    ev_watch retired;
+    _proc_auth auth{};
+    _cap_owner scope;
+    _ev_watch retired;
     // The hardware owner may supply fresh per-run grants before construction.
     // They are execution obligations, never a second deployment recipe.
     ubus_msg startup;
-    cap_owner observe, manage, root_scope;
+    _cap_owner observe, manage, root_scope;
     uint64_t root_version{}, started{};
-    vm_area source;
-    std::function<std::expected<proc_image, status_t>()> loading;
+    _vm_area source;
+    std::function<std::expected<_proc_image, status_t>()> loading;
     struct snapshot { uint64_t version{}; bool replayable{}, active{}; ubus_msg recipe; };
     std::map<std::string, snapshot, std::less<>> snapshots;
     std::deque<ubus_msg> inbox;
     bool received{}, desired{}, relaunch{}, removing{}, reusable{true};
-    std::unique_ptr<proc_task> task;
+    struct cpu_sample {
+        uint64_t at{}; status_t status{};
+        std::pair<uint64_t, std::vector<uint64_t>> value;
+        auto sample(const _proc&, word_t) -> std::expected<std::pair<uint64_t, std::vector<uint64_t>>, status_t>;
+    } cpu;
+    std::unique_ptr<_proc> task;
     mgr_state state{mgr_state::Idle};
+    bool auto_retire{true};
     status_t result{};
 };
 
@@ -57,8 +63,8 @@ class mgr {
     struct publication {
         uint64_t id{}, owner{}, run_id{}, version{};
         std::string name, interface;
-        cap_owner connector;
-        ev_watch terminal;
+        _cap_owner connector;
+        _ev_watch terminal;
     };
     struct pending {
         enum kind { Get, Receive, Send, Changed, Configure, Spawn, Action } operation{};
@@ -67,15 +73,15 @@ class mgr {
         ubus_request request;
         ubus_msg staged, response;
         word_t control{};
-        ev_watch terminal;
-        std::array<ev_watch, 2> changes;
+        _ev_watch terminal;
+        std::array<_ev_watch, 2> changes;
         std::unique_ptr<ubus_conn> relay;
         bool introduced{};
     };
     struct loan {
         uint64_t source{}, run_id{}, authority{};
-        cap_owner quota;
-        ev_watch drained{};
+        _cap_owner quota;
+        _ev_watch drained{};
     };
     std::map<uint64_t, loan> loans_;
     uint64_t next_loan_{};
@@ -89,19 +95,19 @@ class mgr {
         word_t rights{};
         bool closed{}, staged{};
         uint64_t grant{};
-        ev_watch drained{};
+        _ev_watch drained{};
     };
     std::map<word_t, facet> facets_;
     ubus_object object_{"ubus.environment", 3, 0,
         [this](word_t facet, std::string_view method) { return access(facet, method); }};
     uint64_t next_{}, next_badge_{3}, next_publication_{}, identity_{}, cspace_id_{}, epoch_{1}, deadline_{};
     size_t capacity_{128};
-    std::function<std::expected<proc_image, status_t>(mgr_child&)> load_;
+    std::function<std::expected<_proc_image, status_t>(mgr_child&)> load_;
     auto environment(word_t) -> mgr_child*;
     auto live(word_t) -> bool;
     auto descends(word_t, word_t) const -> bool;
     auto access(word_t, std::string_view) -> status_t;
-    auto issue(word_t parent, word_t rights, uint64_t target = 0, uint64_t run_id = 0, bool independent = false, word_t* issued = nullptr) -> std::expected<cap_owner, status_t>;
+    auto issue(word_t parent, word_t rights, uint64_t target = 0, uint64_t run_id = 0, bool independent = false, word_t* issued = nullptr) -> std::expected<_cap_owner, status_t>;
     auto reserve_reply(ubus_request&, ubus_msg&, word_t) -> std::expected<word_t, status_t>;
     void reply(mgr_child&, ubus_msg&, word_t);
     auto admit(const ubus_request&) -> status_t;
@@ -112,17 +118,17 @@ class mgr {
     auto cycle(uint64_t from, uint64_t target) const -> bool;
     void withdraw(mgr_child&);
 public:
-    explicit mgr(std::function<std::expected<proc_image, status_t>(mgr_child&)> load) : load_(std::move(load)) {}
+    explicit mgr(std::function<std::expected<_proc_image, status_t>(mgr_child&)> load) : load_(std::move(load)) {}
     auto configure(ubus_msg recipe, bool spawn = false, bool validate = false) -> std::expected<std::shared_ptr<mgr_child>, status_t>;
     auto recover(std::function<std::expected<ubus_msg, status_t>(ubus_msg)> = {}) -> status_t;
     auto start(mgr_child&) -> status_t;
     auto poll() -> status_t;
     auto open() -> status_t;
     auto attach(ubus_conn&) -> status_t;
-    auto connector(word_t rights = mgr_observe | mgr_control) -> std::expected<cap_owner, status_t> { return issue(3, rights); }
+    auto connector(word_t rights = mgr_observe | mgr_control) -> std::expected<_cap_owner, status_t> { return issue(3, rights); }
     auto deadline() const -> uint64_t { return deadline_; }
     auto object() -> ubus_object& { return object_; }
-    auto lookup(std::string_view name) -> std::expected<cap_owner, status_t>;
+    auto lookup(std::string_view name) -> std::expected<_cap_owner, status_t>;
     auto known(std::string_view name) const -> bool { return revisions_.contains(name); }
     auto children() const -> const auto& { return children_; }
     auto action(mgr_child&, std::string_view) -> status_t;

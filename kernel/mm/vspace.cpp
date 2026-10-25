@@ -32,19 +32,20 @@ auto status(VSpaceError error) noexcept -> status_t {
     case VSpaceError::NotMapped:
         return STATUS_NOT_FOUND;
     case VSpaceError::InvalidRange:
-    case VSpaceError::Overlap:
     case VSpaceError::NotRam:
         return STATUS_BAD_ARGS;
     case VSpaceError::OutOfMemory:
-    case VSpaceError::QuotaExceeded:
-    case VSpaceError::GenerationExhausted:
         return STATUS_NO_MEMORY;
     case VSpaceError::Canceled:
         return STATUS_CANCELED;
     case VSpaceError::Contended:
         return STATUS_RETRY;
     case VSpaceError::ResourceExhausted:
-        return STATUS_NO_MEMORY;
+    case VSpaceError::QuotaExceeded:
+    case VSpaceError::GenerationExhausted:
+        return STATUS_EXHAUSTED;
+    case VSpaceError::Overlap: return STATUS_CONFLICT;
+    case VSpaceError::Stale: return STATUS_STALE;
     case VSpaceError::InvalidState:
     case VSpaceError::Busy:
     case VSpaceError::GrantUnavailable:
@@ -442,7 +443,7 @@ void VSpace::advance_exec() noexcept {
 }
 
 auto VSpace::can_destroy_object(cap::VmLimit auth) const noexcept -> bool {
-    return auth.range.contains(VRange{va_t{UserBegin}, UserEnd - UserBegin});
+    return !auth.claim() && auth.range.contains(VRange{va_t{UserBegin}, UserEnd - UserBegin});
 }
 
 auto VSpace::root() noexcept -> Root {
@@ -507,7 +508,7 @@ auto VSpace::inspect(VRange scope, va_t cursor) const noexcept -> std::expected<
     if (!end || cursor < scope.base() || cursor >= *end || cursor.raw() % page_size)
         return std::unexpected(VSpaceError::InvalidRange);
     VmRecords info{};
-    info.version = 1; info.size = sizeof(info);
+    info.version = 2; info.size = sizeof(info);
     auto* map = layout_.lower_bound(cursor);
     if (!map || map->range_.base() > cursor) {
         auto* previous = map ? layout_.previous(*map) : layout_.maximum();
@@ -517,7 +518,7 @@ auto VSpace::inspect(VRange scope, va_t cursor) const noexcept -> std::expected<
         const auto first = std::max(cursor.raw(), map->range_.base().raw());
         const auto last = std::min({map->range_.limit()->raw(), end->raw(), first + 64 * page_size});
         auto& row = info.records[info.count++];
-        row.address = first; row.bytes = last - first; row.perms = map->perms_.raw();
+        row.claim = map->claim_; row.address = first; row.bytes = last - first; row.perms = map->perms_.raw();
         row.kind = map->kind_ == MapKind::Map ? VM_RECORD_MAP
             : map->kind_ == MapKind::Reserved ? VM_RECORD_RESERVED : VM_RECORD_GUARD;
         if (map->binding_ && map->binding_->memory_->managed()) {
@@ -567,6 +568,37 @@ void VSpace::detach_mapping(Map& mapping) noexcept {
 }
 
 void VSpace::destroy_layout(Map& node) noexcept {
+    if (node.restore_) {
+        if (auto* binding = node.binding_) {
+            binding->mappings_.erase(node);
+            if (binding->mappings_.empty()) queue_binding(*binding);
+            else if (!binding->private_write_) {
+                u8 bits{};
+                for (const auto& map : binding->mappings_) bits |= map.perms_.raw();
+                libk_assert(binding->memory_->protect(binding->memory_attachment_, Perms::from_raw(bits)));
+            }
+            node.binding_ = nullptr;
+        }
+        node.kind_ = MapKind::Reserved; node.perms_ = {}; node.ceiling_ = {};
+        node.object_ = {}; node.restore_ = false;
+        // Never merge records while an edit cursor still borrows them.
+        if (!active_->edit_) {
+            auto* next = layout_.lower_bound(node.range_.base());
+            auto* previous = next ? layout_.previous(*next) : layout_.maximum();
+            if (previous && previous->kind_ == MapKind::Reserved && previous->claim_ == node.claim_
+                && *previous->range_.limit() == node.range_.base()) {
+                node.range_ = {previous->range_.base(), previous->range_.size() + node.range_.size()};
+                unlink(*previous); mappings_.destroy(*previous);
+            }
+            if (next && next->kind_ == MapKind::Reserved && next->claim_ == node.claim_
+                && *node.range_.limit() == next->range_.base()) {
+                node.range_ = {node.range_.base(), node.range_.size() + next->range_.size()};
+                unlink(*next); mappings_.destroy(*next);
+            }
+        }
+        link(node);
+        return;
+    }
     if (node.binding_)
         detach_mapping(node);
     else
@@ -715,9 +747,9 @@ auto VSpace::find(VRange range) noexcept -> Map* {
 
 auto VSpace::overlap(VRange range) noexcept -> Map* {
     auto* n = layout_.lower_bound(range.base());
-    if (n && n->range_.intersects(range)) return n;
     auto* prev = n ? layout_.previous(*n) : layout_.maximum();
-    return prev && prev->range_.intersects(range) ? prev : nullptr;
+    if (prev && prev->range_.intersects(range)) return prev;
+    return n && n->range_.intersects(range) ? n : nullptr;
 }
 
 auto VSpace::begin_edit(VRange range, bool empty) noexcept -> std::expected<void, VSpaceError> {
@@ -743,14 +775,14 @@ void VSpace::end_edit() noexcept {
     else settle();
 }
 
-auto VSpace::reserve(VRange range, bool guard) noexcept -> std::expected<void, VSpaceError> {
+auto VSpace::reserve_guard(VRange range) noexcept -> std::expected<void, VSpaceError> {
     {
         sync::Lock lock{lock_};
         auto admitted = begin_edit(range, true);
         if (!admitted) return std::unexpected(admitted.error());
     }
     Edit edit{this};
-    auto made = mappings_.create(quota_, range, guard ? MapKind::Guard : MapKind::Reserved);
+    auto made = mappings_.create(quota_, range, MapKind::Guard);
     if (!made) return std::unexpected(node_error(made.error()));
     auto rollback = libk::scope_exit{[&]() noexcept { mappings_.destroy(*made->object); }};
     sync::Lock lock{lock_};
@@ -758,6 +790,120 @@ auto VSpace::reserve(VRange range, bool guard) noexcept -> std::expected<void, V
     link(*made->object);
     rollback.release();
     return {};
+}
+
+// Called under the editing claim: layout is stable across metadata allocation.
+auto VSpace::reserved(VRange range, u64 claim) noexcept -> bool {
+    auto address = range.base();
+    for (auto* map = overlap(range); map && address < *range.limit(); map = layout_.next(*map)) {
+        if (map->claim_ != claim || map->kind_ != MapKind::Reserved || map->range_.base() > address)
+            return false;
+        address = *map->range_.limit();
+    }
+    return address >= *range.limit();
+}
+
+auto VSpace::fill(Map& target, u64 claim, VmCtx ctx) noexcept -> std::expected<void, VSpaceError> {
+    auto* first = overlap(target.range_);
+    libk_assert(first && reserved(target.range_, claim));
+    auto* last = first;
+    while (*last->range_.limit() < *target.range_.limit()) last = layout_.next(*last);
+    std::array<Map*, 2> tails{};
+    libk::scope_exit rollback{[&]() noexcept { for (auto* tail : tails) if (tail) mappings_.destroy(*tail); }};
+    const VRange ranges[]{
+        {first->range_.base(), target.range_.base().raw() - first->range_.base().raw()},
+        {*target.range_.limit(), last->range_.limit()->raw() - target.range_.limit()->raw()}};
+    for (usize i = 0; i < 2; ++i) if (!ranges[i].empty()) {
+        auto made = make_fragment(i ? *last : *first, ranges[i], {});
+        if (!made) return std::unexpected(made.error());
+        tails[i] = *made;
+    }
+    sync::Lock lock{lock_};
+    if (state_ != VSpaceState::Live || (target.binding_ && target.binding_->invalid()))
+        return std::unexpected(VSpaceError::InvalidState);
+    if (auto accepted = accept(ctx); !accepted) return std::unexpected(accepted.error());
+    for (auto* map = first;;) {
+        auto* next = layout_.next(*map);
+        const bool done = map == last;
+        unlink(*map); mappings_.destroy(*map);
+        if (done) break;
+        map = next;
+    }
+    for (auto* tail : tails) if (tail) link(*tail);
+    target.claim_ = claim;
+    if (target.binding_) target.binding_->mappings_.push_back(target);
+    link(target); rollback.release();
+    return {};
+}
+
+auto VSpace::guard(cap::VmLimit auth, VRange range) noexcept -> std::expected<void, VSpaceError> {
+    if (!auth.range.contains(range)) return std::unexpected(VSpaceError::InvalidAuthority);
+    if (!auth.claim()) return reserve_guard(range);
+    {
+        sync::Lock lock{lock_};
+        auto admitted = begin_edit(range, false);
+        if (!admitted) return std::unexpected(admitted.error());
+        if (!reserved(range, auth.claim())) { editing_ = false; return std::unexpected(VSpaceError::Stale); }
+    }
+    Edit edit{this};
+    auto made = mappings_.create(quota_, range, MapKind::Guard);
+    if (!made) return std::unexpected(node_error(made.error()));
+    auto filled = fill(*made->object, auth.claim());
+    if (!filled) mappings_.destroy(*made->object);
+    return filled;
+}
+
+auto VSpace::reserve(const VmAlloc& req, cap::VmLimit auth,
+                     libk::delegate<status_t(cap::VmLimit)> publish) noexcept
+    -> std::expected<cap::VmLimit, status_t> {
+    const auto alignment = req.alignment ? req.alignment : page_size;
+    if (req.version != VM_ALLOC_VERSION || req.size != sizeof(req) || auth.claim()
+        || !req.bytes || req.bytes % page_size || alignment < page_size || (alignment & (alignment - 1))
+        || (req.perms & ~(VM_READ | VM_WRITE | VM_EXECUTE))
+        || !valid_perms(Perms::from_raw(req.perms)) || !auth.perms().contains(Perms::from_raw(req.perms))) return std::unexpected(STATUS_BAD_ARGS);
+    VRange range{};
+    u64 claim{};
+    {
+        sync::Lock lock{lock_};
+        if (state_ != VSpaceState::Live) return std::unexpected(STATUS_CLOSED);
+        if (editing_ || draining_ || active_) return std::unexpected(STATUS_RETRY);
+        auto address = req.address;
+        if (!address) {
+            const auto lower = std::max({req.lower, auth.range.base().raw(), UserBegin});
+            const auto upper = std::min({req.upper, auth.range.limit()->raw(), UserEnd});
+            if (lower > UINT64_MAX - (alignment - 1)) return std::unexpected(STATUS_BAD_ARGS);
+            address = (lower + alignment - 1) & ~(alignment - 1);
+            auto* map = layout_.lower_bound(va_t{address});
+            auto* previous = map ? layout_.previous(*map) : layout_.maximum();
+            if (previous && previous->range_.limit()->raw() > address) map = previous;
+            for (; map && address < upper && req.bytes <= upper - address; map = layout_.next(*map)) {
+                if (address + req.bytes <= map->range_.base().raw()) break;
+                const auto end = map->range_.limit()->raw();
+                if (end <= address) continue;
+                if (end > UINT64_MAX - (alignment - 1)) return std::unexpected(STATUS_EXHAUSTED);
+                address = (end + alignment - 1) & ~(alignment - 1);
+            }
+            if (address >= upper || req.bytes > upper - address) return std::unexpected(STATUS_EXHAUSTED);
+        }
+        range = {va_t{address}, req.bytes};
+        if (address % alignment || !valid_user_range(range) || !auth.range.contains(range))
+            return std::unexpected(STATUS_BAD_ARGS);
+        if (overlap(range)) return std::unexpected(STATUS_CONFLICT);
+        if (next_claim_ > cap::VmLimit::max_claim) return std::unexpected(STATUS_EXHAUSTED);
+        claim = next_claim_++; editing_ = true;
+    }
+    Edit edit{this};
+    auto made = mappings_.create(quota_, range, MapKind::Reserved);
+    if (!made) return std::unexpected(status(node_error(made.error())));
+    libk::scope_exit rollback{[&]() noexcept { mappings_.destroy(*made->object); }};
+    const cap::VmLimit result{range, Perms::from_raw(req.perms), claim};
+    // Publication checks the source Grant again. Competing VM operations are
+    // excluded until the returned selector and its layout record both exist.
+    if (const auto status = publish(result); status != STATUS_OK) return std::unexpected(status);
+    sync::Lock lock{lock_};
+    made->object->claim_ = claim;
+    link(*made->object); rollback.release();
+    return result;
 }
 
 Borrow::~Borrow() noexcept { libk_assert(!hook_.is_linked() && idle()); }
@@ -955,10 +1101,10 @@ void VSpace::retire_table(Flush& retire, OwnedPage&& page) noexcept {
     libk_assert(retire.adopt(std::move(page), std::move(usage)));
 }
 
-auto VSpace::map(VmCtx ctx, MapReq request, object::ref<> ref, Mem& mem, cap::MemLimit auth) noexcept
+auto VSpace::map(VmCtx ctx, MapReq request, object::ref<> ref, Mem& mem, cap::MemLimit auth, u64 claim) noexcept
     -> std::expected<MapResult, VSpaceError> {
     return map_impl(ctx, request, std::move(ref), mem, auth,
-                    Perms::of(Perm::Read, Perm::Write, Perm::Execute), nullptr);
+                    Perms::of(Perm::Read, Perm::Write, Perm::Execute), nullptr, claim);
 }
 
 auto VSpace::map(VmCtx ctx, cap::VmLimit where, MapReq request, cap::Resolved<Mem>& mem) noexcept
@@ -966,19 +1112,23 @@ auto VSpace::map(VmCtx ctx, cap::VmLimit where, MapReq request, cap::Resolved<Me
     auto view = mem.view();
     auto* auth = std::get_if<cap::MemLimit>(&view.data);
     if (!auth || !view.rights.contains(cap::Right::Map) || !where.range.contains(request.virtual_range) ||
-        !where.perms.contains(request.perms))
+        !where.perms().contains(request.perms))
         return std::unexpected(VSpaceError::InvalidAuthority);
     auto ref = mem.reference();
     if (!ref) return std::unexpected(VSpaceError::InvalidState);
-    return map_impl(ctx, request, std::move(*ref), mem.object(), *auth, where.perms, &mem);
+    return map_impl(ctx, request, std::move(*ref), mem.object(), *auth, where.perms(), &mem, where.claim());
 }
 
 auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& memory,
-                      cap::MemLimit mem_auth, Perms vspace_access, cap::Resolved<Mem>* capability) noexcept
+                      cap::MemLimit mem_auth, Perms vspace_access, cap::Resolved<Mem>* capability, u64 claim) noexcept
     -> std::expected<MapResult, VSpaceError> {
     {
         sync::Lock lock{lock_};
-        auto admitted = begin_edit(request.virtual_range, true);
+        auto admitted = begin_edit(request.virtual_range, !claim);
+        if (admitted && claim && !reserved(request.virtual_range, claim)) {
+            editing_ = false;
+            return std::unexpected(VSpaceError::Stale);
+        }
         if (!admitted) return std::unexpected(admitted.error());
     }
     Edit editing{this};
@@ -1041,30 +1191,36 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
     const MapId key = mapping->key_;
     auto layout = libk::scope_exit{[&]() noexcept { mappings_.destroy(*mapping); }};
 
-    // Map publishes one authorized VMA. Every backing kind uses the same
-    // single-page fault path; mapping never scans a transient resident set.
-    sync::Lock lock{lock_};
-    if (state_ != VSpaceState::Live || auth->invalid())
-        return std::unexpected(VSpaceError::InvalidState);
-    if (auto accepted = accept(ctx); !accepted) return std::unexpected(accepted.error());
-    auth->mappings_.push_back(*mapping);
-    link(*mapping);
+    mapping->claim_ = claim;
+    // Preparation retains the old reservation until both admission and all
+    // fragments are funded. No failure path leaves a half-filled claim.
+    if (claim) {
+        auto filled = fill(*mapping, claim, ctx);
+        if (!filled) return std::unexpected(filled.error());
+    } else {
+        sync::Lock lock{lock_};
+        if (state_ != VSpaceState::Live || auth->invalid())
+            return std::unexpected(VSpaceError::InvalidState);
+        if (auto accepted = accept(ctx); !accepted) return std::unexpected(accepted.error());
+        auth->mappings_.push_back(*mapping);
+        link(*mapping);
+    }
     layout.release(); binding.release();
     return MapResult{key, VmStatus::Complete};
 }
 
 auto VSpace::protect(VmCtx ctx, cap::VmLimit auth, VRange range, Perms perms) noexcept
     -> std::expected<VmStatus, VSpaceError> {
-    if (!auth.range.contains(range) || !auth.perms.contains(perms))
+    if (!auth.range.contains(range) || !auth.perms().contains(perms))
         return std::unexpected(VSpaceError::InvalidAuthority);
-    return protect(ctx, range, perms);
+    return edit(ctx, range, perms, false, auth.claim());
 }
 
 auto VSpace::protect(VmCtx ctx, VRange range, Perms perms) noexcept -> std::expected<VmStatus, VSpaceError> {
     return edit(ctx, range, perms);
 }
 
-auto VSpace::edit(VmCtx ctx, VRange range, std::optional<Perms> perms, bool clear) noexcept
+auto VSpace::edit(VmCtx ctx, VRange range, std::optional<Perms> perms, bool clear, u64 claim) noexcept
     -> std::expected<VmStatus, VSpaceError> {
     if (perms && (!valid_perms(*perms) || (perms->contains(Perm::Write) && perms->contains(Perm::Execute))))
         return std::unexpected(VSpaceError::InvalidAccess);
@@ -1085,7 +1241,7 @@ auto VSpace::edit(VmCtx ctx, VRange range, std::optional<Perms> perms, bool clea
         if (!ctx.submission.publish && !clear && advancing_) return std::unexpected(VSpaceError::Busy);
         if (auto accepted = accept(ctx, false); !accepted) return std::unexpected(accepted.error());
         auto& op = transaction();
-        op.edit_.emplace(VmOp::Edit{.range=range, .perms=perms, .clear=clear,
+        op.edit_.emplace(VmOp::Edit{.range=range, .perms=perms, .clear=clear, .claim=claim,
             .cursor=overlap(range), .covered=range.base()});
         if (!ctx.submission.publish && !clear) { advancing_ = inline_step = true; }
         if (!inline_step) active_->state_.post();
@@ -1135,16 +1291,24 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
         switch (edit.phase) {
         case E::Scan:
             if (!map || map->range_.base() >= *edit.range.limit()) {
-                if (!edit.clear && edit.perms && edit.covered < *edit.range.limit()) {
-                    mutation->abort(); return fail(VSpaceError::NotMapped);
+                if (!edit.clear && (edit.perms || edit.claim) && edit.covered < *edit.range.limit()) {
+                    mutation->abort(); return fail(edit.claim ? VSpaceError::Stale : VSpaceError::NotMapped);
                 }
                 edit.phase = E::Prepare;
                 break;
             }
+            if (edit.claim && map->claim_ != edit.claim) {
+                if (!edit.clear) { mutation->abort(); return fail(VSpaceError::Stale); }
+                edit.cursor = layout_.next(*map); break;
+            }
+            if (edit.claim && !edit.clear && map->range_.base() > edit.covered) {
+                mutation->abort(); return fail(VSpaceError::Stale);
+            }
             // Unmap is idempotent over holes, including mappings already removed
             // by grant revocation. Protect still requires complete coverage;
             // neither operation may destroy a reserved or guarded VA region.
-            if (!edit.clear && (!map->binding_ || (edit.perms && map->range_.base() > edit.covered))) {
+            if (!edit.clear && ((!map->binding_ && !(edit.claim && !edit.perms && map->kind_ == MapKind::Reserved))
+                || (edit.perms && map->range_.base() > edit.covered))) {
                 mutation->abort(); return fail(VSpaceError::NotMapped);
             }
             if (map->binding_ && map->binding_->invalid() && !edit.clear) {
@@ -1210,6 +1374,11 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
             break;
         }
         case E::Apply: {
+            if (edit.claim && map->claim_ != edit.claim) {
+                edit.cursor = map == edit.last ? nullptr : layout_.next(*map);
+                edit.phase = edit.cursor ? E::Apply : E::Done;
+                break;
+            }
             const auto lo = std::max(map->range_.base(), edit.range.base());
             const auto hi = std::min(*map->range_.limit(), *edit.range.limit());
             unlink(*map);
@@ -1272,7 +1441,7 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
                 // successor is taken before handing the Map to retirement.
                 edit.cursor = map == edit.last ? nullptr : layout_.lower_bound(*map->range_.limit());
                 if (edit.perms) { map->perms_ = *edit.perms; link(*map); }
-                else queue_layout(*map);
+                else { map->restore_ = !edit.clear && map->claim_; queue_layout(*map); }
                 edit.phase = edit.cursor ? E::Apply : E::Done;
             }
             break;
@@ -1306,6 +1475,7 @@ auto VSpace::make_fragment(Map& source, VRange range, Perms perms) noexcept
                                perms, source.ceiling_, *source.binding_)
             : mappings_.create(quota_, range, source.kind_);
     if (!made) return std::unexpected(node_error(made.error()));
+    made->object->claim_ = source.claim_;
     made->object->key_ = made->key;
     return made->object;
 }
@@ -1313,11 +1483,15 @@ auto VSpace::make_fragment(Map& source, VRange range, Perms perms) noexcept
 auto VSpace::unmap(VmCtx ctx, cap::VmLimit auth, VRange range) noexcept
     -> std::expected<VmStatus, VSpaceError> {
     if (!auth.range.contains(range)) return std::unexpected(VSpaceError::InvalidAuthority);
-    return unmap(ctx, range);
+    return edit(ctx, range, std::nullopt, false, auth.claim());
 }
 
 auto VSpace::unmap(VmCtx ctx, VRange range) noexcept -> std::expected<VmStatus, VSpaceError> {
     return edit(ctx, range, std::nullopt);
+}
+
+auto VSpace::clear(VmCtx ctx, cap::VmLimit auth) noexcept -> std::expected<VmStatus, VSpaceError> {
+    return edit(ctx, auth.range, std::nullopt, true, auth.claim());
 }
 
 auto VSpace::clear(VmCtx ctx, VRange range) noexcept -> std::expected<VmStatus, VSpaceError> {
@@ -1738,6 +1912,7 @@ auto VSpace::start_invalidation(VmCtx ctx, Binding& auth) noexcept -> std::expec
                 if (!mapping.layout_hook_.is_linked()) continue;
                 --remaining;
                 unlink(mapping);
+                mapping.restore_ = mapping.claim_ && state_ == VSpaceState::Live;
                 queue_layout(mapping);
             }
         }

@@ -378,7 +378,7 @@ bool test_typed_attenuation_rejects_malformed_and_amplifying(
 
     byte bytes[CAP_ATTENUATION_SIZE]{};
     attenuation_bytes(bytes, ObjThread);
-    bytes[CAP_ATTENUATION_VERSION_OFFSET] = 2;
+    bytes[CAP_ATTENUATION_VERSION_OFFSET] = CAP_ATTENUATION_VERSION_CURRENT + 1;
     if (cap::decode_attenuation(
             std::span<const byte>{bytes, sizeof(bytes)})) {
         return false;

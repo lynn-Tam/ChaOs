@@ -2,27 +2,27 @@
 #include <proc.hpp>
 #include <posix.hpp>
 #include <unistd.h>
-#include <util.hpp>
+#include <thread.hpp>
 #include <vector>
 
 int main() {
     if (const auto status = px_init(); status != STATUS_OK) return status;
-    const auto& info = rt_startup();
+    const auto& info = _startup();
     const auto check = [](bool ok) {
         if (!ok)
-            sys::exit(STATUS_INTERNAL);
+            _thread_exit(STATUS_INTERNAL);
     };
 
-    const auto notification = sys::port_create(info.alloc(), 8, 4);
+    const auto notification = _port_create(info.alloc(), 8, 4);
     if (notification.status != STATUS_OK)
-        sys::exit(notification.status);
-    cap_owner events{notification.value};
+        _thread_exit(notification.status);
+    _cap_owner events{notification.value};
     ubus_conn directory, files;
-    auto status = directory.bind(info.environment);
+    auto status = directory.bind(info.bootstrap);
     ubus_msg query, response; query.data.put("name", "exec");
     if (status == STATUS_OK) status = directory.invoke("Get", std::move(query), response);
     if (status == STATUS_OK) status = files.bind(response.capability(response.data["connector"]));
-    if (status != STATUS_OK) sys::exit(status);
+    if (status != STATUS_OK) _thread_exit(status);
     query = {}; query.data.put("path", "/boot/sleep.elf").put("perms", word_t{VM_READ | VM_EXECUTE});
     check(files.invoke("Map", std::move(query), response) == STATUS_OK);
     const auto buffer = response.data["buffer"].as<ubus_buffer>(); check(bool(buffer));
@@ -31,16 +31,16 @@ int main() {
     if (const auto rc =
             image.open(info.vspace, memory.selector(), buffer->size, VM_READ | VM_EXECUTE | VM_MAP_PRIVATE);
         rc != STATUS_OK)
-        sys::exit(rc);
+        _thread_exit(rc);
     test_tasks tasks;
     tasks.open(info.alloc(), info.domain, info.cpus);
     const auto spawn = [&](const char* ms) {
         const std::string_view args[]{"sleep", ms};
         const auto child = tasks.spawn(
             image, {},
-            {.argv = args, .resources = {.bytes = 1024 * 1024, .caps = 64}, .events = rt_events()});
+            {.argv = args, .resources = {.bytes = 1024 * 1024, .caps = 64}, .events = &_events()});
         if (child.status != STATUS_OK)
-            sys::exit(child.status);
+            _thread_exit(child.status);
         return child.id;
     };
     const auto wait = [&](test_id id, uint64_t deadline = 0) {
@@ -48,22 +48,22 @@ int main() {
             const auto result = tasks.collect(id);
             if (result.status == STATUS_OK)
                 return static_cast<status_t>(result.value);
-            if (result.status != STATUS_WOULD_BLOCK && !proc_retryable(result.status))
+            if (result.status != STATUS_WOULD_BLOCK && !(result.status == STATUS_BUSY || result.status == STATUS_RETRY))
                 return result.status;
-            const auto now = sys::clock_now();
+            const auto now = _clock_now();
             if (now.status != STATUS_OK)
-                sys::exit(now.status);
+                _thread_exit(now.status);
             if (deadline && now.value >= deadline)
                 return STATUS_TIMED_OUT;
-            sys::yield();
+            _yield();
         }
     };
     const auto first = spawn("10000");
-    const auto deadline = rt_after_ms(1);
+    const auto deadline = _after(std::chrono::milliseconds{1});
     check(deadline.has_value());
     check(wait(first, *deadline) == STATUS_TIMED_OUT);
     if (const auto rc = tasks.request_stop(first); rc != STATUS_OK)
-        sys::exit(rc);
+        _thread_exit(rc);
     check(wait(first) == STATUS_CANCELED);
     check(wait(first) == STATUS_INVALID_CAP);
     // More live/unconsumed records than the removed four-slot proxy admitted.
@@ -78,12 +78,12 @@ int main() {
         check(wait(id) == STATUS_INVALID_CAP);
     }
     if (const auto rc = tasks.request_stop(reused); rc != STATUS_OK)
-        sys::exit(rc);
+        _thread_exit(rc);
     check(wait(reused) == STATUS_CANCELED);
     for (unsigned i = 0; i < 6; ++i) {
         const auto id = spawn("10000");
         if (const auto rc = tasks.request_stop(id); rc != STATUS_OK)
-            sys::exit(rc);
+            _thread_exit(rc);
         check(wait(id) == STATUS_CANCELED);
     }
     constexpr std::string_view message{"[process] direct spawn, retention, deadlines and reuse ok\n"};

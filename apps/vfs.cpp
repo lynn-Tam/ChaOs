@@ -28,7 +28,7 @@ struct vf_target {
 };
 struct vf_job {
     ubus_request request;
-    ev_watch canceled;
+    _ev_watch canceled;
     std::string method;
     std::deque<vf_target> targets;
     std::set<std::string> covered;
@@ -74,7 +74,7 @@ static auto enqueue(std::string_view method, ubus_request& request, ubus_msg inp
     auto& job = *jobs.emplace_back(std::make_unique<vf_job>()); job.method = method; job.covered = std::move(covered);
     const auto status = target(job, mount, std::move(input), generation);
     if (status != STATUS_OK) { jobs.pop_back(); return status; }
-    const auto watched = job.canceled.open(rt_events(), request.reply.selector(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+    const auto watched = job.canceled.open(&_events(), request.reply.selector(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
     if (watched != STATUS_OK) { jobs.pop_back(); return watched; }
     job.epoch = epoch; job.request = std::move(request); return STATUS_PENDING;
 }
@@ -160,7 +160,7 @@ static auto control(std::string_view method, ubus_request& request, ubus_msg&) -
             const auto status = target(job, mount, std::move(input));
             if (status != STATUS_OK) { jobs.pop_back(); return status; }
         }
-        const auto watched = job.canceled.open(rt_events(), request.reply.selector(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
+        const auto watched = job.canceled.open(&_events(), request.reply.selector(), SOURCE_TERMINAL, 0, 0, SOURCE_WRITE);
         if (watched != STATUS_OK) { jobs.pop_back(); return watched; }
         job.request = std::move(request); return STATUS_PENDING;
     }
@@ -239,8 +239,8 @@ static auto list(ubus_request& request, ubus_msg& response) -> status_t {
     return enqueue("List", request, std::move(forwarded), mount->second, generation, covered);
 }
 int main() {
-    const auto& env = rt_startup();
-    auto status = bus.bind(env.environment);
+    const auto& env = _startup();
+    auto status = bus.bind(env.bootstrap);
     if (status != STATUS_OK) return status;
     ubus_msg setup;
     status = bus.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
@@ -298,9 +298,9 @@ int main() {
         }
         word_t deadline{};
         for (auto job = jobs.begin(); job != jobs.end();) {
-            auto admitted = rt_admit((*job)->request.deadline);
+            auto admitted = _deadline_status((*job)->request.deadline);
             if (admitted == STATUS_OK && (*job)->canceled.pending()) {
-                const auto peer = sys::source_info((*job)->request.reply.selector(), SOURCE_WRITE);
+                const auto peer = _source_info((*job)->request.reply.selector(), SOURCE_WRITE);
                 if (peer.status != STATUS_OK || (peer.value & SOURCE_TERMINAL)) admitted = STATUS_CANCELED;
                 else admitted = (*job)->canceled.arm(peer.value2).status;
             }
@@ -320,7 +320,7 @@ int main() {
             job = jobs.erase(job); again = true;
         }
         if (!again) {
-            status = ev_wait(rt_events(), deadline).status;
+            status = _ev_wait(&_events(), deadline).status;
             if (status != STATUS_OK && status != STATUS_TIMED_OUT) return status;
         }
     }

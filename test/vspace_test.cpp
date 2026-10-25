@@ -147,10 +147,10 @@ public:
     [[nodiscard]] auto root_authority() noexcept
         -> cap::VmLimit {
         return cap::VmLimit{
-            .range = mm::VRange{
+            mm::VRange{
                 mm::va_t{mm::UserBegin},
                 mm::UserEnd - mm::UserBegin},
-            .perms = mm::Perms::of(
+            mm::Perms::of(
                 mm::Perm::Read,
                 mm::Perm::Write,
                 mm::Perm::Execute),
@@ -363,11 +363,15 @@ bool test_batched_edit(const TestContext&) noexcept {
         if (!fault || fault->kind != mm::FaultKind::Materialized) return false;
     }
     const mm::VRange whole{base, 24 * mm::page_size};
-    if (!settled(fixture.space(), fixture.space().protect(fixture.context(), whole, mm::Perms::of(mm::Perm::Read))))
+    // Start inside the first record and cross subsequent records. The first
+    // intersecting record precedes lower_bound; both outer pages survive.
+    const mm::VRange middle{mm::va_t{base.raw() + mm::page_size}, 22 * mm::page_size};
+    if (!settled(fixture.space(), fixture.space().protect(fixture.context(), middle, mm::Perms::of(mm::Perm::Read))))
         return false;
-    for (usize i = 0; i < 12; ++i) {
-        const auto denied = fixture.space().fault(fixture.context(), mm::va_t{base.raw() + i * 2 * mm::page_size}, mm::Perm::Write);
-        if (!denied || denied->kind != mm::FaultKind::AccessDenied) return false;
+    for (usize i = 0; i < 24; ++i) {
+        const auto fault = fixture.space().fault(fixture.context(), mm::va_t{base.raw() + i * mm::page_size}, mm::Perm::Write);
+        const auto expected = !i ? mm::FaultKind::Ready : i == 23 ? mm::FaultKind::Materialized : mm::FaultKind::AccessDenied;
+        if (!fault || fault->kind != expected) return false;
     }
     if (!settled(fixture.space(), fixture.space().unmap(fixture.context(), whole))) return false;
     const auto absent = fixture.space().fault(fixture.context(), base, mm::Perm::Read);

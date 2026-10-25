@@ -3,12 +3,12 @@
 #include <vm.hpp>
 #include <libk/cpio.hpp>
 
-struct bf_file { std::string name; std::span<const std::byte> bytes; vm_area backing; };
+struct bf_file { std::string name; std::span<const std::byte> bytes; _vm_area backing; };
 struct bf_open { ubus_object object; bf_file* file; uint64_t offset{}, sequence{}; bool closed{}; };
 static std::vector<bf_file> files;
-static std::vector<vm_ptr<bf_open>> opens;
+static std::vector<_vm_ptr<bf_open>> opens;
 static CreateAuth images;
-static cap_desc descriptor;
+static _cap_desc descriptor;
 static ubus_object directory{"io.files"};
 
 static auto find(std::string_view path) -> bf_file* {
@@ -23,16 +23,15 @@ static auto map(ubus_request& request, ubus_msg& response) -> status_t {
     auto* file = find(*request.data["path"].as<std::string_view>()); if (!file) return STATUS_NOT_FOUND;
     const auto size = (std::max(file->bytes.size(), size_t{1}) + 4095) & ~size_t{4095};
     if (!file->backing.memory) {
-        auto backing = vm_area::create(images, rt_vm(), 0, size, VM_READ | VM_WRITE | VM_EXECUTE, VM_READ | VM_WRITE);
+        auto backing = _vm_area::create(images, _vm(), 0, size, VM_READ | VM_WRITE | VM_EXECUTE, VM_READ | VM_WRITE);
         if (!backing) return backing.error();
         ::memcpy(reinterpret_cast<void*>(backing->address), file->bytes.data(), file->bytes.size());
         auto status = backing->detach();
-        if (status == STATUS_OK) status = sys::memory_seal(backing->memory.selector()).status;
+        if (status == STATUS_OK) status = _memory_seal(backing->memory.selector()).status;
         if (status != STATUS_OK) return status;
         file->backing = std::move(*backing);
     }
-    const CapView view{.version=CAP_ATTENUATION_VERSION_CURRENT, .kind=ObjMem, .size=CAP_ATTENUATION_SIZE,
-        .rights=RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_DELEGATE, .words={0, size / 4096, perms}};
+    const auto view = _cap_mem(RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_DELEGATE, 0, size / 4096, perms);
     auto exported = descriptor.derive(file->backing.memory.selector(), view, images.quota);
     if (!exported) return exported.error();
     const auto index = response.offer(std::move(*exported), view.rights); if (!index) return STATUS_NO_MEMORY;
@@ -43,7 +42,7 @@ static auto open(ubus_request& request, ubus_msg& response) -> status_t {
     auto* file = find(*request.data["path"].as<std::string_view>()); if (!file) return STATUS_NOT_FOUND;
     if (opens.size() >= 64) return STATUS_EXHAUSTED;
     const auto budget = request.capability(request.data["budget"]);
-    auto storage = vm_new<bf_open>({budget ? budget : rt_startup().quota, rt_startup().scope});
+    auto storage = _vm_new<bf_open>({budget ? budget : _startup().quota, _startup().scope});
     if (!storage) return storage.error();
     auto opened = std::move(*storage); opened->file = file;
     auto& object = opened->object;
@@ -57,7 +56,7 @@ static auto open(ubus_request& request, ubus_msg& response) -> status_t {
             const auto offset = explicit_offset.value_or(state->offset);
             const auto count = offset >= state->file->bytes.size() ? size_t{0}
                 : std::min<uint64_t>(buffer.size, state->file->bytes.size() - offset);
-            const auto status = mem_write(q.capability(q.data["buffer"]), buffer.offset, state->file->bytes.subspan(std::min<uint64_t>(offset, state->file->bytes.size()), count));
+            const auto status = _mem_write(q.capability(q.data["buffer"]), buffer.offset, state->file->bytes.subspan(std::min<uint64_t>(offset, state->file->bytes.size()), count)).status;
             if (status != STATUS_OK) return status;
             state->sequence = id; if (!explicit_offset) state->offset += count;
             r.data.put("bytes", count); return STATUS_OK;
@@ -90,15 +89,15 @@ static auto list(ubus_request& request, ubus_msg& response) -> status_t {
     return STATUS_OK;
 }
 int main() {
-    const auto& env = rt_startup();
+    const auto& env = _startup();
     ubus_conn parent;
-    auto status = parent.bind(env.environment); if (status != STATUS_OK) return status;
+    auto status = parent.bind(env.bootstrap); if (status != STATUS_OK) return status;
     ubus_msg setup;
     status = parent.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
     const auto message = setup.data["message"];
     images = {setup.capability(message["image.quota"]), setup.capability(message["image.scope"])};
     const auto buffer = message["archive"].as<ubus_buffer>(); if (!buffer || buffer->offset) return STATUS_BAD_ARGS;
-    auto mapping = vm_area::map(rt_vm(), setup.take(message["archive"]), 0, (buffer->size + 4095) & ~size_t{4095}, VM_READ);
+    auto mapping = _vm_area::map(_vm(), setup.take(message["archive"]), 0, (buffer->size + 4095) & ~size_t{4095}, VM_READ);
     if (!mapping) return mapping.error();
     const auto archive = libk::cpio_view::parse({reinterpret_cast<const std::byte*>(mapping->address), size_t(buffer->size)});
     if (!archive) return STATUS_BAD_ARGS;
@@ -135,6 +134,6 @@ int main() {
             if (status != STATUS_OK && status != STATUS_WOULD_BLOCK) return status;
             progress |= status == STATUS_OK; ++it;
         }
-        if (!progress && (status = ev_wait(rt_events()).status) != STATUS_OK) return status;
+        if (!progress && (status = _ev_wait(&_events()).status) != STATUS_OK) return status;
     }
 }

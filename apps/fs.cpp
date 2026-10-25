@@ -84,7 +84,7 @@ static int remove_path(std::string_view path, bool recursive, bool force) {
 }
 
 int main(int argc, char** argv) {
-    const auto& env = rt_startup();
+    const auto& env = _startup();
     if (const auto rc = px_init(); rc != STATUS_OK) return rc;
 
     std::string_view command = argv[0];
@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
     if (command == "format") {
         if (argc != 2 && argc != 3) return STATUS_BAD_ARGS;
         ubus_conn bus, admin; ubus_msg request, response; request.data.put("name", "admin");
-        auto status = bus.bind(env.environment);
+        auto status = bus.bind(env.bootstrap);
         if (status == STATUS_OK) status = bus.invoke("Get", std::move(request), response);
         if (status == STATUS_OK) status = admin.bind(response.capability(response.data["connector"]));
         request = {};
@@ -168,7 +168,7 @@ int main(int argc, char** argv) {
     if ((command == "device" || command == "volid") && argc == 2) {
         uint8_t id[20]{};
         ubus_conn bus, service;
-        auto status = bus.bind(env.environment);
+        auto status = bus.bind(env.bootstrap);
         ubus_msg request, response; request.data.put("name", "files");
         if (status == STATUS_OK) status = bus.invoke("Get", std::move(request), response);
         if (status == STATUS_OK) status = service.bind(response.capability(response.data["connector"]));

@@ -10,17 +10,17 @@
 
 // Explicit, single-threaded native FTXUI session. The application owns its loop.
 class ft_terminal final {
-    cap_t port_{};
+    _ev_port* port_{};
     ubus_conn control_;
     io_tx output_;
-    ch_pair subscription_;
+    _ch_pair subscription_;
     ubus_rx focus_events_, input_;
     uint64_t focus_{};
     bool focused_{};
     struct { uint16_t rows{24}, columns{80}; } size_;
     status_t status_{};
     std::deque<unsigned char> bytes_;
-    ev_watch writable_;
+    _ev_watch writable_;
     std::string frame_, next_frame_, pending_;
     size_t sent_{};
     auto reset() -> status_t {
@@ -28,17 +28,17 @@ class ft_terminal final {
         const auto status = output_.cancel();
         return status == STATUS_OK ? writable_.close() : status;
     }
-    auto open_session(const rt_env& env, const ubus_msg& setup) -> status_t {
-        port_ = rt_events();
+    auto open_session(const _env& env, const ubus_msg& setup) -> status_t {
+        port_ = &_events();
         auto status = control_.bind(setup.capability(setup.data["message"]["terminal"]));
         if (status == STATUS_OK) status = subscription_.open(env.alloc(), 8, 0);
         if (status == STATUS_OK) status = focus_events_.open(subscription_.ends[0].selector(), port_);
         if (status == STATUS_OK) status = input_.open(setup.capability(setup.data["message"]["stdin"]), port_);
         if (status != STATUS_OK) return status;
-        const auto sender = sys::channel_mint(subscription_.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
+        const auto sender = _channel_mint(subscription_.ends[1].selector(), env.cspace, 1, RIGHT_SEND | RIGHT_DUPLICATE);
         if (sender.status != STATUS_OK) return sender.status;
         ubus_msg request, response;
-        const auto events_idx = request.offer(cap_owner{sender.value}, RIGHT_SEND);
+        const auto events_idx = request.offer(_cap_owner{sender.value}, RIGHT_SEND);
         if (!events_idx) return events_idx.error();
         request.data.cap("events", *events_idx);
         return control_.invoke("Fullscreen", std::move(request), response);
@@ -90,7 +90,7 @@ class ft_terminal final {
                 if (received != STATUS_WOULD_BLOCK) return received;
             }
             if (!block) return STATUS_WOULD_BLOCK;
-            if (const auto wake = ev_wait(port_, deadline); wake.status != STATUS_OK) return wake.status;
+            if (const auto wake = _ev_wait(port_, deadline); wake.status != STATUS_OK) return wake.status;
         }
     }
 
@@ -101,7 +101,7 @@ class ft_terminal final {
 public:
     ft_terminal() = default;
     ~ft_terminal();
-    auto open(const rt_env&, const ubus_msg&) -> status_t;
+    auto open(const _env&, const ubus_msg&) -> status_t;
     auto read() -> std::expected<std::optional<ftxui::Event>, status_t>;
     auto present(const ftxui::Component&) -> status_t;
     auto flush() -> status_t;
