@@ -124,15 +124,16 @@ public:
         mm::Perms access, bool private_write = false) noexcept
         -> std::expected<mm::MapResult, mm::VSpaceError> {
         auto reference = object::ref<>{memory_};
-        if (!reference) {
-            return std::unexpected(mm::VSpaceError::InvalidState);
+        if (!reference) return std::unexpected(mm::VSpaceError::InvalidState);
+        if (private_write) {
+            auto pending = vspace_test_mm->get<mm::Mem>().create({}, pmm(), object.size() * mm::page_size,
+                mm::CopyCfg{std::move(reference), object.base(), {}});
+            if (!pending) return std::unexpected(mm::VSpaceError::OutOfMemory);
+            reference = std::move(*pending).publish(); object = {0, object.size()};
         }
-        return space_->map(
-            context(),
-            mm::MapReq{range, object, access, private_write},
-            std::move(reference),
-            memory_.get(),
-            memory_authority(memory_.get().page_count()));
+        auto* memory = static_cast<mm::Mem*>(reference.get());
+        const auto authority = memory_authority(memory->page_count());
+        return space_->map(context(), mm::MapReq{range, object, access}, std::move(reference), *memory, authority);
     }
 
     [[nodiscard]] static auto memory_authority(usize pages) noexcept

@@ -1,17 +1,31 @@
 #include "virtio.hpp"
+#include <map>
 
 static blk_dev device;
 static std::array<uint8_t, io_limit> scratch;
 static ubus_object directory{"io.block"};
-struct blk_cmd { blk_op kind; uint64_t offset{}; ubus_buffer buffer{}; uint64_t deadline{}; };
+struct blk_cmd { blk_op kind; uint64_t offset{}; ubus_buffer buffer{}; uint64_t deadline{}, registration{}; };
+struct blk_buffer {
+    _cap_owner memory;
+    uint64_t address{}, bytes{}, uses{};
+    word_t perms{};
+    bool closing{};
+};
 struct blk_client {
     _vm_ptr<blk_client> next;
     ubus_object object;
     ubus_queue<blk_cmd, blk_dev::Depth> queue;
     std::optional<ubus_request> closing;
-    bool stopped{}, failed{};
+    uint64_t offset{}, bytes{}, next_buffer{};
+    bool exclusive{}, stopped{}, failed{};
+    std::map<uint64_t, blk_buffer> buffers;
     void stop() { stopped = failed = true; queue.stop(); }
     void finish(ubus_ticket ticket, status_t status, uint64_t count = 0) {
+        if (auto* cmd = queue.request(ticket); cmd && cmd->registration) {
+            const auto it = buffers.find(cmd->registration);
+            if (it == buffers.end() || !it->second.uses) _thread_exit(STATUS_INTERNAL);
+            --it->second.uses;
+        }
         ubus_msg reply; reply.status = status; reply.data.put("bytes", count);
         if (!queue.finish(ticket, std::move(reply))) _thread_exit(STATUS_INTERNAL);
     }
@@ -23,30 +37,80 @@ struct blk_flush { blk_client* client{}; ubus_ticket ticket{}; bool submitted{};
 static blk_flush flush;
 
 static auto open(ubus_request& request, ubus_msg& response) -> status_t {
+    const auto offset = request.data["offset"].as<uint64_t>().value_or(0);
+    const auto bytes = request.data["bytes"].as<uint64_t>().value_or(device.capacity() - std::min(offset, device.capacity()));
+    const auto exclusive = request.data["exclusive"].as<bool>().value_or(false);
+    if (!bytes || (offset | bytes) % 512 || offset > device.capacity() || bytes > device.capacity() - offset) return STATUS_BAD_ARGS;
+    for (auto* c = clients.get(); c; c = c->next.get())
+        if ((exclusive || c->exclusive) && offset < c->offset + c->bytes && c->offset < offset + bytes) return STATUS_BUSY;
     const auto budget = request.capability(request.data["budget"]);
     auto storage = _vm_new<blk_client>({budget ? budget : _startup().quota, _startup().scope});
     if (!storage) return storage.error();
     auto client = std::move(*storage);
+    client->offset = offset; client->bytes = bytes; client->exclusive = exclusive;
     auto& object = client->object;
     for (const auto& [name, kind] : std::array<std::pair<std::string_view, blk_op>, 4>{{
         {"Read", blk_op::Read}, {"Write", blk_op::Write}, {"Flush", blk_op::Flush}, {"Identify", blk_op::Identify}}}) {
         ubus_schema input{{"id", ubus_type::U64}};
-        if (kind != blk_op::Flush) { input.push_back({"offset", ubus_type::U64}); input.push_back({"buffer", ubus_type::Buffer}); }
+        if (kind != blk_op::Flush) {
+            input.push_back({"offset", ubus_type::U64}); input.push_back({"buffer", ubus_type::Buffer, true});
+            input.push_back({"registration", ubus_type::U64, true}); input.push_back({"buffer_offset", ubus_type::U64, true});
+            input.push_back({"bytes", ubus_type::U64, true});
+        }
         const auto status = object.add(std::string{name}, std::move(input), {{"bytes", ubus_type::U64}},
             [state=client.get(), kind](auto& q, auto&) {
                 if (state->stopped) return STATUS_CLOSED;
                 blk_cmd command{.kind=kind, .offset=q.data["offset"].template as<uint64_t>().value_or(0), .deadline=q.deadline};
                 if (kind != blk_op::Flush) {
-                    command.buffer = *q.data["buffer"].template as<ubus_buffer>();
-                    if (command.buffer.size > blk_dev::MaxTransfer || command.buffer.offset > UINT64_MAX - command.buffer.size) return STATUS_BAD_ARGS;
+                    if (const auto buffer = q.data["buffer"].template as<ubus_buffer>()) command.buffer = *buffer;
+                    else {
+                        command.registration = q.data["registration"].template as<uint64_t>().value_or(0);
+                        auto it = state->buffers.find(command.registration);
+                        if (it == state->buffers.end() || it->second.closing) return STATUS_BAD_ARGS;
+                        command.buffer.offset = q.data["buffer_offset"].template as<uint64_t>().value_or(0);
+                        command.buffer.size = q.data["bytes"].template as<uint64_t>().value_or(0);
+                        if (command.buffer.offset > it->second.bytes || command.buffer.size > it->second.bytes - command.buffer.offset
+                            || (kind == blk_op::Read && !(it->second.perms & VM_WRITE))) return STATUS_BAD_RIGHTS;
+                    }
+                    if (q.data["buffer"] && q.data["registration"]) return STATUS_BAD_ARGS;
+                    if (!command.buffer.size || command.buffer.size > blk_dev::MaxTransfer || command.buffer.offset > UINT64_MAX - command.buffer.size)
+                        return STATUS_BAD_ARGS;
+                    if ((kind == blk_op::Read || kind == blk_op::Write)
+                        && (command.offset > state->bytes || command.buffer.size > state->bytes - command.offset)) return STATUS_BAD_ARGS;
                 }
-                return state->queue.accept(*q.data["id"].template as<uint64_t>(), command, q);
+                const auto status = state->queue.accept(*q.data["id"].template as<uint64_t>(), command, q);
+                if (status == STATUS_PENDING && command.registration) ++state->buffers.find(command.registration)->second.uses;
+                return status;
             });
         if (status != STATUS_OK) return status;
     }
+    auto registered = object.add("Register", {{"buffer", ubus_type::Buffer}, {"perms", ubus_type::U64}}, {{"registration", ubus_type::U64}},
+        [state=client.get()](auto& q, auto& r) {
+            if (state->stopped || state->next_buffer == UINT64_MAX) return STATUS_CLOSED;
+            const auto b = *q.data["buffer"].template as<ubus_buffer>();
+            const auto perms = *q.data["perms"].template as<uint64_t>();
+            if (!b.size || (b.offset | b.size) % 4096 || !(perms & VM_READ) || (perms & ~(VM_READ | VM_WRITE))) return STATUS_BAD_ARGS;
+            auto memory = q.take(q.data["buffer"]);
+            const auto map = device.map(memory.selector(), b.offset / 4096, b.size / 4096, perms);
+            if (map.status != STATUS_OK) return map.status;
+            const auto id = ++state->next_buffer;
+            state->buffers.emplace(id, blk_buffer{std::move(memory), map.value, b.size, 0, perms, false});
+            r.data.put("registration", id); return STATUS_OK;
+        });
+    if (registered != STATUS_OK) return registered;
+    registered = object.add("Unregister", {{"registration", ubus_type::U64}}, {}, [state=client.get()](auto& q, auto&) {
+        const auto it = state->buffers.find(*q.data["registration"].template as<uint64_t>());
+        if (it == state->buffers.end()) return STATUS_NOT_FOUND;
+        it->second.closing = true;
+        if (it->second.uses) return STATUS_BUSY;
+        const auto status = device.unmap(it->second.address, it->second.bytes / 4096);
+        if (status == STATUS_OK) state->buffers.erase(it);
+        return status;
+    });
+    if (registered != STATUS_OK) return registered;
     for (const auto status : {
         object.add("Stat", {}, {{"size", ubus_type::U64}, {"sequence", ubus_type::U64}, {"limit", ubus_type::U64}, {"depth", ubus_type::U64}}, [state=client.get()](auto&, auto& r) {
-            r.data.put("size", device.capacity()).put("sequence", state->queue.sequence()).put("limit", uint64_t{io_limit}).put("depth", uint64_t{io_depth}); return STATUS_OK;
+            r.data.put("size", state->bytes).put("sequence", state->queue.sequence()).put("limit", uint64_t{io_limit}).put("depth", uint64_t{io_depth}); return STATUS_OK;
         }),
         object.add("Cancel", {{"id", ubus_type::U64}}, {}, [state=client.get()](auto& q, auto&) { return state->queue.cancel(*q.data["id"].template as<uint64_t>()); }),
         object.add("Close", {}, {}, [state=client.get()](auto& q, auto&) {
@@ -79,7 +143,7 @@ int main() {
         setup.push_back(std::move(fragment));
     } while (more);
     status = device.open(env, setup); if (status != STATUS_OK) return status;
-    status = directory.add("Open", {{"budget", ubus_type::Cap, true}}, {{"handle", ubus_type::Cap}}, open);
+    status = directory.add("Open", {{"budget", ubus_type::Cap, true}, {"offset", ubus_type::U64, true}, {"bytes", ubus_type::U64, true}, {"exclusive", ubus_type::Bool, true}}, {{"handle", ubus_type::Cap}}, open);
     if (status == STATUS_OK) status = directory.open();
     if (status != STATUS_OK) return status;
     auto connector = directory.connector(); if (!connector) return connector.error();
@@ -116,7 +180,7 @@ int main() {
             const auto* command = client.queue.request(operation.ticket); if (!command) return STATUS_INTERNAL;
             status = completion.status;
             if (client.failed || client.queue.cancelled(operation.ticket)) status = STATUS_CANCELED;
-            if (status == STATUS_OK && (command->kind == blk_op::Read || command->kind == blk_op::Identify)) {
+            if (status == STATUS_OK && !command->registration && (command->kind == blk_op::Read || command->kind == blk_op::Identify)) {
                 if (completion.size > command->buffer.size) return STATUS_INTERNAL;
                 auto* call = client.queue.call(operation.ticket);
                 status = _mem_write(call->capability(call->data["buffer"]), command->buffer.offset,
@@ -152,13 +216,15 @@ int main() {
                 if (status == STATUS_OK && command.kind == blk_op::Flush) { flush = {client, ticket, false}; again = true; break; }
                 auto& operation = pending[index];
                 if (status == STATUS_OK && !client->queue.commit(ticket)) status = STATUS_CANCELED;
-                if (status == STATUS_OK && command.kind == blk_op::Write) {
+                if (status == STATUS_OK && !command.registration && command.kind == blk_op::Write) {
                     auto* call = client->queue.call(ticket);
                     status = _mem_read(call->capability(call->data["buffer"]), command.buffer.offset,
                         std::as_writable_bytes(std::span{scratch}.first(command.buffer.size))).status;
                 }
                 if (status == STATUS_OK) status = device.submit({index, ++operation.gen}, command.kind,
-                    command.offset, command.buffer.size, command.kind == blk_op::Write ? scratch.data() : nullptr);
+                    command.offset + ((command.kind == blk_op::Read || command.kind == blk_op::Write) ? client->offset : 0), command.buffer.size,
+                    !command.registration && command.kind == blk_op::Write ? scratch.data() : nullptr,
+                    command.registration ? client->buffers.find(command.registration)->second.address + command.buffer.offset : 0);
                 if (status == STATUS_OK) { operation.client = client; operation.ticket = ticket; }
                 else client->finish(ticket, status);
                 again = true;
@@ -168,6 +234,11 @@ int main() {
         for (auto* link = &clients; *link;) {
             auto& client = **link;
             if (client.stopped && !client.queue.active()) {
+                for (auto& [id, buffer] : client.buffers) {
+                    const auto status = device.unmap(buffer.address, buffer.bytes / 4096);
+                    if (status != STATUS_OK) return status;
+                }
+                client.buffers.clear();
                 if (client.closing) (void)client.closing->respond();
                 auto retired = std::move(*link); *link = std::move(retired->next); again = true;
             } else link = &client.next;

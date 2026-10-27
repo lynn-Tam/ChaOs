@@ -174,7 +174,7 @@ static auto publish_bound(Call& inv, Pending& object, cap::GrantRef& root, cap::
         for (usize i = 0; i < N; ++i) relations[i] = {grants[i], cells[i]};
         return inv.cspace.insert(std::span{&*prepared, 1}, inv.cpu.grants.admission(grants), gates,
             install, relations) ? STATUS_OK : STATUS_CLOSED;
-    });
+    }, N);
     if (status != STATUS_OK) return returned(status);
     return returned(STATUS_OK, handle.raw());
 }
@@ -283,9 +283,10 @@ template<class T, class Provider, class Run>
         libk_assert(dependencies.size() <= grants.size() - count);
         std::copy(dependencies.begin(), dependencies.end(), grants.begin() + count);
         return object->get().op().accept(install, [&](std::span<cap::Attachment*> cells, const object::ref<>& cpu, Source::Action commit) noexcept {
-            const cap::Graph::Attach relations[]{{&target.pin(), cells[0]}, {nullptr, cells[1], &cpu}};
+            const cap::Graph::Attach relations[]{{&target.pin(), cells[0]}};
+            const object::ref<>* publication_gates[]{gates[0], gates[1], gates[2], &cpu};
             return inv.cspace.insert(std::span{&*prepared, 1},
-                inv.cpu.grants.admission(std::span{grants}.first(count + dependencies.size())), gates, commit,
+                inv.cpu.grants.admission(std::span{grants}.first(count + dependencies.size())), publication_gates, commit,
                 relations) ? STATUS_OK : STATUS_CLOSED;
         });
     };
@@ -313,7 +314,7 @@ template<usize op> [[gnu::noinline]] auto vm_submit(Call& inv) noexcept -> Resul
     const auto range = kind == VM_OP_CLEAR ? std::optional{where->range} : range_of(request.address, request.bytes);
     const auto perms = perms_of(request.perms & (VM_READ | VM_WRITE | VM_EXECUTE));
     if (!range || ((kind == VM_OP_MAP || kind == VM_OP_PROTECT) && !perms)
-        || (request.perms & ~(VM_READ | VM_WRITE | VM_EXECUTE | (kind == VM_OP_MAP ? VM_MAP_PRIVATE : 0)))
+        || (request.perms & ~(VM_READ | VM_WRITE | VM_EXECUTE))
         || (kind != VM_OP_MAP && (request.memory || request.page))
         || (kind == VM_OP_CLEAR && (request.address || request.bytes || request.perms))) return returned(STATUS_BAD_ARGS);
     std::optional<cap::Resolved<mm::Mem>> memory;
@@ -328,8 +329,7 @@ template<usize op> [[gnu::noinline]] auto vm_submit(Call& inv) noexcept -> Resul
         auto& space = target->object();
         std::expected<mm::VmStatus, mm::VSpaceError> result;
         if (kind == VM_OP_MAP) {
-            auto mapped = space.map(ctx, *where, {*range, {request.page, range->size() / mm::page_size}, *perms,
-                bool(request.perms & VM_MAP_PRIVATE)}, *memory);
+            auto mapped = space.map(ctx, *where, {*range, {request.page, range->size() / mm::page_size}, *perms}, *memory);
             result = mapped ? std::expected<mm::VmStatus, mm::VSpaceError>{mapped->status} : std::unexpected(mapped.error());
         } else if (kind == VM_OP_UNMAP) result = space.unmap(ctx, *where, *range);
         else if (kind == VM_OP_PROTECT) result = space.protect(ctx, *where, *range, *perms);
@@ -430,8 +430,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto pager_create(Call& inv)
     if (!object) return returned(STATUS_NO_MEMORY);
     const auto rights =
         cap::Rights::of(cap::Right::Duplicate, cap::Right::Delegate, cap::Right::Inspect, cap::Right::Attach,
-                        cap::Right::Serve, cap::Right::Supply, cap::Right::Fail, cap::Right::WritebackAck,
-                        cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
+                        cap::Right::Manage, cap::Right::Serve, cap::Right::Supply, cap::Right::Close, cap::Right::Destroy, cap::Right::Adopt, cap::Right::Reassign, cap::Right::Revoke);
     const auto caps = std::array<cap::View, 1>{cap::View{rights}};
     auto root = inv.cpu.grants.create_root(std::move(*admission), object->reference(), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
@@ -496,8 +495,8 @@ template<usize op> [[nodiscard]] auto scope_create(Call& inv) noexcept -> Result
     return publication(publish(inv, *scope, *root, *quota, caps));
 }
 
-static auto publish_memory(Call& inv, cap::Resolved<resource::Quota>& pool, usize size,
-                           mm::Perms access, mm::Mem::Config config, const cap::GrantPin* dependency = nullptr) noexcept -> Result {
+template<usize N = 0> static auto publish_memory(Call& inv, cap::Resolved<resource::Quota>& pool, usize size,
+                           mm::Perms access, mm::Mem::Config config, const std::array<const cap::GrantPin*, N>& dependencies = {}) noexcept -> Result {
     auto admission = check_create<mm::Mem>(inv, pool, object::pool<mm::Mem>::slot_usage());
     if (!admission) return returned(admission.error());
     auto fee = reserve(pool, object::pool<mm::Mem>::slot_usage());
@@ -518,8 +517,8 @@ static auto publish_memory(Call& inv, cap::Resolved<resource::Quota>& pool, usiz
     auto root = inv.cpu.grants.create_root(std::move(*admission), object->reference(), caps[0]);
     if (!root) return returned(STATUS_NO_MEMORY);
     Result result;
-    if (dependency) {
-        result = publish_bound(inv, *object, *root, caps[0], std::array{dependency});
+    if constexpr (N) {
+        result = publish_bound(inv, *object, *root, caps[0], dependencies);
         if (result.status == STATUS_OK) object->publish().reset();
     } else result = publication(publish(inv, *object, *root, pool, caps));
     if (result.status == STATUS_OK && pending) { obj.op().publish(); obj.op().post(); result.status = STATUS_PENDING; }
@@ -539,13 +538,36 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_pager(Cal
     if (!pool || !pager) return returned(cap_status(!pool ? pool.error() : pager.error()));
     const auto size = inv.trap.arg(1), flags = inv.trap.arg(4), credits = inv.trap.arg(5);
     const auto access = perms_of(inv.trap.arg(2));
-    if (!size || size % mm::page_size || !access || !credits || (flags & ~usize{MEMORY_PAGER_PRIVATE}))
+    if (!size || size % mm::page_size || !access || !credits || (flags & ~usize{MEMORY_PAGER_ANON}))
         return returned(STATUS_BAD_ARGS);
     auto reference = pager->reference();
     if (!reference) return returned(STATUS_BUSY);
     return publish_memory(inv, *pool, size, *access,
-                          mm::PagedCfg{std::move(*reference), *access, bool(flags & MEMORY_PAGER_PRIVATE), credits}, &pager->pin());
+                          mm::PagedCfg{std::move(*reference), *access, bool(flags & MEMORY_PAGER_ANON), credits}, std::array{&pager->pin()});
 }
+template<usize op> auto memory_clone(Call& inv) noexcept -> Result {
+    auto pool = resolve_pool(inv, cap::Right::Create);
+    auto source = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Map));
+    if (!pool || !source) return returned(cap_status(!pool ? pool.error() : source.error()));
+    const mm::ObjectRange range{inv.trap.arg(2), inv.trap.arg(3)};
+    const auto view = source->view();
+    const auto* limit = std::get_if<cap::MemLimit>(&view.data);
+    if (range.empty() || !range.within(source->object().page_count()) || !limit || !limit->range.contains(range)
+        || !limit->perms.contains(mm::Perm::Read)) return returned(STATUS_BAD_RIGHTS);
+    auto src = source->reference();
+    if (!src) return returned(STATUS_CLOSED);
+    if (inv.trap.arg(4)) {
+        auto cap = inv.cspace.resolve<Pager>(handle_of(inv.trap.arg(4)), cap::Rights::of(cap::Right::Attach));
+        if (!cap) return returned(cap_status(cap.error()));
+        auto pg = cap->reference();
+        if (!pg) return returned(STATUS_CLOSED);
+        return publish_memory(inv, *pool, range.size() * mm::page_size, mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
+            mm::CopyCfg{std::move(*src), range.base(), std::move(*pg)}, std::array{&source->pin(), &cap->pin()});
+    }
+    return publish_memory(inv, *pool, range.size() * mm::page_size, mm::Perms::of(mm::Perm::Read, mm::Perm::Write),
+        mm::CopyCfg{std::move(*src), range.base(), {}}, std::array{&source->pin()});
+}
+
 static auto physical_claim(cap::Resolved<mm::Phys>& physical, cap::Resolved<resource::Quota>& pool,
                            usize address, usize bytes) noexcept -> std::expected<mm::Phys::Claim, status_t> {
     const auto pages = mm::Pages::from_aligned_bytes(mm::pa_t{address}, bytes);
@@ -572,7 +594,7 @@ template <usize op> [[gnu::noinline]] [[nodiscard]] auto memory_create_physical(
     if (!claim) return returned(claim.error());
     const auto pages = *mm::Pages::from_aligned_bytes(mm::pa_t{address}, size);
     const mm::Extent extent{{0, pages.page_count()}, pages, *access};
-    return publish_memory(inv, *pool, size, *access, mm::PhysCfg{{&extent, 1}, {}, std::move(*claim)}, &physical->pin());
+    return publish_memory(inv, *pool, size, *access, mm::PhysCfg{{&extent, 1}, {}, std::move(*claim)}, std::array{&physical->pin()});
 }
 template <usize op> [[gnu::noinline]] [[nodiscard]] auto irq_controller_create(Call& inv) noexcept -> Result {
     auto pool = resolve_pool(inv, cap::Right::Create);

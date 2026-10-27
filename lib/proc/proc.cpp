@@ -192,10 +192,10 @@ auto _proc_image::map(_vm_area& source, _cap_owner memory, uint64_t offset, uint
 class _proc_loader {
     using owner = _cap_owner;
     CreateAuth pool_;
-    cap_t vm_;
+    cap_t vm_, pager_;
 
   public:
-    _proc_loader(CreateAuth pool, cap_t vm) : pool_(pool), vm_(vm) {}
+    _proc_loader(CreateAuth pool, cap_t vm, cap_t pager) : pool_(pool), vm_(vm), pager_(pager) {}
     auto adopt(_sys_result r) noexcept -> std::expected<owner, status_t> {
         owner cap{r.value};
         if (r.status == STATUS_PENDING) r.status = _op_wait(cap.selector()).status;
@@ -215,13 +215,12 @@ class _proc_loader {
             return STATUS_BAD_ARGS;
         return _mem_write(mem, offset, {reinterpret_cast<const std::byte*>(src), n}).status;
     }
-    auto install(cap_t mem, word_t address, word_t size, word_t perms, word_t first = 0,
-                 word_t flags = 0) noexcept -> status_t {
+    auto install(cap_t mem, word_t address, word_t size, word_t perms, word_t first = 0) noexcept -> status_t {
         auto region = adopt(_vm_slice(vm_, address, size, perms, RIGHT_MAP | RIGHT_UNMAP));
         if (!region)
             return region.error();
         const auto status =
-            _vm_wait(pool_, region->selector(), VM_OP_MAP, {mem, address, size, first, perms | flags});
+            _vm_wait(pool_, region->selector(), VM_OP_MAP, {mem, address, size, first, perms});
         return status;
     }
     auto map(const libk::elf_view& elf, const _proc_image& source) noexcept -> status_t {
@@ -266,8 +265,16 @@ class _proc_loader {
                     if (status == STATUS_OK && (perms & VM_EXECUTE)) status = _memory_seal(cap).status;
                     if (status != STATUS_OK) return status;
                 }
-                const auto status = install(cap, seg.va - skip + offset, length, perms, page,
-                    shared && (perms & VM_WRITE) ? VM_MAP_PRIVATE : 0);
+                if (shared && (perms & VM_WRITE)) {
+                    auto made = adopt(_memory_clone(pool_, cap, page, length / page_size, pager_));
+                    if (!made) return made.error();
+                    mem = std::move(*made); cap = mem.selector(); page = 0;
+                }
+                if (mem && pager_ && !shared) {
+                    const auto bound = _memory_bind_pager(mem.selector(), pager_);
+                    if (bound.status != STATUS_OK) return bound.status;
+                }
+                const auto status = install(cap, seg.va - skip + offset, length, perms, page);
                 if (status != STATUS_OK)
                     return status;
                 offset += length;
@@ -350,7 +357,7 @@ auto _proc_create(const _proc_auth& auth, const _proc_image& image, const _proc_
             choices &= choices - 1;
         const auto cpu = o.cpu.value_or(std::countr_zero(choices));
         if (cpu >= 64 || !(r.cpus_ & (word_t{1} << cpu))) return STATUS_DENIED;
-        _proc_loader load{r.alloc(), r.vspace()};
+        _proc_loader load{r.alloc(), r.vspace(), o.pager};
         s = load.map(mod, image);
         if (s != STATUS_OK)
             return s;
@@ -385,7 +392,7 @@ auto _proc_create(const _proc_auth& auth, const _proc_image& image, const _proc_
         auto events = load.adopt(_port_create(r.alloc(), o.resources.watches, o.resources.hints));
         if (!events)
             return events.error();
-        libk::inplace_vector<AuxEntry, 24> aux{AuxEntry{AT_PAGESZ, page_size},
+        libk::inplace_vector<AuxEntry, 25> aux{AuxEntry{AT_PAGESZ, page_size},
                                   AuxEntry{AT_ENTRY, mod.entry()},
                                   AuxEntry{AT_SYS_CPUS, word_t(std::popcount(r.cpus_))},
                                   AuxEntry{AT_SYS_IPC, ipc_base},
@@ -418,6 +425,11 @@ auto _proc_create(const _proc_auth& auth, const _proc_image& image, const _proc_
             const auto copy = _cap_duplicate(o.bootstrap, r.cspace(), RIGHT_SEND | RIGHT_DUPLICATE);
             if (copy.status != STATUS_OK) return copy.status;
             libk_assert(aux.try_push_back(AuxEntry{AT_SYS_BOOTSTRAP, copy.value}));
+        }
+        if (o.pager) {
+            const auto copied = _cap_duplicate(o.pager, r.cspace(), RIGHT_ATTACH | RIGHT_DUPLICATE);
+            if (copied.status != STATUS_OK) return copied.status;
+            libk_assert(aux.try_push_back(AuxEntry{AT_SYS_PAGER, copied.value}));
         }
         const auto lifecycle = _channel_mint(r.lifecycle(), r.cspace(), 1, RIGHT_SEND | RIGHT_DUPLICATE);
         if (lifecycle.status != STATUS_OK) return lifecycle.status;
@@ -469,8 +481,10 @@ auto _proc_create(const _proc_auth& auth, const _proc_image& image, const _proc_
             if (copy.status != STATUS_OK) return copy.status;
             for (auto& item : aux) if (item.type == word_t(key)) item.value = copy.value;
         }
-        return load.write(stack->selector(), stack_size, stack_size - initial_bytes + pointers,
+        s = load.write(stack->selector(), stack_size, stack_size - initial_bytes + pointers,
             aux.data(), aux.size() * sizeof(AuxEntry));
+        if (s == STATUS_OK && o.pager) s = _memory_bind_pager(stack->selector(), o.pager).status;
+        return s;
     };
     const auto status = build();
     if (status != STATUS_OK) return std::unexpected(status); // r submits private Scope/Quota closure.

@@ -306,8 +306,8 @@ auto live_trim(Cpu& rt) noexcept -> bool {
         thread.block(); // This scenario driver is a kernel thread, not a provider.
         const auto result = thread.wait().result();
         if (result.status != STATUS_OK) return std::unexpected(MemErr::BackingFailed);
-        if (result.value == MEM_TRIM_BUSY) return std::unexpected(MemErr::Busy);
-        return result.value == MEM_TRIM_DIRTY ? std::expected<void, MemErr>{std::unexpected(MemErr::Dirty)}
+        if (result.value == Mem::trim_busy) return std::unexpected(MemErr::Busy);
+        return result.value == Mem::trim_dirty ? std::expected<void, MemErr>{std::unexpected(MemErr::Dirty)}
             : std::expected<void, MemErr>{};
     };
     if (!trim() || mem->state() != MemState::Live ||
@@ -327,15 +327,47 @@ auto live_trim(Cpu& rt) noexcept -> bool {
     if (!mem->observe_usage(0, false, true)) return false;
     held->reset();
     auto dirty = trim();
-    if (dirty || dirty.error() != MemErr::Dirty || mem->query(0).value() != ContentState::Resident ||
-        !mem->writeback(0))
+    if (dirty || dirty.error() != MemErr::Dirty) return false;
+    auto staged = k.objects.get<Mem>().create({}, k.pmm, page_size, AnonCfg{.eager=true});
+    if (!staged) return false;
+    auto snapshot = std::move(*staged).publish();
+    auto close_snapshot = libk::on_scope_exit([&]() noexcept { (void)snapshot.destroy(); snapshot.reset(); });
+    auto capture = [&]() noexcept -> std::expected<Pager::Req, MemErr> {
+        auto page = snapshot->materialize(0);
+        if (!page) return std::unexpected(page.error());
+        Source::Context context{thread, cpus, current_cpu().dispatcher()};
+        auto accepted = mem->reclaim(0, context, std::move(*page));
+        if (accepted || accepted.error() != MemErr::Pending) return std::unexpected(MemErr::InvalidState);
+        auto ready = pager->events().await(context, {.mask=SOURCE_READY});
+        if (ready.status == STATUS_PENDING) thread.block();
+        auto request = pager->claim();
+        if (!request || request->kind != Pager::Kind::Writeback) return std::unexpected(MemErr::BackingFailed);
+        return *request;
+    };
+    auto write = capture();
+    byte saved{};
+    if (!write || !snapshot->read(0, {&saved, 1}) || saved != byte{0x6b}) return false;
+    if (!mem->dirty(0)) return false;
+    held = mem->materialize(0);
+    if (!held) return false;
+    k.pmm.bytes(held->page())[0] = byte{0x7c}; held->reset();
+    if (!mem->pager_finish(pager.get(), write->id, false)) return false;
+    dirty = trim();
+    if (dirty || dirty.error() != MemErr::Dirty || !snapshot->read(0, {&saved, 1}) || saved != byte{0x6b}) return false;
+    write = capture();
+    if (!write || !snapshot->read(0, {&saved, 1}) || saved != byte{0x7c}
+        || !mem->pager_finish(pager.get(), write->id, false) || !trim() || mem->query(0).value() != ContentState::Zero)
         return false;
-    auto write = pager->claim();
-    byte byte_read{};
-    if (!write || write->kind != Pager::Kind::Writeback || !mem->read(0, {&byte_read, 1}) ||
-        byte_read != byte{0x6b} || !mem->pager_finish(pager.get(), write->id, false))
-        return false;
-    if (!trim() || mem->query(0).value() != ContentState::Zero) return false;
+    if (mem->materialize(0).error() != MemErr::Pending || !supply() || !mem->dirty(0)) return false;
+    write = capture();
+    auto pg_peer = object::ref<>{pager};
+    auto made = k.objects.get<Mem>().create({}, k.pmm, page_size, PagedCfg{std::move(pg_peer), perms});
+    if (!made) return false;
+    auto peer = std::move(*made).publish();
+    auto close_peer = libk::on_scope_exit([&]() noexcept { (void)peer.destroy(); peer.reset(); });
+    if (!write || peer->materialize(0).error() != MemErr::Pending || !pager->close(true)
+        || peer->query(0).value() != ContentState::Failed || mem->query(0).value() != ContentState::Resident
+        || pager->reply(write->id)) return false;
     console::print<"[scenario] live trim ok: two spaces, partial range, wired Busy, refault, dirty writeback\n">();
     return true;
 }

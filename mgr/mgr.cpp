@@ -287,7 +287,8 @@ auto mgr::start(mgr_child& child) -> status_t {
     const auto cpu = child.recipe_.data["cpu"].as<uint32_t>();
     auto auth = child.auth; auth.alloc.scope = child.scope.selector();
     auto prepared = _proc_create(auth, *image,
-        {.argv=args, .envp=env, .bootstrap=door->selector(), .resources=resources, .cpu=cpu, .events=&_events()});
+        {.argv=args, .envp=env, .bootstrap=door->selector(), .pager=child.recipe_.capability(child.recipe_.data["native"]["pager"]),
+            .resources=resources, .cpu=cpu, .events=&_events()});
     if (!prepared) return fail(prepared.error());
     child.task = std::make_unique<_proc>(std::move(*prepared));
     child.cpu = {};
@@ -1167,6 +1168,7 @@ auto mgr::open() -> status_t {
         {"version", ubus_type::U64, true}, {"resources", ubus_type::Record, true}, {"routes", ubus_type::Record, true},
         {"exports", ubus_type::Array, true, UINT64_MAX, {{"", ubus_type::String}}},
         {"image", ubus_type::Buffer, true}, {"setup", ubus_type::Record, true},
+        {"native", ubus_type::Record, true, UINT64_MAX, {{"pager", ubus_type::Cap, true}}},
         {"start", ubus_type::Bool, true}, {"restart", ubus_type::Bool, true}, {"capacity", ubus_type::U64, true}};
     for (const auto status : {
         add("Attach", {{"scope", ubus_type::Cap}, {"observe", ubus_type::Cap}, {"manage", ubus_type::Cap, true}, {"version", ubus_type::U64, true}}, {{"version", ubus_type::U64}}),

@@ -91,6 +91,7 @@ extern "C" auto crt_boot(word_t* stack) noexcept -> uintptr_t {
         case AT_SYS_IPC_REGION: initial.ipc_region = aux->value; break;
         case AT_SYS_GUARD_SIZE: initial.guard_size = aux->value; break;
         case AT_PAGESZ: page_size = true; if (aux->value != 4096) _thread_exit(STATUS_BAD_ARGS); break;
+        case AT_SYS_PAGER: startup.pager = aux->value; break;
         case AT_SYS_QUOTA: startup.quota = aux->value; break;
         case AT_SYS_SCOPE: startup.scope = aux->value; break;
         case AT_SYS_DOMAIN: startup.domain = aux->value; break;
@@ -163,7 +164,7 @@ extern "C" [[noreturn]] void crt_start(word_t* stack) noexcept {
     size_t envc{}, bytes{};
     for (size_t i = 0; i < size_t(argc); ++i) bytes += ::strlen(source[i]) + 1;
     for (; envp[envc]; ++envc) bytes += ::strlen(envp[envc]) + 1;
-    address_space.space = startup.vspace;
+    address_space.space = startup.vspace; address_space.pager = startup.pager;
     init_heap(startup.alloc(), address_space);
     auto** argv = static_cast<char**>(::malloc((argc + envc + 2) * sizeof(char*) + bytes));
     if (!argv) _thread_exit(STATUS_NO_MEMORY);

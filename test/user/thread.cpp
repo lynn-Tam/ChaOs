@@ -201,7 +201,8 @@ static void file_barriers() {
     check(reply.count == 1);
     const auto scope = _scope_create(env.alloc()); check(scope.status == STATUS_OK); _cap_owner nested{scope.value};
     auto stack = _vm_area::create(env.alloc(), _vm(), 0, 16 * 1024); check(bool(stack));
-    auto ipc = _vm_area::create(env.alloc(), _vm(), 0, 4096); check(bool(ipc));
+    auto wired = _vm(); wired.pager = 0;
+    auto ipc = _vm_area::create(env.alloc(), wired, 0, 4096); check(bool(ipc));
     check(_memory_populate(ipc->memory.selector(), 0).status == STATUS_OK);
     const auto descriptor = _memory_create(env.alloc(), 4096, VM_READ | VM_WRITE); check(descriptor.status == STATUS_OK);
     _cap_owner start{descriptor.value};

@@ -218,19 +218,6 @@ inline void _yield() noexcept {
     return _call(SYS_MEMORY_CREATE, auth.quota, size, access, 0, 0, 0, auth.scope);
 }
 
-// Data is snapshotted from the registered IPC buffer. The destination must
-// remain private, writable and anonymous; no mapping/TLB teardown is needed.
-[[nodiscard]] inline auto _mem_trim(cap_t mem, word_t first, word_t count) noexcept -> _sys_result {
-    auto result = _call(SYS_MEM_TRIM, mem, first, count);
-    if (result.status == STATUS_OK && result.value == MEM_TRIM_DIRTY) result.status = STATUS_DIRTY;
-    if (result.status == STATUS_OK && result.value == MEM_TRIM_BUSY) result.status = STATUS_BUSY;
-    if (result.status == STATUS_OK && result.value == MEM_TRIM_CANCELED) result.status = STATUS_CANCELED;
-    return result;
-}
-[[nodiscard]] inline auto _mem_writeback(cap_t mem, word_t page) noexcept -> _sys_result {
-    return _call(SYS_MEM_WRITEBACK, mem, page);
-}
-
 [[nodiscard]] inline auto _memory_populate(cap_t memory, word_t page) noexcept -> _sys_result {
     return _call(SYS_MEMORY_POPULATE, memory, page);
 }
@@ -260,21 +247,20 @@ inline void _yield() noexcept {
     return _call(SYS_PAGER_CLAIM, pager);
 }
 
-[[nodiscard]] inline auto _pager_complete(cap_t pager, cap_t memory, word_t id) noexcept -> _sys_result {
-    return _call(SYS_PAGER_COMPLETE, pager, memory, id);
+[[nodiscard]] inline auto _pager_complete(cap_t pager, word_t id) noexcept -> _sys_result {
+    return _call(SYS_PAGER_COMPLETE, pager, id);
 }
 
-[[nodiscard]] inline auto _pager_fail(cap_t pager, cap_t memory, word_t id) noexcept -> _sys_result {
-    return _call(SYS_PAGER_FAIL, pager, memory, id);
+[[nodiscard]] inline auto _pager_fail(cap_t pager, word_t id, word_t flags = 0) noexcept -> _sys_result {
+    return _call(SYS_PAGER_FAIL, pager, id, flags);
 }
 
 [[nodiscard]] inline auto _pager_requeue(cap_t pager, word_t id) noexcept -> _sys_result {
     return _call(SYS_PAGER_REQUEUE, pager, id);
 }
 
-[[nodiscard]] inline auto _pager_supply(cap_t pager, cap_t memory, cap_t staging,
-    word_t page, word_t id) noexcept -> _sys_result {
-    return _call(SYS_PAGER_SUPPLY, pager, memory, staging, page, id);
+[[nodiscard]] inline auto _pager_supply(cap_t pager, word_t id, cap_t staging, word_t page, word_t flags = 0) noexcept -> _sys_result {
+    return _call(SYS_PAGER_SUPPLY, pager, id, staging, page, flags);
 }
 
 [[nodiscard]] inline auto _irq_set(cap_t irq, bool enabled) noexcept -> _sys_result {
@@ -511,4 +497,38 @@ inline void _yield() noexcept {
     for (;;) {
         asm volatile("wfi");
     }
+}
+
+[[nodiscard]] inline auto _memory_bind_pager(cap_t memory, cap_t pager) noexcept -> _sys_result {
+    return _call(SYS_MEMORY_BIND_PAGER, memory, pager);
+}
+[[nodiscard]] inline auto _pager_records(cap_t pager, word_t key = 0, word_t cursor = 0, word_t aliases = 0, bool sample = false, word_t maps = 0) noexcept -> _sys_result {
+    return _call(SYS_PAGER_RECORDS, pager, key, cursor, aliases, sample, maps);
+}
+[[nodiscard]] inline auto _pager_reclaim(cap_t pager, word_t key, word_t page,
+    cap_t snapshot = 0, word_t destination = 0) noexcept -> _sys_result {
+    return _call(SYS_PAGER_RECLAIM, pager, key, page, snapshot, destination);
+}
+[[nodiscard]] inline auto _pager_dirty(cap_t pager, word_t key, word_t page) noexcept -> _sys_result {
+    return _call(SYS_PAGER_DIRTY, pager, key, page);
+}
+
+[[nodiscard]] inline auto _memory_clone(CreateAuth auth, cap_t source, word_t first, word_t count, cap_t pager = 0) noexcept -> _sys_result {
+    return _call(SYS_MEMORY_CLONE, auth.quota, source, first, count, pager, 0, auth.scope);
+}
+
+[[nodiscard]] inline auto _memory_info(cap_t physical) noexcept -> _sys_result { return _call(SYS_MEMORY_INFO, physical); }
+[[nodiscard]] inline auto _memory_watch(cap_t physical, word_t low, word_t high, word_t reserve) noexcept -> _sys_result {
+    return _call(SYS_MEMORY_WATCH, physical, low, high, reserve);
+}
+
+[[nodiscard]] inline auto _pager_buffer(cap_t pager, word_t operation, word_t memory_or_slot, word_t page = 0) noexcept -> _sys_result {
+    return _call(SYS_PAGER_BUFFER, pager, operation, memory_or_slot, page);
+}
+[[nodiscard]] inline auto _pager_restore(cap_t pager, word_t key, word_t page) noexcept -> _sys_result {
+    return _call(SYS_PAGER_RESTORE, pager, key, page);
+}
+
+[[nodiscard]] inline auto _pager_configure(cap_t pager, bool set = false, word_t limit = 0) noexcept -> _sys_result {
+    return _call(SYS_PAGER_CONFIGURE, pager, set, limit);
 }

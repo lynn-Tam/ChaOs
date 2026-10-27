@@ -8,7 +8,7 @@ extern "C" char** environ;
 
 // Native execution context only. The runtime never interprets the environment.
 struct _env {
-    cap_t quota{}, scope{}, vspace{}, cspace{}, domain{}, bootstrap{}, lifecycle{};
+    cap_t quota{}, scope{}, vspace{}, cspace{}, domain{}, bootstrap{}, lifecycle{}, pager{};
     auto alloc() const noexcept -> CreateAuth { return {quota, scope}; }
     word_t cpus{}, frequency{};
     std::span<const std::byte> boot{};

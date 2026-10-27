@@ -32,7 +32,7 @@ int main() {
     if (!archive_idx) return archive_idx.error();
     const auto firmware_idx = recipe.attach(root.firmware, RIGHT_MAP | RIGHT_DUPLICATE);
     if (!firmware_idx) return firmware_idx.error();
-    const auto phys_idx = recipe.attach(root.physical, RIGHT_CREATE | RIGHT_CONTROL | RIGHT_DUPLICATE);
+    const auto phys_idx = recipe.attach(root.physical, RIGHT_CREATE | RIGHT_CONTROL | RIGHT_INSPECT | RIGHT_DUPLICATE);
     if (!phys_idx) return phys_idx.error();
     payload.put("archive", ubus_buffer{*archive_idx, 0, root.bundle_bytes})
         .put("firmware", ubus_buffer{*firmware_idx, root.firmware_offset, root.firmware_bytes})

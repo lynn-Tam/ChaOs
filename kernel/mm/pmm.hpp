@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <atomic>
+#include <libk/delegate.hpp>
 #include <stdint.h>
 
 #include <libk/types.hpp>
@@ -157,6 +158,12 @@ class Pmm {
     ~Pmm() noexcept;
 
     [[nodiscard]] auto allocate_page() noexcept -> AllocateResult;
+    using Notify = libk::delegate<void() noexcept>;
+    // Notification only queues bounded work, never allocates or enters PMM.
+    void watch(Notify) noexcept;
+    auto configure(usize low, usize high, usize floor) noexcept -> bool;
+    auto pressured() const noexcept -> bool;
+    auto reserve_pages() const noexcept -> usize;
     [[nodiscard]] auto group() noexcept -> PageGroup;
     [[nodiscard]] auto take_boot() noexcept -> std::optional<BootPages>;
     [[nodiscard]] auto take_boot(Pages range) noexcept -> std::optional<BootPages>;
@@ -192,6 +199,10 @@ class Pmm {
 
   private:
     friend class OwnedPage;
+    friend class Cache;
+    auto allocate_reserved() noexcept -> AllocateResult;
+    auto allocate_page(bool reserve) noexcept -> AllocateResult;
+    void pressure() noexcept;
     friend class PageGroup;
     friend class BootPages;
 
@@ -286,6 +297,9 @@ class Pmm {
     size_t outstanding_groups_{};
     size_t next_group_id_{};
     size_t issued_reservations_{};
+    usize free_{}, low_{}, high_{}, floor_{};
+    bool pressure_{};
+    Notify observer_;
 };
 
 // The caller serializes this owner; Pmm serializes descriptor mutations.

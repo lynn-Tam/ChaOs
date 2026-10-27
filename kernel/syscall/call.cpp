@@ -1,6 +1,8 @@
 #include <expected>
 #include <optional>
 #include <mm/mem.hpp>
+#include <mm/phys.hpp>
+#include <pte.hpp>
 #include <object/ref.hpp>
 #include <syscall/call.hpp>
 #include <object/pool.hpp>
@@ -102,6 +104,7 @@ auto read_desc_bytes(
     case mm::MemErr::OutOfMemory:
     case mm::MemErr::ResourceExhausted:
         return std::unexpected(STATUS_NO_MEMORY);
+    case mm::MemErr::Forwarded:
     case mm::MemErr::Pending:
         return std::unexpected(STATUS_WOULD_BLOCK);
     case mm::MemErr::BackingFailed:
@@ -327,6 +330,7 @@ auto mem_status(mm::MemErr error) noexcept
     case mm::MemErr::InvalidState:
     case mm::MemErr::AttachmentState:
         return STATUS_BUSY;
+    case mm::MemErr::Forwarded:
     case mm::MemErr::Pending:
         return STATUS_WOULD_BLOCK;
     case mm::MemErr::BackingFailed:
@@ -389,7 +393,7 @@ template<usize op>
         handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Manage));
     if (!memory) return returned(cap_status(memory.error()));
     const usize page = inv.trap.arg(1);
-    const mm::ObjectRange range{page, op == SYS_MEM_TRIM ? inv.trap.arg(2) : 1};
+    const mm::ObjectRange range{page, 1};
     if (range.empty() || !range.limit() || *range.limit() > memory.value()->page_count())
         return returned(STATUS_BAD_ARGS);
     const auto view = memory->view();
@@ -402,24 +406,9 @@ template<usize op>
     auto& mem = memory->object();
     auto* cpus = inv.cpu.cpus;
     libk_assert(cpus);
-    const auto result = [&]() {
-        if constexpr (op == SYS_MEM_TRIM) {
-            Source::Context context{*thread, *cpus, inv.cpu.dispatcher()};
-            std::array<const cap::GrantPin*, 1> grants{&memory->pin()};
-            std::array<const object::ref<>*, 1> gates{&*ref};
-            return mem.trim(range, context, inv.cpu.grants.admission(grants), gates, &memory->pin());
-        }
-        else if constexpr (op == SYS_MEM_WRITEBACK) return mem.writeback(page);
-        else {
-            Source::Context context{*thread, *cpus, inv.cpu.dispatcher()};
-            const auto page_result = mem.materialize(page, &context);
-            return page_result ? std::expected<void, mm::MemErr>{} : std::unexpected(page_result.error());
-        }
-    }();
-    if constexpr (op == SYS_MEMORY_POPULATE)
-        if (!result && result.error() == mm::MemErr::Pending) return {STATUS_PENDING, 0, Disposition::Retry};
-    if constexpr (op == SYS_MEM_TRIM)
-        if (!result && result.error() == mm::MemErr::Pending) return {STATUS_PENDING, 0, Disposition::Park};
+    Source::Context context{*thread, *cpus, inv.cpu.dispatcher()};
+    const auto result = mem.materialize(page, &context);
+    if (!result && result.error() == mm::MemErr::Pending) return {STATUS_PENDING, 0, Disposition::Retry};
     return returned(thread->stop_requested() ? STATUS_CANCELED
                     : result ? STATUS_OK : mem_status(result.error()));
 }
@@ -759,15 +748,22 @@ template<usize op>
 [[nodiscard]] static auto pager_descriptor(
     const Pager::Req& request) noexcept -> PagerReq {
     PagerReq descriptor{};
-    descriptor.kind = request.kind == Pager::Kind::PageIn
-        ? PAGER_REQUEST_PAGE_IN : PAGER_REQUEST_WRITEBACK;
+    descriptor.kind = request.kind == Pager::Kind::PageIn ? PAGER_REQUEST_PAGE_IN
+        : request.kind == Pager::Kind::Writeback ? PAGER_REQUEST_WRITEBACK
+        : request.kind == Pager::Kind::Capacity ? PAGER_REQUEST_CAPACITY : PAGER_REQUEST_RECLAIMED;
     descriptor.id = request.id;
+    descriptor.key = request.key;
     descriptor.page_index = request.page_index;
     if (request.kind == Pager::Kind::PageIn) {
         descriptor.payload.page_in.first = request.first;
         descriptor.payload.page_in.count = request.count;
-    } else {
+    } else if (request.kind == Pager::Kind::Writeback) {
         descriptor.payload.writeback.dirty_epoch = request.dirty_epoch;
+    } else if (request.kind == Pager::Kind::Reclaimed) {
+        descriptor.payload.reclaimed.status = static_cast<word_t>(static_cast<isize>(request.status));
+        descriptor.payload.reclaimed.pages = request.count;
+    } else if (request.kind == Pager::Kind::Capacity) {
+        descriptor.payload.capacity.quota = request.quota;
     }
     return descriptor;
 }
@@ -810,6 +806,7 @@ static auto pg_claim(Call& inv) noexcept -> Result {
 
 template<usize op>
 static auto pg_finish(Call& inv) noexcept -> Result {
+    if constexpr (op == SYS_PAGER_FAIL) if (inv.trap.arg(2) & ~word_t{PAGER_FAIL_RETRY}) return returned(STATUS_BAD_ARGS);
     const auto right = op == SYS_PAGER_REQUEUE ? cap::Right::Serve : cap::Right::Supply;
     auto pager = inv.cspace.resolve<Pager>(handle_of(inv.trap.arg(0)), cap::Rights::of(right));
     if (!pager) return returned(cap_status(pager.error()));
@@ -821,42 +818,133 @@ static auto pg_finish(Call& inv) noexcept -> Result {
         const auto result = pager.value()->requeue(inv.trap.arg(1), pager->pin().graph().admission(grants), gates);
         return result ? returned(STATUS_OK) : returned(pager_error(result.error()));
     }
-    auto memory = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(1)),
-        cap::Rights::of(cap::Right::Manage));
-    if (!memory) return returned(cap_status(memory.error()));
+    auto target = pager->object().memory(inv.trap.arg(1));
+    if (!target) return returned(STATUS_RETRY);
+    auto memory = target.as<mm::Mem>();
     auto pager_ref = pager->reference();
-    auto memory_ref = memory->reference();
-    if (!pager_ref || !memory_ref) return returned(STATUS_CLOSED);
-    const cap::GrantPin* grants[]{&pager->pin(), &memory->pin()};
-    const object::ref<>* gates[]{&*pager_ref, &*memory_ref};
-    const auto result = memory.value()->pager_finish(pager.value().object(), inv.trap.arg(2),
-        op == SYS_PAGER_FAIL, pager->pin().graph().admission(grants), gates);
-    return result ? returned(STATUS_OK) : returned(mem_status(result.error()));
+    const cap::GrantPin* grants[]{&pager->pin()};
+    const object::ref<>* gates[]{&*pager_ref, &target};
+    const auto result = memory->get().pager_finish(pager->object(), inv.trap.arg(1),
+        op == SYS_PAGER_FAIL, pager->pin().graph().admission(grants), gates, op == SYS_PAGER_FAIL && inv.trap.arg(2));
+    return result ? returned(STATUS_OK, *result) : returned(mem_status(result.error()));
 }
 
 static auto pg_supply(Call& inv) noexcept -> Result {
-    auto pager = inv.cspace.resolve<Pager>(
-        handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Supply));
-    auto target = inv.cspace.resolve<mm::Mem>(
-        handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Manage));
-    auto source = inv.cspace.resolve<mm::Mem>(
-        handle_of(inv.trap.arg(2)), cap::Rights::of(cap::Right::Manage));
-    if (!pager || !target || !source) {
-        return returned(cap_status(!pager ? pager.error()
-            : !target ? target.error() : source.error()));
+    const auto flags = inv.trap.arg(4);
+    if ((flags & ~word_t{PAGER_SUPPLY_COPY | PAGER_SUPPLY_NOWAIT}) || (flags == PAGER_SUPPLY_NOWAIT)) return returned(STATUS_BAD_ARGS);
+    auto pager = inv.cspace.resolve<Pager>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Supply));
+    auto source = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(2)), cap::Rights::of(flags ? cap::Right::Map : cap::Right::Manage));
+    if (!pager || !source) return returned(cap_status(!pager ? pager.error() : source.error()));
+    const auto view = source->view(); const auto* limit = std::get_if<cap::MemLimit>(&view.data);
+    if (!limit || !limit->range.contains(inv.trap.arg(3))) return returned(STATUS_DENIED);
+    auto target = pager->object().memory(inv.trap.arg(1));
+    if (!target) return returned(STATUS_RETRY);
+    auto memory = target.as<mm::Mem>();
+    auto pg = pager->reference(), src = source->reference();
+    if (!pg || !src) return returned(STATUS_CLOSED);
+    const cap::GrantPin* grants[]{&pager->pin(), &source->pin()};
+    const object::ref<>* gates[]{&*pg, &target, &*src};
+    if (flags) {
+        if (!limit->perms.contains(mm::Perm::Read) || source->object().kind() != mm::BackingKind::Anonymous) return returned(STATUS_BAD_RIGHTS);
+        const auto ready = source->object().query(inv.trap.arg(3));
+        if (!ready || *ready != mm::ContentState::Resident) return returned(STATUS_BAD_ARGS);
+        auto page = source->object().materialize(inv.trap.arg(3));
+        if (!page) return returned(mem_status(page.error()));
+        const auto copied = memory->get().supply(pager->object(), *page, inv.trap.arg(1),
+            pager->pin().graph().admission(grants), gates, !(flags & PAGER_SUPPLY_NOWAIT));
+        return copied ? returned(STATUS_OK) : returned(mem_status(copied.error()));
     }
-    auto transfer = source.value()->begin_transfer(inv.trap.arg(3));
+    auto transfer = source->object().begin_transfer(inv.trap.arg(3));
     if (!transfer) return returned(mem_status(transfer.error()));
-    auto pager_ref = pager->reference();
-    auto target_ref = target->reference();
-    auto source_ref = source->reference();
-    if (!pager_ref || !target_ref || !source_ref) return returned(STATUS_CLOSED);
-    const cap::GrantPin* grants[]{&pager->pin(), &target->pin(), &source->pin()};
-    const object::ref<>* gates[]{&*pager_ref, &*target_ref, &*source_ref};
-    auto supplied = target.value()->supply(pager.value().object(), std::move(*transfer),
-        inv.trap.arg(4), pager->pin().graph().admission(grants), gates);
-    return supplied ? returned(STATUS_OK)
-                    : returned(mem_status(supplied.error()));
+    auto supplied = memory->get().supply(pager->object(), std::move(*transfer), inv.trap.arg(1),
+        pager->pin().graph().admission(grants), gates);
+    return supplied ? returned(STATUS_OK) : returned(mem_status(supplied.error()));
+}
+
+static auto pager_manage(Call& inv, usize op) noexcept -> Result {
+    auto pager = inv.cspace.resolve<Pager>(handle_of(inv.trap.arg(0)),
+        op == SYS_PAGER_RECORDS ? cap::Rights::of(cap::Right::Inspect)
+        : op == SYS_PAGER_RECLAIM && inv.trap.arg(3) ? cap::Rights::of(cap::Right::Manage, cap::Right::Serve)
+        : cap::Rights::of(cap::Right::Manage));
+    if (!pager) return returned(cap_status(pager.error()));
+    auto target = inv.trap.arg(1) ? pager->object().find(inv.trap.arg(1)) : pager->object().next(0);
+    if (!target) return returned(STATUS_NOT_FOUND);
+    auto memory = target.as<mm::Mem>();
+    if (op == SYS_PAGER_RECORDS) {
+        PagerRecords out{};
+        out.version = 1; out.size = sizeof(out); out.cursor = inv.trap.arg(2); out.alias_cursor = inv.trap.arg(3); out.map_cursor = inv.trap.arg(5);
+        memory->get().records(out, inv.trap.arg(4) != 0);
+        auto next = pager->object().next(out.key);
+        out.next_key = next ? next.id().value : 0;
+        auto* buffer = inv.target->ipc_buffer();
+        if (!buffer) return returned(STATUS_BAD_ARGS);
+        auto access = buffer->access();
+        if (!access || !access->write(0, std::span<const byte>{reinterpret_cast<const byte*>(&out), sizeof(out)})) return returned(STATUS_RETRY);
+        return returned(STATUS_OK);
+    }
+    if (op == SYS_PAGER_RESTORE) {
+        auto r = memory->get().materialize(inv.trap.arg(2));
+        return !r && r.error() == mm::MemErr::Pending ? returned(STATUS_PENDING)
+            : r ? returned(STATUS_OK) : returned(mem_status(r.error()));
+    }
+    if (op == SYS_PAGER_DIRTY) {
+        auto r = memory->get().dirty(inv.trap.arg(2));
+        return r ? returned(STATUS_OK) : returned(mem_status(r.error()));
+    }
+    mm::PageHold snapshot;
+    auto pg = pager->reference();
+    const cap::GrantPin* grants[]{&pager->pin(), nullptr};
+    const object::ref<>* gates[]{&*pg, &target};
+    std::optional<cap::Resolved<mm::Mem>> destination;
+    if (inv.trap.arg(3)) {
+        auto dst = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(3)), cap::Rights::of(cap::Right::Map));
+        if (!dst) return returned(cap_status(dst.error()));
+        const auto view = dst->view();
+        const auto* limit = std::get_if<cap::MemLimit>(&view.data);
+        if (!limit || !limit->range.contains(inv.trap.arg(4)) || !limit->perms.contains(mm::Perm::Write)
+            || dst->object().kind() != mm::BackingKind::Anonymous) return returned(STATUS_BAD_RIGHTS);
+        auto ready = dst->object().query(inv.trap.arg(4));
+        if (!ready || *ready != mm::ContentState::Resident) return returned(STATUS_BAD_ARGS);
+        auto page = dst->object().materialize(inv.trap.arg(4));
+        if (!page) return returned(mem_status(page.error()));
+        snapshot = std::move(*page);
+        destination.emplace(std::move(*dst)); grants[1] = &destination->pin();
+    }
+    const auto authority = std::span{grants}.first(destination ? 2 : 1);
+    Source::Context ctx{*inv.target, *inv.cpu.cpus, inv.cpu.dispatcher()};
+    auto r = memory->get().reclaim(inv.trap.arg(2), ctx, std::move(snapshot),
+        pager->pin().graph().admission(authority), gates, authority);
+    return !r && r.error() == mm::MemErr::Pending ? returned(STATUS_PENDING)
+        : r ? returned(STATUS_OK) : returned(mem_status(r.error()));
+}
+
+template<usize op> auto phys_call(Call& inv) noexcept -> Result {
+    auto phys = inv.cspace.resolve<mm::Phys>(handle_of(inv.trap.arg(0)), cap::Rights::of(
+        op == SYS_MEMORY_INFO ? cap::Right::Inspect : cap::Right::Control));
+    if (!phys) return returned(cap_status(phys.error()));
+    const auto view = phys->view(); const auto* range = std::get_if<cap::PhysLimit>(&view.data);
+    if (!range || !range->range.contains(mm::Pages{mm::Page{0}, arch::Pte::PhysicalPages})) return returned(STATUS_DENIED);
+    if constexpr (op == SYS_MEMORY_WATCH) {
+        if ((inv.trap.arg(1) | inv.trap.arg(2) | inv.trap.arg(3)) % mm::page_size) return returned(STATUS_BAD_ARGS);
+        return returned(phys->object().configure(inv.trap.arg(1) / mm::page_size, inv.trap.arg(2) / mm::page_size,
+            inv.trap.arg(3) / mm::page_size) ? STATUS_OK : STATUS_BAD_ARGS);
+    }
+    const auto info = phys->object().info(); auto* ipc = inv.target->ipc_buffer();
+    return returned(ipc && ipc->write(0, std::span<const byte>{reinterpret_cast<const byte*>(&info), sizeof(info)}) ? STATUS_OK : STATUS_BAD_ARGS);
+}
+
+template<usize op> auto memory_bind_pager(Call& inv) noexcept -> Result {
+    auto mem = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Manage));
+    auto pager = inv.cspace.resolve<Pager>(handle_of(inv.trap.arg(1)), cap::Rights::of(cap::Right::Attach));
+    if (!mem || !pager) return returned(cap_status(!mem ? mem.error() : pager.error()));
+    const auto view = mem->view();
+    const auto* limit = std::get_if<cap::MemLimit>(&view.data);
+    if (!limit || !limit->range.contains(mm::ObjectRange{0, mem->object().page_count()})) return returned(STATUS_BAD_RIGHTS);
+    auto ref = pager->reference(), target = mem->reference();
+    if (!ref || !target) return returned(STATUS_CLOSED);
+    const object::ref<>* gates[]{&*ref, &*target};
+    auto r = mem->object().bind_pager(*ref, &pager->pin(), gates);
+    return r ? returned(STATUS_OK) : returned(mem_status(r.error()));
 }
 
 template<usize op>
@@ -895,6 +983,36 @@ static auto irq_call(Call& inv) noexcept -> Result {
 
 template<usize op>
 auto pg_call(Call& inv) noexcept -> Result {
+    if constexpr (op == SYS_PAGER_RECORDS || op == SYS_PAGER_RECLAIM || op == SYS_PAGER_DIRTY || op == SYS_PAGER_RESTORE)
+        return pager_manage(inv, op);
+    if constexpr (op == SYS_PAGER_CONFIGURE) {
+        auto pager = inv.cspace.resolve<Pager>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Manage));
+        if (!pager) return returned(cap_status(pager.error()));
+        if (inv.trap.arg(1) && !pager->object().configure(inv.trap.arg(2))) return returned(STATUS_BUSY);
+        const auto info = pager->object().info(); auto* ipc = inv.target->ipc_buffer();
+        return returned(ipc && ipc->write(0, std::span<const byte>{reinterpret_cast<const byte*>(&info), sizeof(info)}) ? STATUS_OK : STATUS_BAD_ARGS);
+    }
+    if constexpr (op == SYS_PAGER_BUFFER) {
+        auto pager = inv.cspace.resolve<Pager>(handle_of(inv.trap.arg(0)), cap::Rights::of(cap::Right::Manage));
+        if (!pager) return returned(cap_status(pager.error()));
+        const auto operation = inv.trap.arg(1);
+        if (!operation) {
+            auto mem = inv.cspace.resolve<mm::Mem>(handle_of(inv.trap.arg(2)), cap::Rights::of(cap::Right::Manage));
+            if (!mem) return returned(cap_status(mem.error()));
+            const auto view = mem->view(); const auto* limit = std::get_if<cap::MemLimit>(&view.data);
+            if (!limit || !limit->range.contains(inv.trap.arg(3))) return returned(STATUS_DENIED);
+            auto r = mem->object().buffer(inv.trap.arg(3), false);
+            if (!r) return returned(mem_status(r.error()));
+            auto ref = mem->reference(); auto registered = pager->object().buffer(std::move(*ref), inv.trap.arg(3));
+            return registered ? returned(STATUS_OK, *registered) : returned(pager_error(registered.error()));
+        }
+        if (operation > 2) return returned(STATUS_BAD_ARGS);
+        auto b = pager->object().buffer(inv.trap.arg(2), operation == 2);
+        if (!b.memory) return returned(STATUS_NOT_FOUND);
+        if (operation == 2) return returned(STATUS_OK);
+        auto mem = b.memory.as<mm::Mem>(); auto r = mem->get().buffer(b.page, true);
+        return r ? returned(STATUS_OK) : returned(mem_status(r.error()));
+    }
     if constexpr (op == SYS_PAGER_CLAIM) {
         return pg_claim(inv);
     }

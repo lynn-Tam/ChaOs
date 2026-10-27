@@ -74,6 +74,13 @@ public:
     [[nodiscard]] auto active() const noexcept -> size_t { return active_; }
     [[nodiscard]] auto depth() const noexcept -> size_t { return depth_; }
 
+    auto map(cap_t memory, uint64_t page, uint64_t count, word_t perms) noexcept -> _sys_result {
+        return _io_wait(_startup().alloc(), space_.selector(), IO_OP_MAP, {memory, page, count, 0, perms});
+    }
+    auto unmap(uint64_t address, uint64_t count) noexcept -> status_t {
+        return _io_wait(_startup().alloc(), space_.selector(), IO_OP_UNMAP, {0, 0, count, address, 0}).status;
+    }
+
     // After close starts, BAR/IRQ views may be revoked. Do not submit,
     // observe or acknowledge again; only the IOSpace state remains usable.
     [[nodiscard]] auto close() noexcept -> status_t {
@@ -81,7 +88,7 @@ public:
     }
 
     [[nodiscard]] auto submit(ubus_ticket ticket, blk_op operation,
-        uint64_t offset, size_t size, const uint8_t* source = nullptr) noexcept
+        uint64_t offset, size_t size, const uint8_t* source = nullptr, uint64_t direct = 0) noexcept
         -> status_t {
         if (ticket.slot >= depth_ || slots_[ticket.slot].active) return STATUS_BUSY;
         if (operation == blk_op::Flush) {
@@ -92,7 +99,7 @@ public:
         } else {
             if (operation != blk_op::Read && operation != blk_op::Write)
                 return STATUS_INVALID_OP;
-            if (operation == blk_op::Write && (read_only_ || source == nullptr))
+            if (operation == blk_op::Write && (read_only_ || (!source && !direct)))
                 return STATUS_DENIED;
             if (size == 0 || size > MaxTransfer || size % BlockSize != 0 || offset % BlockSize != 0
                 || offset > capacity() || size > capacity() - offset) return STATUS_BAD_ARGS;
@@ -112,15 +119,15 @@ public:
         if (operation == blk_op::Flush) {
             descriptor(head + 1, iova_ + headers_ + slot * 32 + 16, 1, 2, 0);
         } else {
-            if (operation == blk_op::Write)
+            if (operation == blk_op::Write && !direct)
                 ::memcpy(reinterpret_cast<void*>(arena_.address + data_ + slot * MaxTransfer), source, size);
-            descriptor(head + 1, iova_ + data_ + slot * MaxTransfer, size,
+            descriptor(head + 1, direct ? direct : iova_ + data_ + slot * MaxTransfer, size,
                 operation == blk_op::Write ? 1 : 3, head + 2);
             descriptor(head + 2, iova_ + headers_ + slot * 32 + 16, 1, 2, 0);
         }
         dma_write<uint16_t>(arena_.address + available_offset_ + 4 + (available_ % queue_size_) * 2, head);
         ++available_;
-        slots_[slot] = {ticket, size, operation, true};
+        slots_[slot] = {ticket, size, operation, true, direct != 0};
         ++active_;
         return STATUS_OK;
     }
@@ -156,7 +163,7 @@ public:
         completion = {slot.ticket, status == 0 ? STATUS_OK
             : status == 2 ? STATUS_INVALID_OP : STATUS_BACKING_FAILED,
             status == 0 ? slot.size : 0,
-            returned_data
+            returned_data && !slot.direct
                 ? reinterpret_cast<const uint8_t*>(arena_.address + data_ + index * MaxTransfer) : nullptr};
         slots_[index] = {};
         --active_;
@@ -282,7 +289,7 @@ private:
         ubus_ticket ticket{};
         size_t size{};
         blk_op operation{blk_op::Read};
-        bool active{};
+        bool active{}, direct{};
     };
     Slot slots_[Depth]{};
     size_t active_{};

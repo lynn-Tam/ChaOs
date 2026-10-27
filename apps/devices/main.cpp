@@ -299,7 +299,7 @@ int main() {
         iommu = _cap_owner{ctl.value};
         const auto deadline = _after(std::chrono::milliseconds{5000});
         if (!deadline) return STATUS_BAD_ARGS;
-        const auto done = _wait_one(iommu.selector(), OP_DONE, 0, *deadline, 0, SOURCE_OP);
+        const auto done = _op_wait(iommu.selector(), *deadline);
         if (done.status != STATUS_OK) return done.status;
         const auto state = _iommu_state(iommu.selector());
         if (state.status != STATUS_OK || state.value != IO_SPACE_READY) return STATUS_BACKING_FAILED;
@@ -433,6 +433,14 @@ int main() {
             items.push(row);
         }
         response.data.put("items", items); return STATUS_OK;
+    });
+    if (status == STATUS_OK) status = inventory.add("Open", {{"id", ubus_type::String}}, {{"connector", ubus_type::Cap}}, [&](auto& q, auto& r) -> status_t {
+        const auto id = *q.data["id"].template as<std::string_view>();
+        const auto record = std::ranges::find_if(records, [&](const auto& row) { return row.id == id; });
+        if (record == records.end() || !record->driver) return STATUS_NOT_FOUND;
+        auto connector = owner.lookup(record->driver->name + "/block"); if (!connector) return connector.error();
+        const auto index = r.give(std::move(*connector)); if (!index) return index.error();
+        r.data.cap("connector", *index); return STATUS_OK;
     });
     if (status == STATUS_OK) status = inventory.open();
     if (status != STATUS_OK) return status;

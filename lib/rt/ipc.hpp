@@ -13,11 +13,12 @@
 
 // Accepted effects and cleanup survive the caller. Waiting is a userspace
 // composition over the common Op source, independent of provider type.
-inline auto _op_wait(cap_t op) noexcept -> _sys_result {
+// Completion remains queryable after its notification source has closed.
+inline auto _op_wait(cap_t op, word_t deadline = 0) noexcept -> _sys_result {
     for (;;) {
         const auto result = _op_query(op);
         if (result.value2 == OP_DONE || result.status != STATUS_PENDING) return result;
-        const auto waited = _wait_one(op, OP_DONE, 0, 0, 0, SOURCE_OP);
+        const auto waited = _wait_one(op, OP_DONE, 0, deadline, 0, SOURCE_OP);
         if (waited.status != STATUS_OK && waited.status != STATUS_CLOSED) return waited;
     }
 }

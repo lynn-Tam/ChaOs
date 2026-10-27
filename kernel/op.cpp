@@ -2,7 +2,8 @@
 #include <sched/sched.hpp>
 
 // Accepted work keeps its original CPU quota independently of the submitting
-// Thread/SC. Both the provider and this Domain link share final Gate admission.
+// Thread/SC. Its Work::Link owns Domain cancellation and drain; capability
+// bindings retain only provider authority, without a duplicate Domain link.
 auto Op::admit_cpu(Publish publish) noexcept -> status_t {
     auto domain = cpu_.as<sched::ScDomain>();
     return domain ? domain->get().admit(cpu_link_, publish) : STATUS_BAD_ARGS;
@@ -63,15 +64,23 @@ auto Op::commit() noexcept -> bool {
 }
 
 auto Op::start(object::ref<> cpu, const object::ref<>& self, cap::Graph::Admission admission,
-    std::span<const object::ref<>*> gates, Source::Action install, const cap::GrantPin* provider_grant) noexcept -> status_t {
+    std::span<const object::ref<>*> gates, Source::Action install, std::span<const cap::GrantPin*> grants) noexcept -> status_t {
+    if (grants.size() > 2) return STATUS_BAD_ARGS;
+    const auto providers = std::max<usize>(1, grants.size());
+    std::array<const object::ref<>*, cap::Graph::max_attachments + 1> publication_gates;
+    if (gates.size() >= publication_gates.size()) return STATUS_BAD_ARGS;
+    std::copy(gates.begin(), gates.end(), publication_gates.begin());
     cpu_domain(std::move(cpu));
+    publication_gates[gates.size()] = &cpu_;
     auto admitted = [&]() noexcept {
         auto commit = [&]() noexcept { accept(); if (install) install(); };
         return bindings_.admit([&](std::span<cap::Attachment*> cells, Source::Action publish) noexcept {
-            const cap::Graph::Attach items[]{{provider_grant, cells[0], provider_grant ? nullptr : &self},
-                {nullptr, cells[1], &cpu_}};
-            return admission.attach(items, gates, publish) ? STATUS_OK : STATUS_CLOSED;
-        }, Source::Action::bind(commit));
+            std::array<cap::Graph::Attach, 2> items;
+            if (grants.empty()) items[0] = {nullptr, cells[0], &self};
+            else for (usize i = 0; i < grants.size(); ++i) items[i] = {grants[i], cells[i]};
+            return admission.attach(std::span{items}.first(providers),
+                std::span{publication_gates}.first(gates.size() + 1), publish) ? STATUS_OK : STATUS_CLOSED;
+        }, Source::Action::bind(commit), providers);
     };
     return admit_cpu(Publish::bind(admitted));
 }

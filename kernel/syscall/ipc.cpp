@@ -1,3 +1,5 @@
+#include <mm/phys.hpp>
+#include <pte.hpp>
 #include <expected>
 #include <optional>
 #include <syscall/call.hpp>
@@ -231,6 +233,12 @@ static auto source(cap::Resolved<void>& cap, u64 facet, u64 mask) noexcept -> So
     if (reference->kind() == ObjIoSpace && facet == SOURCE_STATE && cap.rights().contains(cap::Right::Observe)
         && !(mask & ~((u64{1} << (IO_SPACE_FAILED + 1)) - 1)))
         return &static_cast<io::Space*>(reference->get())->events();
+    if (reference->kind() == ObjPhys && facet == SOURCE_STATE && cap.rights().contains(cap::Right::Inspect)
+        && !(mask & ~SOURCE_READY)) {
+        const auto view = cap.view(); const auto* limit = std::get_if<cap::PhysLimit>(&view.data);
+        return limit && limit->range.contains(mm::Pages{mm::Page{0}, arch::Pte::PhysicalPages})
+            ? &static_cast<mm::Phys*>(reference->get())->events() : nullptr;
+    }
     if (reference->kind() == ObjIrq && facet == SOURCE_READ && cap.rights().contains(cap::Right::Observe)
         && !(mask & ~(SOURCE_READY | SOURCE_TERMINAL)))
         return &static_cast<irq::Irq*>(reference->get())->events();

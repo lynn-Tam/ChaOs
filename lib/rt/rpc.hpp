@@ -58,12 +58,8 @@ public:
         if (const auto status = readable_.close(); status != STATUS_OK) return status;
         return reply_.close();
     }
-    auto begin(cap_t endpoint, CreateAuth auth, _ev_port* events, std::span<const word_t> words,
-               std::span<const CapXfer> caps = {}, word_t tag = 0, word_t deadline = 0, _rpc_deadline policy = _rpc_deadline::Cancel) noexcept -> status_t {
+    auto prepare(CreateAuth auth, _ev_port* events) noexcept -> status_t {
         if (active()) return STATUS_BUSY;
-        committed_ = false; // A rejected reuse cannot report the preceding send.
-        if (!endpoint || words.size() > words_.size() || caps.size() > caps_.size()) return STATUS_BAD_ARGS;
-        if (const auto status = _deadline_status(deadline); status != STATUS_OK) return status;
         if (reply_.ends[0] && events != events_)
             if (const auto status = close(); status != STATUS_OK) return status;
         if (!reply_.ends[0]) {
@@ -72,6 +68,15 @@ public:
                 SOURCE_READY | SOURCE_TERMINAL, 0, 0, SOURCE_READ);
             if (status != STATUS_OK) { (void)close(); return status; }
         }
+        events_ = events; return STATUS_OK;
+    }
+    auto begin(cap_t endpoint, CreateAuth auth, _ev_port* events, std::span<const word_t> words,
+               std::span<const CapXfer> caps = {}, word_t tag = 0, word_t deadline = 0, _rpc_deadline policy = _rpc_deadline::Cancel) noexcept -> status_t {
+        if (active()) return STATUS_BUSY;
+        committed_ = false; // A rejected reuse cannot report the preceding send.
+        if (!endpoint || words.size() > words_.size() || caps.size() > caps_.size()) return STATUS_BAD_ARGS;
+        if (const auto status = _deadline_status(deadline); status != STATUS_OK) return status;
+        if (const auto status = prepare(auth, events); status != STATUS_OK) return status;
         events_ = events; endpoint_ = endpoint; tag_ = tag; deadline_ = deadline; drain_ = policy == _rpc_deadline::Admission;
         std::copy(words.begin(), words.end(), words_.begin()); size_ = words.size();
         std::copy(caps.begin(), caps.end(), caps_.begin()); count_ = caps.size();

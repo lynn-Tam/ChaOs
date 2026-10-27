@@ -69,7 +69,7 @@ public:
     // and externally resumed completion use the provider maintenance wake.
     void post() noexcept { if (!schedule()) wake(); }
     auto start(object::ref<> cpu, const object::ref<>& self, cap::Graph::Admission = {},
-        std::span<const object::ref<>*> gates = {}, Source::Action install = {}, const cap::GrantPin* provider_grant = nullptr) noexcept -> status_t;
+        std::span<const object::ref<>*> gates = {}, Source::Action install = {}, std::span<const cap::GrantPin*> grants = {}) noexcept -> status_t;
     auto canceled() const noexcept -> bool { sync::Lock guard{lock_}; return canceled_; }
     auto provider() const noexcept -> object::ref<> { sync::Lock guard{lock_}; return provider_; }
     void links(u64 cursor, LinkRecords& out) const noexcept { bindings_.links(out, LINK_USE, cursor); }
@@ -81,7 +81,7 @@ public:
         auto submit = [&]() noexcept {
             return bindings_.admit([&](std::span<cap::Attachment*> cells, Source::Action admitted) noexcept {
                 return publish(cells, cpu_, admitted);
-            }, Source::Action::bind(commit));
+            }, Source::Action::bind(commit), 1);
         };
         return admit_cpu(Publish::bind(submit));
     }

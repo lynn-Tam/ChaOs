@@ -643,7 +643,8 @@ public:
         revoked_ = false; phase_ = Phase::Idle; changed(); return true;
     }
     template<class Publish>
-    auto admit(Publish&& publish, Action commit = {}) noexcept -> status_t {
+    auto admit(Publish&& publish, Action commit = {}, usize count = N) noexcept -> status_t {
+        if (!count || count > N) return STATUS_BAD_ARGS;
         auto publishing = hold();
         sync::Lock guard{lock_};
         if (phase_ != Phase::Idle) return STATUS_BUSY;
@@ -651,27 +652,27 @@ public:
         for (usize i = 0; i < N; ++i) cells[i] = &cells_[i].attachment;
         auto install = [&]() noexcept {
             phase_ = Phase::Live; changed();
-            for (auto& cell : cells_) { cell.used = true; cell.released = false; }
+            for (usize i = 0; i < count; ++i) { cells_[i].used = true; cells_[i].released = false; }
             if (commit) commit();
         };
-        return std::forward<Publish>(publish)(std::span{cells}, Action::bind(install));
+        return std::forward<Publish>(publish)(std::span{cells}.first(count), Action::bind(install));
     }
     auto attach(std::span<const GrantPin*> grants, std::span<const object::ref<>*> gates = {},
         Action commit = {}) noexcept -> status_t {
-        if (grants.size() != N || !grants.front() || !*grants.front()) return STATUS_BAD_ARGS;
+        if (grants.empty() || grants.size() > N || !grants.front() || !*grants.front()) return STATUS_BAD_ARGS;
         return admit([&](std::span<Attachment*> cells, Action install) noexcept {
             std::array<Graph::Attach, N> items;
-            for (usize i = 0; i < N; ++i) items[i] = {grants[i], cells[i]};
-            return grants.front()->graph().admission(grants).attach(items, gates, install) ? STATUS_OK : STATUS_CLOSED;
-        }, commit);
+            for (usize i = 0; i < grants.size(); ++i) items[i] = {grants[i], cells[i]};
+            return grants.front()->graph().admission(grants).attach(std::span{items}.first(grants.size()), gates, install) ? STATUS_OK : STATUS_CLOSED;
+        }, commit, grants.size());
     }
     auto attach(std::span<const object::ref<>*> targets, Action commit = {}) noexcept -> status_t {
-        if (targets.size() != N) return STATUS_BAD_ARGS;
+        if (targets.empty() || targets.size() > N) return STATUS_BAD_ARGS;
         return admit([&](std::span<Attachment*> cells, Action install) noexcept {
             std::array<Graph::Attach, N> items;
-            for (usize i = 0; i < N; ++i) items[i] = {nullptr, cells[i], targets[i]};
-            return Graph::Admission{}.attach(items, {}, install) ? STATUS_OK : STATUS_CLOSED;
-        }, commit);
+            for (usize i = 0; i < targets.size(); ++i) items[i] = {nullptr, cells[i], targets[i]};
+            return Graph::Admission{}.attach(std::span{items}.first(targets.size()), {}, install) ? STATUS_OK : STATUS_CLOSED;
+        }, commit, targets.size());
     }
     void links(LinkRecords& out, u32 kind, u64 cursor) const noexcept {
         sync::Lock guard{lock_};
@@ -694,16 +695,17 @@ public:
         auto publishing = hold();
         std::array<object::ref<>, N> targets;
         std::array<GrantPin, N> pins;
-        std::array<const object::ref<>*, N> gates;
+        libk::inplace_vector<const object::ref<>*, N> gates;
         libk::inplace_vector<const GrantPin*, N> grants;
         sync::Lock guard{lock_};
         if (phase_ == Phase::Idle) { commit(); return true; }
         if (phase_ != Phase::Live || revoked_) return false;
         for (usize i = 0; i < N; ++i) {
+            if (!cells_[i].used) continue;
             auto& attachment = cells_[i].attachment;
             targets[i] = attachment.link_.reference();
             if (!targets[i]) return false;
-            gates[i] = &targets[i];
+            (void)gates.try_emplace_back(&targets[i]);
             if (attachment.graph_) {
                 auto pin = attachment.acquire();
                 if (!pin) return false;
@@ -712,8 +714,8 @@ public:
                 (void)grants.try_emplace_back(&pins[i]);
             }
         }
-        if (grants.empty()) return object::ref<>::publish(gates, commit);
-        return grants.front()->graph().admission(grants.span()).publish(gates, commit) == STATUS_OK;
+        if (grants.empty()) return object::ref<>::publish(gates.span(), commit);
+        return grants.front()->graph().admission(grants.span()).publish(gates.span(), commit) == STATUS_OK;
     }
     auto close() noexcept -> bool {
         { sync::Lock guard{lock_}; if (phase_ == Phase::Closed) return !calls_; }

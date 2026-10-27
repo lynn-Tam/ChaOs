@@ -23,14 +23,14 @@ constinit libk::manual_lifetime<mm::Pmm> memory_test_pmm{};
 constinit libk::manual_lifetime<WorkQueue> memory_work{};
 constinit libk::manual_lifetime<object::store<mm::VSpace, mm::Mem, Pager>> memory_test_mm{};
 
-constinit libk::manual_lifetime<mm::Mem> memory_test_object{};
-constinit libk::manual_lifetime<mm::Mem> memory_test_peer{};
-constinit libk::manual_lifetime<mm::Mem> memory_test_staging{};
+constinit libk::manual_lifetime<object::ref<mm::Mem>> memory_test_object{};
+constinit libk::manual_lifetime<object::ref<mm::Mem>> memory_test_peer{};
+constinit libk::manual_lifetime<object::ref<mm::Mem>> memory_test_staging{};
 
 struct StagingReset final {
     ~StagingReset() noexcept {
-            if (memory_test_staging) {
-            memory_test_staging->retire();
+        if (memory_test_staging) {
+            (*memory_test_staging)->retire();
             while (memory_work->run()) {}
             memory_test_staging.reset();
         }
@@ -87,29 +87,32 @@ public:
         }
         memory_test_map.reset();
 
-        [[maybe_unused]] auto& memory =
-            memory_test_mm.emplace(*memory_test_pmm, *memory_work);
+        auto& memory = memory_test_mm.emplace(*memory_test_pmm, *memory_work);
+        // Content accounting excludes the reusable object slab, whose real
+        // identity and lifetime are still exercised by every fixture Mem.
+        auto warm = memory.get<mm::Mem>().create(*memory_test_pmm, mm::page_size, mm::AnonCfg{});
+        if (!warm) return false;
+        warm->publish().reset();
+        while (memory_work->run()) {}
         return true;
     }
 
     [[nodiscard]] auto make(usize bytes, mm::Mem::Config cfg) noexcept
         -> std::expected<mm::Mem*, mm::MemErr> {
-        if (memory_test_object) { memory_test_object->retire(); while (memory_work->run()) {} memory_test_object.reset(); }
-        auto data = mm::Mem::prepare({}, *memory_test_pmm, bytes, std::move(cfg));
-        if (!data) return std::unexpected(data.error());
-        auto& memory = memory_test_object.emplace(std::move(*data));
-        memory.bind_work(*memory_work, {});
-        return &memory;
+        if (memory_test_object) { (*memory_test_object)->retire(); while (memory_work->run()) {} memory_test_object.reset(); }
+        auto made = memory().get<mm::Mem>().create(*memory_test_pmm, bytes, std::move(cfg));
+        if (!made) return std::unexpected(made.error());
+        (void)memory_test_object.emplace(std::move(*made).publish());
+        return &memory_test_object->get();
     }
 
     [[nodiscard]] auto make_peer(usize bytes, mm::Mem::Config cfg) noexcept
         -> std::expected<mm::Mem*, mm::MemErr> {
-        if (memory_test_peer) { memory_test_peer->retire(); while (memory_work->run()) {} memory_test_peer.reset(); }
-        auto data = mm::Mem::prepare({}, *memory_test_pmm, bytes, std::move(cfg));
-        if (!data) return std::unexpected(data.error());
-        auto& memory = memory_test_peer.emplace(std::move(*data));
-        memory.bind_work(*memory_work, {});
-        return &memory;
+        if (memory_test_peer) { (*memory_test_peer)->retire(); while (memory_work->run()) {} memory_test_peer.reset(); }
+        auto made = memory().get<mm::Mem>().create(*memory_test_pmm, bytes, std::move(cfg));
+        if (!made) return std::unexpected(made.error());
+        (void)memory_test_peer.emplace(std::move(*made).publish());
+        return &memory_test_peer->get();
     }
 
     [[nodiscard]] auto pmm() noexcept -> mm::Pmm& {
@@ -172,12 +175,12 @@ public:
 private:
     void reset() noexcept {
         if (memory_test_object) {
-            memory_test_object->retire();
+            (*memory_test_object)->retire();
             while (memory_work->run()) {}
             memory_test_object.reset();
         }
         if (memory_test_peer) {
-            memory_test_peer->retire();
+            (*memory_test_peer)->retire();
             while (memory_work->run()) {}
             memory_test_peer.reset();
         }
@@ -710,9 +713,9 @@ bool test_pager_backing_donates_owned_page_without_copy(
         || memory.query(1).value() != mm::ContentState::Busy) {
         return false;
     }
-    const auto exhausted = memory.materialize(0);
-    if (exhausted || exhausted.error() != mm::MemErr::ResourceExhausted) return false;
-    if (pager.pending() != 1) {
+    const auto second = memory.materialize(0);
+    if (second || second.error() != mm::MemErr::Pending) return false;
+    if (pager.pending() != 2) {
         return false;
     }
     const auto request = pager.claim();
@@ -764,10 +767,10 @@ bool test_pager_supply_moves_staging_owner(
     auto peer_ready = fixture.make_peer(mm::page_size, mm::PagedCfg{std::move(peer_pager), access});
     if (!peer_ready) return false;
     auto& peer = **peer_ready;
-    auto staged = mm::Mem::prepare({}, fixture.pmm(), mm::page_size, mm::AnonCfg{.perms = access});
+    auto staged = fixture.memory().get<mm::Mem>().create(fixture.pmm(), mm::page_size, mm::AnonCfg{.perms = access});
     if (!staged) return false;
-    auto& staging = memory_test_staging.emplace(std::move(*staged));
-    staging.bind_work(*memory_work, {});
+    (void)memory_test_staging.emplace(std::move(*staged).publish());
+    auto& staging = memory_test_staging->get();
     auto source_page = staging.materialize(0);
     if (!source_page) {
         return false;
@@ -1063,170 +1066,26 @@ bool test_pager_lease_with_missing_sibling(const TestContext&) noexcept {
     return memory.state() == MemState::Retired;
 }
 
-bool test_pager_writeback_tracks_new_writes(
-    const TestContext&) noexcept {
-    MemoryFixture fixture{};
-    if (!fixture.initialize() || !fixture.make_pager()) {
-        return false;
-    }
-    auto& pager = fixture.pager();
 
-
-    const auto access = mm::Perms::of(
-        mm::Perm::Read, mm::Perm::Write);
-    auto pager_ref = fixture.pager_ref();
-    if (!pager_ref) return false;
-    auto memory_ready = fixture.make(mm::page_size, mm::PagedCfg{std::move(pager_ref), access});
-    if (!memory_ready) return false;
-    auto& memory = **memory_ready;
-    auto cleanup = libk::on_scope_exit([&memory]() noexcept {
-        memory.retire();
-        while (memory_work->run()) {}
-    });
-    if (memory.materialize(0).error() != mm::MemErr::Pending) {
-        return false;
-    }
-    if (pager.pending() != 1) {
-        return false;
-    }
-    const auto request = pager.claim();
-    auto page = fixture.pmm().allocate_page();
-    if (!request || !page
-        || !memory.supply(pager, request.value().id, std::move(page).value())) {
-        return false;
-    }
-
-    if (!memory.observe_usage(0, true, true))
-        return false;
-    // Completion of an older snapshot must leave newer writes dirty.
-    if (!memory.writeback(0)) {
-        return false;
-    }
-    const auto writeback_claim = pager.claim();
-    if (!writeback_claim
-        || memory.pager_finish(pager, 0, false).error()
-            != mm::MemErr::OwnershipMismatch
-        || !memory.observe_usage(0, true, true)
-        || !memory.pager_finish(pager, writeback_claim.value().id, false)) {
-        return false;
-    }
-    if (!memory.writeback(0)) {
-        return false;
-    }
-    const auto retry_claim = pager.claim();
-    if (!retry_claim
-        || !memory.pager_finish(pager, retry_claim.value().id, false)
-        || memory.query(0).value() != mm::ContentState::Resident) {
-        return false;
-    }
-    memory.retire();
-    while (memory_work->run()) {}
-    return memory.state() == mm::MemState::Retired;
-}
-
-bool test_private_pager_preserves_dirty_content(const TestContext&) noexcept {
+bool test_anon_pager_zeroes_locally(const TestContext&) noexcept {
     using namespace mm;
-    MemoryFixture fixture{};
+    MemoryFixture fixture;
     if (!fixture.initialize() || !fixture.make_pager()) return false;
-
-
     auto reference = fixture.pager_ref();
     if (!reference) return false;
-    auto memory_ready = fixture.make(2 * page_size, mm::PagedCfg{std::move(reference), Perms::of(Perm::Read, Perm::Write), true});
-    if (!memory_ready) return false;
-    auto& memory = **memory_ready;
-    auto cleanup = libk::on_scope_exit([&memory]() noexcept { memory.retire();
-    while (memory_work->run()) {} });
-    auto& pager = fixture.pager();
-    for (usize index = 0; index < 2; ++index) {
-        if (memory.materialize(index).error() != MemErr::Pending) return false;
-
-        const auto request = pager.claim();
-        auto page = fixture.pmm().allocate_page();
-        if (!request || !page) return false;
-        page.value().bytes()[0] = byte{0x5a};
-        if (!memory.supply(pager, request.value().id, std::move(page).value())) return false;
-    }
-    if (!memory.observe_usage(0, false, true)
-        || memory.writeback(0).error() != MemErr::InvalidState) return false;
-    byte contents[1]{};
-    return memory.read(0, {contents, 1}) && contents[0] == byte{0x5a};
+    auto made = fixture.make(2 * page_size, PagedCfg{std::move(reference), Perms::of(Perm::Read, Perm::Write), true});
+    if (!made) return false;
+    auto& memory = **made;
+    auto cleanup = libk::on_scope_exit([&]() noexcept { memory.retire(); while (memory_work->run()) {} });
+    auto page = memory.materialize(0);
+    if (!page || fixture.pager().pending() || fixture.pmm().bytes(page->page())[0]) return false;
+    if (!memory.dirty(0)) return false;
+    fixture.pmm().bytes(page->page())[0] = byte{0x5a};
+    page->reset();
+    byte value{};
+    return memory.read(0, {&value, 1}) && value == byte{0x5a} && memory.query(1) == ContentState::Zero;
 }
 
-bool test_pager_forced_close_settles_backing_obligations(
-    const TestContext&) noexcept {
-    MemoryFixture fixture{};
-    if (!fixture.initialize() || !fixture.make_pager()) {
-        return false;
-    }
-    auto& pager = fixture.pager();
-
-
-    const auto access = mm::Perms::of(
-        mm::Perm::Read, mm::Perm::Write);
-    auto pager_ref = fixture.pager_ref();
-    if (!pager_ref) return false;
-    auto memory_ready = fixture.make(2 * mm::page_size, mm::PagedCfg{std::move(pager_ref), access});
-    if (!memory_ready) return false;
-    auto& memory = **memory_ready;
-    auto cleanup = libk::on_scope_exit([&memory]() noexcept {
-        memory.retire();
-        while (memory_work->run()) {}
-    });
-    if (memory.materialize(0).error() != mm::MemErr::Pending) {
-        return false;
-    }
-    if (pager.pending() != 1) {
-        return false;
-    }
-    const auto request = pager.claim();
-    auto page = fixture.pmm().allocate_page();
-    if (!request || !page
-        || !memory.supply(pager, request.value().id, std::move(page).value())
-        || !memory.observe_usage(0, true, true)) {
-        return false;
-    }
-    if (!memory.writeback(0)
-        || pager.pending() != 1) {
-        return false;
-    }
-    // A second page stays published-but-unclaimed so forced close also walks
-    // the real page-in Forced branch, not only the writeback edge.
-    if (memory.materialize(1).error() != mm::MemErr::Pending) {
-        return false;
-    }
-    if (pager.pending() != 2) {
-        return false;
-    }
-    const auto active = pager.claim();
-    if (!active
-        || active.value().kind != Pager::Kind::Writeback
-        || memory.writeback(0).error() != mm::MemErr::InvalidState) {
-        return false;
-    }
-    const auto queued = pager.claim();
-    if (!queued
-        || queued.value().kind != Pager::Kind::PageIn) {
-        return false;
-    }
-    if (!pager.close(true) || pager.state() != Pager::State::Closed
-        || memory.writeback(0).error() != mm::MemErr::InvalidState
-        || memory.query(1).value() != mm::ContentState::Failed
-        || pager.reply(active.value().id).error()
-            != Pager::Error::Stale
-        || pager.reply(queued.value().id).error()
-            != Pager::Error::Stale
-        || memory.pager_finish(pager, active.value().id, false)
-               .has_value()
-        || memory.pager_finish(pager, queued.value().id, true)
-               .has_value()) {
-        return false;
-    }
-    memory.retire();
-    while (memory_work->run()) {}
-    return memory.state() == mm::MemState::Retired
-        && pager.state() == Pager::State::Closed;
-}
 
 } // namespace
 
@@ -1253,8 +1112,8 @@ static bool test_pager_requests_follow_mem_lifetime(const TestContext&) noexcept
     if (!busy) return false;
     // Claims belong to the session; another authorized worker may requeue one.
     if (!pager.requeue(second->id) || pager.reply(second->id)) return false;
-    busy = Pager::Reply{}; // Abort hands the same storage back to the ready queue.
-    if (pager.pending() != 40 || pager.reply(first->id)) return false;
+    busy = Pager::Reply{}; // Releasing a transient borrow preserves the claimed id.
+    if (pager.pending() != 39 || !pager.reply(first->id)) return false;
     auto next = pager.claim();
     if (!next || next->id <= second->id) return false;
     auto held = pager.reply(next->id);
@@ -1323,18 +1182,10 @@ void register_memory_tests(TestRegistry& registry) noexcept {
         "memory",
         "forced pager close publishes backing failure",
         test_pager_force_close_publishes_backing_failure);
-    (void)registry.add(
-        "memory",
-        "pager writeback preserves newer writes",
-        test_pager_writeback_tracks_new_writes);
-    (void)registry.add("memory", "private pager preserves resident contents",
-        test_private_pager_preserves_dirty_content);
+    (void)registry.add("memory", "anonymous pager materializes zero pages without service IPC",
+        test_anon_pager_zeroes_locally);
     (void)registry.add(
         "memory",
         "resident borrow pins backing through close",
         test_pager_lease_with_missing_sibling);
-    (void)registry.add(
-        "memory",
-        "forced pager close settles active writeback and pending page-in",
-        test_pager_forced_close_settles_backing_obligations);
 }

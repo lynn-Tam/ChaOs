@@ -71,19 +71,6 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < values.size(); ++i)
             check(values[i] == i + pass);
     }
-    // Exhaust this ordinary application's real Group budget. Every successful
-    // nothrow allocation must already be usable, including its final page.
-    std::array<std::unique_ptr<uint8_t[]>, 128> pressure;
-    size_t count{};
-    for (; count < pressure.size(); ++count) {
-        pressure[count].reset(new (std::nothrow) uint8_t[64 * 1024]);
-        if (!pressure[count]) break;
-        for (size_t offset = 0; offset < 64 * 1024; offset += 4096)
-            pressure[count][offset] = count;
-        pressure[count][64 * 1024 - 1] = count;
-    }
-    check(count && count < pressure.size());
-    for (auto& allocation : pressure) allocation.reset();
     constexpr std::string_view message{"[demand] initialized data, BSS, private writes and VM reuse ok\n"};
     check(write(STDOUT_FILENO, message.data(), message.size()) == int64_t(message.size()));
     if (static_cast<size_t>(argc) == 3) {

@@ -22,6 +22,7 @@ auto run(
         return true;
     case Id::Dispatch:
     case Id::WaitPublication:
+    case Id::PhysicalPressure:
         // These scenarios need a published Cpu and run from the
         // runtime hook below. Selection itself is validated before bring-up.
         return true;
@@ -44,6 +45,7 @@ auto run_runtime(
     case Id::Off:
     case Id::Ordinary:
     case Id::Initrd:
+    case Id::PhysicalPressure:
         return true;
     }
     return false;

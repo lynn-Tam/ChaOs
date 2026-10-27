@@ -20,20 +20,19 @@ struct Map {
         usize index;
         Pin* next{};
     };
-    Map(mm::Pmm&, Space&, usize, usize) noexcept;
+    Map(Space&, usize, usize) noexcept;
     ~Map() noexcept;
     static void invalidate_mem(void*, mm::MemWork&&) noexcept;
     static void invalidate_grant(void*, object::LinkWork&&) noexcept;
     static void released(void*, mm::MemWork&&) noexcept;
     static void released(void*, object::LinkWork&&) noexcept;
-    inline static const mm::MemOps mem_ops{invalidate_mem, released};
+    inline static const mm::MemOps mem_ops{invalidate_mem, released, true};
     inline static const cap::AttachOps grant_ops{invalidate_grant, released};
     Space& owner;
     usize first, count, offset{};
     libk::intrusive_tree_hook hook;
     mm::Perms perms;
     object::ref<mm::Mem> memory;
-    mm::Slab<Pin, false> pins;
     Pin* pages{};
     mm::MemLink mem_link{this, mem_ops};
     cap::Attachment grant{this, grant_ops};
@@ -104,7 +103,7 @@ public:
         object::ref<> quota{to};
         return transaction([&](auto&& visit) { visit(fee_); }, [&] { std::swap(quota_, quota); });
     }
-    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return bindings_.admit(std::forward<Publish>(publish)); }
+    template<class Publish> auto admit(Publish&& publish, usize count) noexcept -> status_t { return bindings_.admit(std::forward<Publish>(publish), {}, count); }
     auto activate() noexcept -> status_t;
     void links(u64 cursor, LinkRecords& out) const noexcept;
     auto open(object::ref<> cpu) noexcept -> status_t;
@@ -179,8 +178,7 @@ public:
         }};
         object::ref<> quota{to};
         return transaction([&](auto&& visit) {
-            visit(fee_); maps_.charges(visit);
-            for (auto* map = mappings_.minimum(); map; map = mappings_.next(*map)) map->pins.charges(visit);
+            visit(fee_); maps_.charges(visit); pins_.charges(visit);
         }, [&] { std::swap(quota_, quota); });
     }
     auto open(object::ref<>, cap::Resolved<Iommu>&, object::ref<> cpu) noexcept -> status_t;
@@ -210,7 +208,9 @@ private:
     object::ref<Iommu> controller_;
     u32 requester_, pscid_{};
     Space* next_{};
-    mm::Slab<Map, false> maps_;
+    mm::Slab<Map, false, false> maps_;
+    mm::Slab<Map::Pin, false, false> pins_;
+    mm::PageGroup tables_;
     MapTree mappings_;
     u64 map_epoch_{1}, observed_epoch_{};
     libk::manual_lifetime<mm::PageTable> root_;

@@ -94,7 +94,7 @@ entry = static_library('kernel-entry', entry_sources,
 test_entry = static_library('kernel-test-entry', entry_sources,
   c_args: kernel_c_args, cpp_args: kernel_cpp_args + ['-DTEST_ENABLED=1'], pic: false)
 test_configs = {}
-foreach cfg : [['debug', scenario_id, get_option('panic_probe')], ['wait', 11, 0]]
+foreach cfg : [['debug', scenario_id, get_option('panic_probe')], ['wait', 11, 0], ['pressure', 12, 0]]
   test_configs += {cfg[0]: static_library('test-boot-' + cfg[0], files('test/boot.cpp'),
     c_args: kernel_c_args,
     cpp_args: kernel_cpp_args + ['-DTEST_SCENARIO=' + cfg[1].to_string(), '-DTEST_PANIC=' + cfg[2].to_string()],
@@ -149,6 +149,12 @@ kernel_wait = executable(
   'kernel_wait.elf', build_info_source,
   c_args: kernel_c_args, cpp_args: debug_build_info_args,
   link_whole: [arch, core, test_entry, trace, sync, panic, test_configs['wait'], test_module],
+  link_args: kernel_link_args, link_language: 'c', build_by_default: false,
+)
+kernel_pressure = executable(
+  'kernel_pressure.elf', build_info_source,
+  c_args: kernel_c_args, cpp_args: debug_build_info_args,
+  link_whole: [arch, core, test_entry, trace, sync, panic, test_configs['pressure'], test_module],
   link_args: kernel_link_args, link_language: 'c', build_by_default: false,
 )
 # Export only mechanism headers. Application/private trees never enter a
@@ -236,6 +242,9 @@ foreach name, spec : {
   'foreign': [files('test/user/foreign.cpp'), false],
   'supervisor': [files('test/user/supervisor.cpp'), false],
   'block': [files('apps/block/main.cpp'), false],
+  'mem': [files('apps/mem/main.cpp'), false],
+  'swap': [files('apps/swap.cpp'), true],
+  'memcheck': [files('test/user/memory.cpp'), true],
   'devices': [files('apps/devices/main.cpp'), false],
   'bootfs': [files('apps/bootfs.cpp'), false],
   'vfs': [files('apps/vfs.cpp'), false],
@@ -510,3 +519,14 @@ endif
 alias_target('kernel', kernel)
 alias_target('kernel-debug', kernel_debug)
 alias_target('bundle', [boot_bundle, bins['uart']])
+
+run_target('run-swap', command: [find_program('python3'), files('tools/build/run-console.py'),
+  qemu, kernel, storage_test_bundle, '4', 'swap'])
+run_target('run-swap-failure', command: [find_program('python3'), files('tools/build/run-console.py'),
+  qemu, kernel, storage_test_bundle, '4', 'swap-failure'])
+foreach mode : ['swap-write-error', 'swap-read-error', 'swap-device-loss', 'swap-sessions']
+  run_target('run-' + mode, command: [find_program('python3'), files('tools/build/run-console.py'),
+    qemu, kernel, storage_test_bundle, '4', mode])
+endforeach
+run_target('run-swap-physical', command: [find_program('python3'), files('tools/build/run-console.py'),
+  qemu, kernel_pressure, storage_test_bundle, '4', 'swap-physical'])

@@ -98,7 +98,8 @@ public:
         }
         auto authority = peer.release(); if (!authority) return authority.error();
         endpoint_ = std::move(*authority);
-        auto memory = _vm_area::create(_startup().alloc(), _vm(), 0, depth_ * stride_);
+        auto wired = _vm(); wired.pager = 0;
+        auto memory = _vm_area::create(_startup().alloc(), wired, 0, depth_ * stride_);
         if (!memory) return memory.error();
         buffer_ = std::move(*memory);
         const auto view = _cap_mem(RIGHT_MAP | RIGHT_DUPLICATE | RIGHT_REVOKE, 0, depth_ * stride_ / 4096, VM_READ | VM_WRITE);

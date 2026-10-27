@@ -184,6 +184,23 @@ auto ubus_rx::receive(ubus_msg& message) -> status_t {
     const auto status = input_.receive(packet).status;
     return status == STATUS_OK ? ubus_decode(std::move(packet), message, nullptr, body_limit_) : status;
 }
+auto ubus_call::prepare(cap_t endpoint, size_t bytes) -> status_t {
+    if (!endpoint || bytes > ubus_body_limit) return STATUS_BAD_ARGS;
+    if (const auto status = rpc_.prepare(_startup().alloc(), &_events()); status != STATUS_OK) return status;
+    if (peer_ != endpoint) { wire_ = {}; peer_ = endpoint; }
+    if (bytes > sizeof(wire_.words) - sizeof(ubus_envelope) && wire_.capacity < bytes) {
+        const auto size = (bytes + 4095) & ~size_t{4095};
+        const auto created = _memory_create(_startup().alloc(), size, VM_READ | VM_WRITE);
+        if (created.status != STATUS_OK) return created.status;
+        _cap_owner memory{created.value};
+        for (size_t page = 0; page < size / 4096; ++page) {
+            const auto status = _memory_populate(memory.selector(), page).status;
+            if (status != STATUS_OK) return status;
+        }
+        wire_.body = std::move(memory); wire_.capacity = size;
+    }
+    return STATUS_OK;
+}
 auto ubus_call::begin(cap_t endpoint, ubus_msg message, bool drain) -> status_t {
     if (rpc_.active()) return STATUS_BUSY;
     if (peer_ != endpoint) { wire_ = {}; peer_ = endpoint; }
@@ -496,13 +513,22 @@ auto ubus_conn::install(_cap_owner endpoint, ubus_value object, std::string_view
         || object["methods"].type() != ubus_type::Array || !description.assign(object.bytes())) return STATUS_PEER_FAULT;
     endpoint_ = std::move(endpoint); description_ = std::move(description); return STATUS_OK;
 }
+auto ubus_conn::begin_adopt(_cap_owner endpoint, std::string_view interface, uint64_t minimum,
+                            uint64_t maximum, uint64_t features, uint64_t deadline) -> status_t {
+    if (call_.active()) return STATUS_BUSY;
+    ubus_msg request; request.deadline = deadline;
+    const auto status = call_.begin(endpoint.selector(), std::move(request));
+    if (status == STATUS_OK) binding_.emplace(std::string{interface}, minimum, maximum, features, std::move(endpoint));
+    return status;
+}
 auto ubus_conn::adopt(_cap_owner endpoint, std::string_view interface, uint64_t minimum,
                       uint64_t maximum, uint64_t features) -> status_t {
+    auto status = begin_adopt(std::move(endpoint), interface, minimum, maximum, features);
+    if (status != STATUS_OK) return status;
     ubus_msg response;
-    auto status = call_.begin(endpoint.selector(), {});
-    if (status == STATUS_OK) status = call_.wait(response);
-    if (status == STATUS_OK) status = response.status;
-    return status == STATUS_OK ? install(std::move(endpoint), response.data.view(), interface, minimum, maximum, features) : status;
+    status = call_.wait(response);
+    if (status == STATUS_OK) return bound(response);
+    binding_.reset(); return status;
 }
 auto ubus_conn::state() const -> status_t {
     if (!endpoint_) return STATUS_CLOSED;
@@ -527,12 +553,12 @@ auto ubus_conn::token(std::string_view name) const -> std::optional<word_t> {
         if (method["name"].as<std::string_view>() == name) return method["token"].as<word_t>();
     return {};
 }
-auto ubus_conn::begin(std::string_view name, ubus_msg request) -> status_t {
+auto ubus_conn::begin(std::string_view name, ubus_msg request, bool drain) -> status_t {
     const auto method = token(name);
     if (!method) return STATUS_INVALID_OP;
     // The native tag carries the method; no duplicate request sequence exists.
     request.tag = *method;
-    return call_.begin(endpoint(), std::move(request));
+    return call_.begin(endpoint(), std::move(request), drain);
 }
 auto ubus_conn::invoke(std::string_view name, ubus_msg request, ubus_msg& response) -> status_t {
     const auto status = begin(name, std::move(request));

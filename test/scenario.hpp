@@ -16,6 +16,7 @@ enum class Id : u16 {
     RemoteDelivery = 4,
     Dispatch = 7,
     WaitPublication = 11,
+    PhysicalPressure = 12,
 };
 
 extern const Id selected;

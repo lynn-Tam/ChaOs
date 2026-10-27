@@ -102,6 +102,7 @@ public:
     auto pending() const noexcept -> bool { return rpc_.pending(); }
     auto sent() const noexcept -> bool { return rpc_.sent(); }
     auto deadline() const noexcept -> std::optional<word_t> { return rpc_.deadline(); }
+    auto prepare(cap_t endpoint, size_t bytes = 0) -> status_t;
     auto begin(cap_t endpoint, ubus_msg message, bool drain = false) -> status_t;
     auto commit() -> status_t;
     auto poll(ubus_msg&) -> status_t;
@@ -163,6 +164,8 @@ public:
     auto state() const -> status_t;
     auto close() -> status_t;
     auto release() -> std::expected<_cap_owner, status_t>;
+    auto begin_adopt(_cap_owner endpoint, std::string_view interface = {}, uint64_t minimum = 0,
+                     uint64_t maximum = UINT64_MAX, uint64_t features = 0, uint64_t deadline = 0) -> status_t;
     auto adopt(_cap_owner endpoint, std::string_view interface = {}, uint64_t minimum = 0,
                uint64_t maximum = UINT64_MAX, uint64_t features = 0) -> status_t;
     auto begin_bind(cap_t connector, std::string_view interface = {}, uint64_t minimum = 0,
@@ -174,7 +177,7 @@ public:
     auto endpoint() const -> cap_t { return endpoint_.selector(); }
     auto token(std::string_view name) const -> std::optional<word_t>;
     auto invoke(std::string_view name, ubus_msg request, ubus_msg& response) -> status_t;
-    auto begin(std::string_view name, ubus_msg request) -> status_t;
+    auto begin(std::string_view name, ubus_msg request, bool drain = false) -> status_t;
     auto notify(std::string_view name, ubus_msg request, bool block = true) -> status_t;
     auto poll(ubus_msg& response) -> status_t { return call_.poll(response); }
     auto cancel() -> status_t { return call_.cancel(); }
@@ -256,6 +259,14 @@ template<class T, size_t Capacity> class ubus_batch {
     struct entry { uint64_t id{}; T data{}; ubus_call call; status_t failure{}; };
     std::array<std::unique_ptr<entry>, Capacity> entries_;
 public:
+    auto prepare(ubus_conn& peer, size_t bytes = 0) -> status_t {
+        for (auto& item : entries_) {
+            if (!item) item = std::make_unique<entry>();
+            const auto status = item->call.prepare(peer.endpoint(), bytes);
+            if (status != STATUS_OK) return status;
+        }
+        return STATUS_OK;
+    }
     template<class Build> auto submit(uint64_t id, T data, ubus_conn& peer,
         std::string_view method, Build&& build, bool drain = true) -> status_t {
         if (!id || contains(id)) return STATUS_BAD_ARGS;

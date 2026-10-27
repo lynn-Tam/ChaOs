@@ -170,7 +170,7 @@ class Map final : private libk::noncopyable_nonmovable {
     Perms perms_{};
     Perms ceiling_{};
     Binding* binding_{};
-    libk::intrusive_list_hook binding_hook_{};
+    libk::intrusive_tree_hook binding_hook_{};
 };
 
 struct LayoutCmp {
@@ -185,49 +185,19 @@ class VSpace;
 class MapPage final : private libk::noncopyable_nonmovable {
   public:
     MapPage(va_t address, usize object_page, PageHold&& source) noexcept
-        : address_(address), object_page_(object_page),
-          storage_(std::in_place_type<PageHold>, std::move(source)) {}
-
-    MapPage(va_t address, usize object_page, OwnedPage&& page, resource::Usage&& usage) noexcept
-        : address_(address), object_page_(object_page),
-          storage_(std::in_place_type<Private>, std::move(usage), std::move(page)) {}
-
+        : address_(address), object_page_(object_page), storage_(std::move(source)) {}
     ~MapPage() noexcept;
-
-    [[nodiscard]] auto address() const noexcept -> va_t { return address_; }
-    [[nodiscard]] auto page() const noexcept -> Page {
-        if (const auto* p = std::get_if<PageHold>(&storage_)) return p->page();
-        return std::get_if<Private>(&storage_)->page.page();
-    }
-    [[nodiscard]] auto object_page() const noexcept -> usize { return object_page_; }
-    [[nodiscard]] auto perms() const noexcept -> Perms {
-        if (const auto* p = std::get_if<PageHold>(&storage_)) return p->perms();
-        return Perms::of(Perm::Read, Perm::Write);
-    }
-    [[nodiscard]] auto private_owned() const noexcept -> bool {
-        return std::get_if<Private>(&storage_) != nullptr;
-    }
-
+    auto address() const noexcept -> va_t { return address_; }
+    auto page() const noexcept -> Page { return storage_.page(); }
+    auto object_page() const noexcept -> usize { return object_page_; }
+    auto perms() const noexcept -> Perms { return storage_.perms(); }
   private:
     friend class VSpace;
     friend class VmOp;
     friend class Binding;
-
-    // An installed PTE retains its actual PageHold until TLB drain.
-    // A private COW page owns its frame and usage.
-    struct Private {
-        resource::Usage usage;
-        OwnedPage page;
-    };
-
-    auto take_charge() noexcept -> resource::Usage {
-        if (auto* p = std::get_if<Private>(&storage_)) return std::move(p->usage);
-        return {};
-    }
-
     va_t address_{};
     usize object_page_{};
-    std::variant<PageHold, Private> storage_;
+    PageHold storage_;
     libk::intrusive_tree_hook tree_hook_{};
     MapPage* pending_next_{};
     Binding* binding_{};
@@ -246,11 +216,11 @@ struct MapPageCmp final {
 };
 
 class Binding final : private libk::noncopyable_nonmovable {
-    using MappingList = libk::intrusive_list<Map, &Map::binding_hook_>;
+    using MappingTree = libk::intrusive_tree<Map, &Map::binding_hook_, LayoutCmp>;
     using PageTree = libk::intrusive_tree<MapPage, &MapPage::tree_hook_, MapPageCmp>;
 
   public:
-    Binding(VSpace& owner, object::ref<> memory, Mem& object, bool private_write) noexcept;
+    Binding(VSpace& owner, object::ref<> memory, Mem& object) noexcept;
     ~Binding() noexcept;
 
     [[nodiscard]] auto memory() noexcept -> Mem& { return *memory_; }
@@ -268,14 +238,14 @@ class Binding final : private libk::noncopyable_nonmovable {
     static void released(void* ctx, object::LinkWork&& done) noexcept;
     static void invalidate_grant(void* ctx, object::LinkWork&& work) noexcept;
 
+    static auto sample(void*, std::span<PagerPage>, u64) noexcept -> u64;
     static const MemOps memory_ops_;
     static const cap::AttachOps grant_ops_;
 
     VSpace* owner_{};
     object::ref<> memory_ref_{};
     Mem* memory_{};
-    bool private_write_{};
-    MappingList mappings_{};
+    MappingTree mappings_{};
     PageTree pages_{};
     libk::intrusive_list<Borrow, &Borrow::hook_> views_{};
     libk::intrusive_list_hook invalidation_hook_{};
@@ -336,7 +306,6 @@ struct MapReq final {
     VRange virtual_range{};
     ObjectRange object{};
     Perms perms{};
-    bool private_write{};
 };
 
 struct MapResult final {
@@ -460,9 +429,6 @@ class VSpace final : private libk::noncopyable_nonmovable {
         object::ref<> quota{to};
         return transaction([&](auto&& visit) {
             visit(table_charge_);
-            pages_.each([&](MapPage& page) {
-                if (auto* owned = std::get_if<MapPage::Private>(&page.storage_)) visit(owned->usage);
-            });
             mappings_.charges(visit); binding_pool_.charges(visit); pages_.charges(visit); views_.charges(visit);
         }, [&] { std::swap(quota_, quota); });
     }
@@ -585,10 +551,9 @@ class VSpace final : private libk::noncopyable_nonmovable {
         -> std::expected<Map*, VSpaceError>;
 
     [[nodiscard]] auto materialize_fault(VmCtx ctx, Map& mapping, va_t page_address, usize object_page,
-                                         Source::Context* context) noexcept
+                                         Source::Context* context, Perm access) noexcept
         -> std::expected<FaultResult, VSpaceError>;
-    [[nodiscard]] auto copy_private_fault(VmCtx ctx, Map& mapping, MapPage& source) noexcept
-        -> std::expected<FaultResult, VSpaceError>;
+    auto sample(Binding&, std::span<PagerPage>, u64) noexcept -> u64;
     [[nodiscard]] auto fold_usage(MapPage& page, PageUsage observed) noexcept
         -> std::expected<PageUsage, VSpaceError>;
     [[nodiscard]] auto reserve_tables(MapPage* pages) noexcept -> std::expected<TableReserve, VSpaceError>;

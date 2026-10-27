@@ -536,7 +536,9 @@ template <typename T> class pool final : private libk::noncopyable_nonmovable {
             libk_assert(storage_.live() != 0 && slot.page->live != 0);
             slot.anchor.phase_ = anchor::phase::free;
             slot.member.reset();
-            release = storage_.release(slot);
+            // One bounded slab remains real kernel metadata. Reusing an
+            // accepted operation must not depend on a fresh frame at pressure.
+            release = storage_.release(slot, storage_.pages() > 1);
         }
         if (release != nullptr) {
             release_page(release);

@@ -64,6 +64,7 @@ inline auto _mem_write(cap_t cap, uint64_t offset, std::span<const std::byte> in
 struct _vm_space {
     cap_t space{};
     uintptr_t begin{}, end{UINTPTR_MAX};
+    cap_t pager{};
 };
 auto _vm() noexcept -> _vm_space&;
 
@@ -129,7 +130,7 @@ public:
     static auto map(_vm_space& space, cap_t memory, uintptr_t va, size_t size, word_t perms)
         noexcept -> std::expected<_vm_area, status_t> {
         _vm_area area;
-        auto status = area.open(space, va, size, perms & ~VM_MAP_PRIVATE);
+        auto status = area.open(space, va, size, perms);
         if (status == STATUS_OK) status = area.attach(memory, 0, size, perms);
         if (status != STATUS_OK) return std::unexpected(status);
         return area;
@@ -142,11 +143,15 @@ public:
     }
     static auto map_private(_vm_space& space, _cap_owner memory, uintptr_t va, size_t size)
         noexcept -> std::expected<_vm_area, status_t> {
-        return map(space, std::move(memory), va, size, VM_READ | VM_WRITE | VM_MAP_PRIVATE);
+        const auto made = _memory_clone(_startup().alloc(), memory.selector(), 0, size / 4096, space.pager);
+        if (made.status != STATUS_OK) return std::unexpected(made.status);
+        return map(space, _cap_owner{made.value}, va, size, VM_READ | VM_WRITE);
     }
     static auto create(CreateAuth auth, _vm_space& space, uintptr_t va, size_t size, word_t memory_perms, word_t map_perms)
         noexcept -> std::expected<_vm_area, status_t> {
-        const auto result = _memory_create(auth, size, memory_perms);
+        const auto result = space.pager
+            ? _memory_create_pager(auth, size, memory_perms, space.pager, MEMORY_PAGER_ANON)
+            : _memory_create(auth, size, memory_perms);
         _cap_owner memory{result.value};
         auto status = result.status;
         if (status == STATUS_PENDING) status = _op_wait(memory.selector()).status;

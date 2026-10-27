@@ -11,9 +11,9 @@ import sys
 import time
 import tempfile
 
-def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=False, missing_storage=False, disk=None, persisted=False, control=False, threads=False, second_disk=None, vfs=False):
+def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=False, missing_storage=False, disk=None, persisted=False, control=False, threads=False, second_disk=None, vfs=False, swap=False):
     root = Path(__file__).resolve().parents[2]
-    logs = root / '.tmp/project/interactive-storage'
+    logs = root / ('.tmp/project/swap' if swap else '.tmp/project/interactive-storage')
     logs.mkdir(parents=True, exist_ok=True)
     output = bytearray()
     command = [qemu, '-machine', 'virt,iommu-sys=on' if missing_storage else 'virt', '-smp', smp, '-nographic',
@@ -25,13 +25,18 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
     if second_disk:
         command += ['-drive', f'if=none,id=other,format=raw,file={second_disk}',
                     '-device', 'virtio-blk-pci,addr=2,drive=other,disable-legacy=on,iommu_platform=on']
+    if stub := os.environ.get('QEMU_GDB'):
+        command += ['-gdb', stub]
+    if ram := os.environ.get('QEMU_RAM'):
+        command += ['-m', ram]
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT)
     poll = selectors.DefaultSelector()
     poll.register(process.stdout, selectors.EVENT_READ)
+    trace = (logs / f'console-{smp}.raw').open('wb', buffering=0)
 
-    def until(marker, start=0):
-        deadline = time.monotonic() + 30
+    def until(marker, start=0, timeout=30):
+        deadline = time.monotonic() + timeout
         while not (marker.search(output[start:]) if isinstance(marker, re.Pattern) else marker in output[start:]):
             if process.poll() is not None or time.monotonic() >= deadline:
                 raise RuntimeError(f'missing {marker!r}')
@@ -40,6 +45,7 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
                 if not chunk:
                     raise RuntimeError('QEMU closed serial')
                 output.extend(chunk)
+                trace.write(chunk)
                 if b'KERNEL PANIC' in output or b'user: contained fault' in output:
                     # Preserve the diagnostic body before stopping QEMU.
                     drain_until = time.monotonic() + 5
@@ -106,6 +112,162 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
         if vfs:
             run('control-test vfs', b'[vfs] delayed Get/Bind, independent mount progress, pinned targets and Sync fanout ok')
             print(f'[vfs] OK: {smp} harts, delayed Get/Bind and multi-mount lifecycle')
+            return
+        if swap:
+            if swap == 'swap-sessions':
+                run('memcheck contracts', b'memory write/bind, sealed snapshots and destination revoke verified')
+                run('swap format pci-10', b'swap format: 0')
+                run('swap on pci-10', b'swap on: 0')
+                mark = len(output)
+                run('memcheck sessions &', b'/ > ')
+                until(re.compile(rb'memory independent sessions, content and owner retirement verified|Done -'), mark, 60)
+                if b'Done -' in output[mark:]: raise RuntimeError('session content/lifetime check failed')
+                until(b'Done 0', mark)
+                state = run('swap status', b'pci-10 On')
+                if len(re.findall(rb'session=\d+', state)) != 1: raise RuntimeError('retired session retained')
+                if not re.search(rb'reads=[1-9]\d*', state): raise RuntimeError('sessions did not refault from disk')
+                run('swap off', b'swap off: 0')
+                print(f'[swap] OK: {smp} harts, independent sessions, content and owner retirement')
+                return
+            if swap == 'swap-physical':
+                run('swap format pci-10', b'swap format: 0')
+                run('swap on pci-10', b'swap on: 0')
+                mark = len(output)
+                # 8 MiB fits its 16 MiB Quota. Real PMM ballast, allocated by
+                # the test kernel after boot, creates the global shortage.
+                run('memcheck 8 15000 &', b'/ > ')
+                until(b'memory filled bytes=8388608', mark)
+                until(b'[pressure] held=', mark)
+                state = run('swap status', b'pci-10 On')
+                if not re.search(rb'released=[1-9]\d*', state): raise RuntimeError('global pressure did not reclaim pages')
+                for cycle in range(1, 4):
+                    until(f'memory pass={cycle} bytes=8388608 verified'.encode(), mark, 120)
+                    if cycle == 1:
+                        if b'[pressure] released free=' in output[mark:]: raise RuntimeError('pressure ended before content verification')
+                        state = run('swap status', b'failures=0')
+                        if not re.search(rb'reads=[1-9]\d*', state): raise RuntimeError('pressure verification did not refault from disk')
+                until(b'[pressure] released free=', mark, 120)
+                run('swap off', b'swap off: 0')
+                print(f'[swap] OK: {smp} harts, real global PMM pressure, nonbinding client Quota and content progress')
+                return
+            if swap in ('swap-write-error', 'swap-read-error'):
+                run('swap format pci-10', b'swap format: 0')
+                run('swap on pci-10', b'swap on: 0')
+                run('swap set resident 1048576', b'swap set: 0')
+                mark = len(output)
+                run('memcheck 8 3000 &', b'/ > ')
+                if swap == 'swap-write-error':
+                    until(b'memory filled bytes=8388608', mark)
+                    until(b'memory pass=3 bytes=8388608 verified', mark)
+                else:
+                    until(b'Done -', mark)
+                    if b'memory pass=3' in output[mark:]: raise RuntimeError('failed reads produced successful content')
+                state = run('swap status', b'pci-10 Failed')
+                if not re.search(rb'failures=[1-9]\d*', state): raise RuntimeError('injected I/O error was not reported')
+                states({'memory': 'running'})
+                run('swap off pci-10', b'swap off: 0')
+                print(f'[swap] OK: {smp} harts, {swap}, real I/O failure and safe drain')
+                return
+            if swap in ('swap-failure', 'swap-device-loss'):
+                run('swap format pci-10', b'swap format: 0')
+                run('swap on pci-10', b'swap on: 0')
+                if swap == 'swap-device-loss':
+                    run('swap format block', b'swap format: 0')
+                    run('swap on block --priority -1', b'swap on: 0')
+                run('swap set resident 1048576', b'swap set: 0')
+                mark = len(output)
+                run('memcheck 8 10000 &', b'/ > ')
+                until(b'memory filled bytes=8388608', mark)
+                run('sleep 2500', b'/ > ')
+                state = run('swap status', b'pci-10 On')
+                if not re.search(rb'released=[1-9]\d*', state): raise RuntimeError('failure scenario did not establish backing')
+                if swap == 'swap-device-loss':
+                    due = time.monotonic() + 10
+                    while not re.search(rb'io=\d+/[1-9]\d*', state):
+                        if time.monotonic() > due: raise RuntimeError('no in-flight writeback before driver stop')
+                        state = run('swap status', b'pci-10 On')
+                run('svc stop devices/block-10' if swap == 'swap-device-loss' else 'svc stop memory', b'service change requested')
+                until(b'Done -', mark)
+                if swap == 'swap-device-loss':
+                    states({'memory': 'running', 'devices/block-10': 'idle'})
+                    run('swap status', b'pci-10 Failed')
+                    run('swap off', b'swap off: 0')
+                    run('swap on block', b'swap on: 0')
+                    recovered = len(output)
+                    run('memcheck 4 1000 &', b'/ > ')
+                    until(b'memory pass=3 bytes=4194304 verified', recovered, 90)
+                    run('swap off', b'swap off: 0')
+                else: states({'memory': 'idle'})
+                print(f'[swap] OK: {smp} harts, {swap}, client failure contained and management remains usable')
+                return
+            run('swap status', b'free=')
+            run('swap format pci-10', b'swap format: 0')
+            run('swap on pci-10', b'swap on: 0')
+            run('swap set swap 262144', b'swap set: 0')
+            run('swap set resident 1048576', b'swap set: 0')
+            mark = len(output)
+            run('memcheck 8 4000 &', b'/ > ')
+            until(b'Running', mark)
+            run('sleep 2500', b'/ > ')
+            state = run('swap status', b'pci-10 On')
+            count = re.search(rb'writes=(\d+) released=(\d+)', state)
+            if not count or min(map(int, count.groups())) == 0: raise RuntimeError('no real swap writes or released pages')
+            usage = re.search(rb'pci-10 On used=(\d+)/', state)
+            if not usage or int(usage[1]) > 262144: raise RuntimeError('session swap limit exceeded')
+            run('swap set swap 16777216', b'swap set: 0')
+            run('swap format block', b'swap format: 0')
+            run('swap on block --limit 8388608 --priority -1', b'swap on: 0')
+            run('swap on pci-10 --limit 262144', b'swap on: 0')
+            run('swap on pci-10 --limit 8388608', b'swap on: 0')
+            run('swap off pci-10', b'swap off: 0')
+            run('swap pause', b'swap pause: 0')
+            run('swap status', b'block Paused')
+            run('swap off', b'swap off: 0')
+            state = run('swap status', b'pci-10 Off')
+            if not re.search(rb'reads=[1-9]\d*', state): raise RuntimeError('no real swap reads')
+            until(b'memory pass=3 bytes=8388608 verified')
+            run('echo swap-content-ok', b'swap-content-ok\n/ > ')
+            run('swap on pci-10 --limit 8388608', b'swap on: 0')
+            run('swap on block --limit 8388608 --priority -1', b'swap on: 0')
+            run('swap set read-ahead 1', b'swap set: 0')
+            run('swap set resident 0', b'swap set: 0')
+            mark = len(output)
+            run('memcheck 24 5000 &', b'/ > ')
+            until(b'Running', mark)
+            until(b'memory filled bytes=25165824', mark, 120)
+            run('swap off', b'swap off: -8')
+            state = run('swap status', b'Paused')
+            if not re.search(rb'used=[1-9]\d*/', state): raise RuntimeError('failed off discarded backing')
+            run('swap on pci-10 --limit 8388608', b'swap on: 0')
+            run('swap on block --limit 8388608 --priority -1', b'swap on: 0')
+            for cycle in range(1, 4):
+                started = time.monotonic()
+                try:
+                    until(re.compile(f'memory pass={cycle} bytes=25165824 verified|Done -'.encode()), mark, 120)
+                except RuntimeError:
+                    run('swap status', b'free=')
+                    raise
+                if b'Done -' in output[mark:]:
+                    run('swap status', b'free=')
+                    raise RuntimeError('pressure workload failed')
+                print(f'[swap] pressure pass={cycle} verified in {time.monotonic() - started:.2f}s', flush=True)
+            run('swap off', b'swap off: 0')
+            state = run('swap status', b'block Off')
+            if not re.search(rb'failures=0(?: |\n)', state): raise RuntimeError('paging failures under real resident quota pressure')
+            mark = len(output)
+            run('memcheck 1 1000 &', b'/ > ')
+            until(b'memory filled bytes=1048576', mark)
+            previous = instance('memory.admin')
+            run('bus call memory.admin Release', b'{}')
+            run('svc restart memory', b'service change requested')
+            until_changed = time.monotonic() + 20
+            while (current := instance('memory.admin')) is None or current == previous:
+                if time.monotonic() >= until_changed: raise RuntimeError('memory service did not republish')
+            run('swap on pci-10 --limit 8388608', b'swap on: 0')
+            run('swap set resident 262144', b'swap set: 0')
+            until(b'memory pass=3 bytes=1048576 verified', mark)
+            run('swap off', b'swap off: 0')
+            print(f'[swap] OK: {smp} harts, registered DMA, real reclaim/refault, pause/off, 8MiB drain and 24MiB through a 16MiB quota verified')
             return
         if second_disk:
             run('control-test devices', b'[devices] independent DMA, cross-page 64KiB I/O and driver retirement ok')
@@ -369,23 +531,38 @@ def exercise(qemu, kernel, bundle, smp, iterations, recovery=False, exec_check=F
             process.kill()
             process.wait()
         poll.close()
+        trace.close()
         (logs / f'console-{smp}.raw').write_bytes(output)
 
 if __name__ == '__main__':
     qemu, kernel, bundle, harts = sys.argv[1:5]
+    harts = os.environ.get("QEMU_SMP", harts)
     mode = sys.argv[5] if len(sys.argv) >= 6 else ''
     iterations = int(sys.argv[6]) if len(sys.argv) >= 7 else 1
     for smp in harts.split(','):
-        if mode in ('interactive', 'recovery', 'control', 'threads', 'devices', 'vfs'):
+        if mode in ('interactive', 'recovery', 'control', 'threads', 'devices', 'vfs') or mode.startswith('swap'):
             temporary = Path(__file__).resolve().parents[2] / '.tmp/project/interactive-storage'
             temporary.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(dir=temporary) as directory:
                 disk = Path(directory) / 'data.img'
                 with disk.open('wb') as stream: stream.truncate(16 * 1024 * 1024)
-                other = Path(directory) / 'other.img' if mode == 'devices' else None
+                other = Path(directory) / 'other.img' if mode == 'devices' or mode.startswith('swap') else None
                 if other:
                     with other.open('wb') as stream: stream.truncate(16 * 1024 * 1024)
-                exercise(qemu, kernel, bundle, smp, iterations, vfs=mode == 'vfs', second_disk=other, disk=disk, recovery=mode == 'recovery', control=mode == 'control', threads=mode == 'threads')
+                    if mode in ('swap-write-error', 'swap-read-error'):
+                        event = 'write_aio' if mode == 'swap-write-error' else 'read_aio'
+                        fault = Path(directory) / 'blkdebug.conf'
+                        # Keep the format/enable header accessible; inject
+                        # below the real driver, never in production code.
+                        if mode == 'swap-read-error':
+                            fault.write_text('[set-state]\nevent = "flush_to_disk"\nstate = "1"\nnew_state = "2"\n'
+                                             '[set-state]\nevent = "write_aio"\nstate = "2"\nnew_state = "3"\n'
+                                             '[inject-error]\nevent = "read_aio"\nstate = "3"\nerrno = "5"\n')
+                        else:
+                            fault.write_text(f'[set-state]\nevent = "{event}"\nstate = "1"\nnew_state = "2"\n'
+                                             f'[inject-error]\nevent = "{event}"\nstate = "2"\nerrno = "5"\n')
+                        other = f'blkdebug:{fault}:{other}'
+                exercise(qemu, kernel, bundle, smp, iterations, swap=mode if mode.startswith('swap') else False, vfs=mode == 'vfs', second_disk=other, disk=disk, recovery=mode == 'recovery', control=mode == 'control', threads=mode == 'threads')
                 if mode == 'interactive': exercise(qemu, kernel, bundle, smp, 0, disk=disk, persisted=True)
         else:
             exercise(qemu, kernel, bundle, smp, iterations, exec_check=mode == 'exec', missing_storage=mode == 'missing-storage', control=mode == 'control')

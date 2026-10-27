@@ -240,6 +240,14 @@ class sh_shell {
             if (!term_idx) return term_idx.error();
             payload.data.cap("terminal", *term_idx);
         }
+        if (!policy["resident"].as<bool>().value_or(false)) {
+            const auto pager = setup_.capability(config["pager"]);
+            if (pager) {
+                const auto copied = payload.attach(pager, RIGHT_ATTACH | RIGHT_DUPLICATE);
+                if (!copied) return copied.error();
+                ubus_data native; native.cap("pager", *copied); recipe.data.put("native", native);
+            }
+        }
         recipe.data.put("setup", payload.data); payload.data = std::move(recipe.data);
         auto child = owner_.configure(std::move(payload)); if (!child) return child.error();
         stage.child = *child;

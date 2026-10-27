@@ -352,8 +352,8 @@ void Map::released(void* arg, object::LinkWork&& done) noexcept {
     sync::Lock guard{space.lock_}; done.reset(); space.post();
 }
 
-Map::Map(mm::Pmm& pmm, Space& domain, usize iova, usize n) noexcept
-    : owner(domain), first(iova), count(n), pins(pmm) {}
+Map::Map(Space& domain, usize iova, usize n) noexcept
+    : owner(domain), first(iova), count(n) {}
 Map::~Map() noexcept {
     libk_assert(!mem_link.busy() && !grant.busy());
     libk_assert(!pages);
@@ -378,7 +378,7 @@ void Space::invalidated(void* arg, object::LinkWork&& work) noexcept {
 }
 Space::Space(mm::Pmm& pmm, WorkQueue& work, object::ref<> quota, object::ref<Iommu> ctl, u32 requester) noexcept
     : pmm_(pmm), work_(work), quota_(std::move(quota)), controller_(std::move(ctl)),
-      requester_(requester), maps_(pmm) {
+      requester_(requester), maps_(pmm), pins_(pmm), tables_(pmm.group()) {
     work_.open(job_, Work::Fn::bind<&Space::progress>(*this));
 }
 Space::~Space() noexcept { libk_assert(!self_ && mappings_.empty() && !attached_ && !cleanup_ && !active_ && !control_ && !operation_); }
@@ -389,6 +389,8 @@ auto Space::open(object::ref<> self, cap::Resolved<Iommu>& controller, object::r
         work_.post(job_);
     }};
     self_ = std::move(self);
+    const auto records = maps_.prepay(quota_, 8), pins = pins_.prepay(quota_, 64);
+    if (!records || !*records || !pins || !*pins) return STATUS_NO_MEMORY;
     auto fee = resource::acquire(quota_, {.memory = mm::page_size});
     if (!fee) return STATUS_NO_MEMORY;
     auto root = mm::PageTable::create(pmm_, mm::PageTable::Kind::Device);
@@ -449,7 +451,7 @@ auto Space::map(Op::Submission ctx, cap::Resolved<mm::Mem>& source, mm::ObjectRa
     }
     // Only these fixed preparations need the caller's Resolved capability.
     // Everything that may yield belongs to the accepted operation.
-    auto made = maps_.create(quota_, pmm_, *this, iova ? iova : arch::IoBegin, range.size());
+    auto made = maps_.create(quota_, *this, iova ? iova : arch::IoBegin, range.size());
     status_t result = made ? STATUS_OK : STATUS_NO_MEMORY;
     if (made) {
         op->edit_->mapping = *made;
@@ -522,9 +524,9 @@ void Space::advance_edit(IoOp& op) noexcept {
             break;
         }
         case E::Pin: {
-            auto page = map->memory->materialize(edit.range.base() + edit.position);
+            auto page = map->memory->materialize(edit.range.base() + edit.position, nullptr, true);
             if (!page || !pmm_.is_ram(page->page()) || !page->perms().contains(edit.perms)) { fail(STATUS_BACKING_FAILED); return; }
-            auto pin = map->pins.create(quota_, std::move(*page), edit.position);
+            auto pin = pins_.create(quota_, std::move(*page), edit.position);
             if (!pin) { fail(STATUS_NO_MEMORY); return; }
             guard.emplace(lock_);
             (*pin)->next = map->pages; map->pages = *pin;
@@ -543,6 +545,13 @@ void Space::advance_edit(IoOp& op) noexcept {
         }
         case E::Reserve:
             if (edit.tables) {
+                {
+                    sync::Lock locked{lock_};
+                    if (auto page = tables_.take()) {
+                        libk_assert(op.pages_.attach(std::move(*page)));
+                        op.tables_fee_.merge(fee_.split({.memory=mm::page_size})); --edit.tables; break;
+                    }
+                }
                 auto fee = resource::acquire(quota_, {.memory=mm::page_size});
                 if (!fee || !op.pages_.allocate()) { fail(STATUS_NO_MEMORY); return; }
                 op.tables_fee_.merge(std::move(*fee)); --edit.tables;
@@ -612,7 +621,7 @@ auto Space::release(Map& m) noexcept -> bool {
     grant.reset();
     if (m.mem_link.busy() || m.grant.busy()) return false;
     for (usize step = 0; m.pages && step < 8; ++step) {
-        auto* page = m.pages; m.pages = page->next; m.pins.destroy(*page);
+        auto* page = m.pages; m.pages = page->next; pins_.destroy(*page);
     }
     if (m.pages) return false;
     return true;
@@ -683,11 +692,15 @@ void Space::advance() noexcept {
         if (ctl_grant_.busy()) { work_.post(job_); return; }
         if (attached_) { controller_->detach(*this); attached_ = false; }
         if (root_) {
-            libk_assert(!op->pages_.page_count());
-            op->pages_ = root_->release(); root_.reset();
+            op->pages_.append(root_->release()); root_.reset();
+            op->pages_.append(std::move(tables_));
             op->tables_fee_.merge(std::move(fee_));
         }
     }
+    if (op->enable_) {
+        sync::Lock locked{lock_};
+        tables_.append(std::move(op->pages_)); fee_.merge(std::move(op->tables_fee_));
+    } else if (!maps_.drain(8) || !pins_.drain(8)) { post(); return; }
     for (usize i = 0; i < 8 && op->pages_.page_count(); ++i) {
         auto page = op->pages_.take(); libk_assert(page); page->reset();
     }

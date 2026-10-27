@@ -3,6 +3,15 @@
 
 namespace mm {
 
+auto Phys::info() const noexcept -> MemoryInfo {
+    return {1, sizeof(MemoryInfo), pmm_.page_count() * page_size, pmm_.free_page_count() * page_size,
+        pmm_.reserve_pages() * page_size, events_.snapshot().sequence, pmm_.pressured() ? 1U : 0U, 0};
+}
+void Phys::retire(object::cleanup&& token) noexcept {
+    pmm_.watch({}); work_->close(job_); cleanup_ = std::move(token); events_.close();
+    if (events_.drained()) drained();
+}
+
 Phys::Claim::Claim(object::ref<Phys>&& owner, Entry* claim) noexcept
     : entry_(Claim::Data{std::move(owner), claim}) {}
 void Phys::Claim::Drop::operator()(Data& data) const noexcept {

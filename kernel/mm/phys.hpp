@@ -6,6 +6,9 @@
 #include <libk/intrusive_list.hpp>
 #include <libk/unique_handle.hpp>
 #include <uapi/abi.h>
+#include <uapi/mem.h>
+#include <wait.hpp>
+#include <work.hpp>
 
 namespace mm {
 
@@ -43,10 +46,24 @@ public:
     explicit Phys(Pmm& pmm, RegionList&& reserved) noexcept
         : pmm_(pmm), reserved_(std::move(reserved)), storage_(pmm) {}
     ~Phys() noexcept { libk_assert(claims_.empty()); }
+    void bind_work(WorkQueue& work, object::Key owner) noexcept {
+        work_ = &work; job_.bind(owner); events_.bind_work(work, owner); pmm_.watch(Pmm::Notify::bind<&Phys::schedule>(*this));
+    }
+    auto events() noexcept -> Source& { return events_; }
+    auto info() const noexcept -> MemoryInfo;
+    auto configure(usize low, usize high, usize floor) noexcept -> bool { return pmm_.configure(low, high, floor); }
+    void retire(object::cleanup&&) noexcept;
     auto claim(object::ref<Phys>, const object::ref<>& quota, Pages) noexcept
         -> std::expected<Claim, status_t>;
 private:
     void release(Entry*) noexcept;
+    void schedule() noexcept { work_->post(job_); }
+    void publish() noexcept { auto publication = events_.prepare(pmm_.pressured() ? SOURCE_READY : 0, true); }
+    void drained() noexcept { if (cleanup_) cleanup_.complete(); }
+    WorkQueue* work_{};
+    Work job_{Work::Fn::bind<&Phys::publish>(*this)};
+    Src<SOURCE_READY> events_{Source::Drained::bind<&Phys::drained>(*this)};
+    object::cleanup cleanup_;
     Pmm& pmm_;
     RegionList reserved_;
     Slab<Entry, false> storage_;

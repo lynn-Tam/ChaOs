@@ -96,9 +96,9 @@ auto VmOp::drain_pages() noexcept -> bool {
         --remaining;
         auto& binding = permits_.pop_front();
         u8 bits{};
-        for (const auto& map : binding.mappings_) bits |= map.perms_.raw();
+        for (auto* map = binding.mappings_.minimum(); map; map = binding.mappings_.next(*map)) bits |= map->perms_.raw();
         if (bits) libk_assert(binding.memory_->protect(binding.memory_attachment_,
-            binding.private_write_ ? Perms::of(Perm::Read) : Perms::from_raw(bits)));
+            Perms::from_raw(bits)));
     }
     if (!edit_ && !permits_.empty()) { owner_->flush_ready(); return false; }
     flushed_ = true;
@@ -143,7 +143,8 @@ auto VSpace::fault(Thread& thread, VmCtx ctx, va_t address, Perm perm) noexcept 
         const auto ready = wait_pending(thread, *ctx.cpus, current_cpu().dispatcher());
         return ready.status == STATUS_PENDING ? FaultKind::Pending : kind;
     }
-    if (kind != FaultKind::Busy) return kind;
+    const bool shortage = kind == FaultKind::ResourceExhausted || kind == FaultKind::OutOfMemory;
+    if (kind != FaultKind::Busy && !shortage) return kind;
     object::ref<> source;
     usize index{};
     {
@@ -151,7 +152,7 @@ auto VSpace::fault(Thread& thread, VmCtx ctx, va_t address, Perm perm) noexcept 
         auto* map = find(VRange{va_t{address.raw() & ~(page_size - 1)}, page_size});
         if (map && map->kind_ == MapKind::Map && map->perms_.contains(perm)) {
             auto& binding = *map->binding_;
-            if (binding.memory_work_ && !binding.memory_work_->range().empty()) {
+            if (shortage || (binding.memory_work_ && !binding.memory_work_->range().empty())) {
                 source = binding.memory_ref_;
                 index = map->object_.base() + (address.raw() - map->range_.base().raw()) / page_size;
             }
@@ -160,6 +161,11 @@ auto VSpace::fault(Thread& thread, VmCtx ctx, va_t address, Perm perm) noexcept 
     if (!source) return kind;
     auto mem = source.as<Mem>();
     libk_assert(mem);
+    if (shortage) {
+        const auto ready = mem->get().wait_capacity(index, context,
+            kind == FaultKind::OutOfMemory ? MemErr::OutOfMemory : MemErr::ResourceExhausted, quota_.id().value);
+        return ready ? FaultKind::Busy : fault_kind(ready.error());
+    }
     const auto ready = mem->get().materialize(index, &context);
     return ready ? FaultKind::Busy : fault_kind(ready.error());
 }
@@ -189,6 +195,7 @@ auto VSpace::fault(Thread& thread, VmCtx ctx, va_t address, Perm perm) noexcept 
     case MemErr::Dirty:
     case MemErr::Busy:
         return VSpaceError::Busy;
+    case MemErr::Forwarded:
     case MemErr::Pending:
         return VSpaceError::Busy;
     case MemErr::BackingFailed:
@@ -219,6 +226,7 @@ MapPage::~MapPage() noexcept {
 const MemOps Binding::memory_ops_{
     .invalidate = &Binding::invalidate_memory,
     .released = &Binding::released,
+    .sample = &Binding::sample,
 };
 
 const cap::AttachOps Binding::grant_ops_{
@@ -226,9 +234,9 @@ const cap::AttachOps Binding::grant_ops_{
     .released = &Binding::released,
 };
 
-Binding::Binding(VSpace& owner, object::ref<> memory, Mem& object, bool private_write) noexcept
+Binding::Binding(VSpace& owner, object::ref<> memory, Mem& object) noexcept
     : owner_(&owner), memory_ref_(std::move(memory)), memory_(&object),
-      private_write_(private_write), memory_attachment_(this, memory_ops_) {}
+      memory_attachment_(this, memory_ops_) {}
 
 Binding::~Binding() noexcept {
     libk_assert(mappings_.empty());
@@ -243,7 +251,7 @@ Binding::~Binding() noexcept {
 }
 
 auto Binding::attach_memory(Perms perms) noexcept -> std::expected<void, MemErr> {
-    return memory_->attach(memory_attachment_, private_write_ ? Perms::of(Perm::Read) : perms);
+    return memory_->attach(memory_attachment_, perms);
 }
 
 auto Binding::detach() noexcept -> bool {
@@ -560,9 +568,9 @@ void VSpace::detach_mapping(Map& mapping) noexcept {
     mappings_.destroy(mapping);
     if (auth.mappings_.empty()) {
         queue_binding(auth);
-    } else if (!auth.private_write_) {
+    } else {
         u8 bits{};
-        for (const auto& map : auth.mappings_) bits |= map.perms_.raw();
+        for (auto* map = auth.mappings_.minimum(); map; map = auth.mappings_.next(*map)) bits |= map->perms_.raw();
         libk_assert(auth.memory_->protect(auth.memory_attachment_, Perms::from_raw(bits)));
     }
 }
@@ -572,9 +580,9 @@ void VSpace::destroy_layout(Map& node) noexcept {
         if (auto* binding = node.binding_) {
             binding->mappings_.erase(node);
             if (binding->mappings_.empty()) queue_binding(*binding);
-            else if (!binding->private_write_) {
+            else {
                 u8 bits{};
-                for (const auto& map : binding->mappings_) bits |= map.perms_.raw();
+                for (auto* map = binding->mappings_.minimum(); map; map = binding->mappings_.next(*map)) bits |= map->perms_.raw();
                 libk_assert(binding->memory_->protect(binding->memory_attachment_, Perms::from_raw(bits)));
             }
             node.binding_ = nullptr;
@@ -607,7 +615,7 @@ void VSpace::destroy_layout(Map& node) noexcept {
 
 void VSpace::release_page(MapPage& page, resource::Usage& release) noexcept {
     page.binding_ = nullptr;
-    release.merge(page.take_charge());
+    (void)release;
     pages_.destroy(page);
 }
 
@@ -831,7 +839,7 @@ auto VSpace::fill(Map& target, u64 claim, VmCtx ctx) noexcept -> std::expected<v
     }
     for (auto* tail : tails) if (tail) link(*tail);
     target.claim_ = claim;
-    if (target.binding_) target.binding_->mappings_.push_back(target);
+    if (target.binding_) target.binding_->mappings_.insert(target);
     link(target); rollback.release();
     return {};
 }
@@ -971,7 +979,7 @@ auto VSpace::bind_view(ViewReq&& request) noexcept -> std::expected<View, VSpace
         auto* node = find(request.virtual_range);
         if (!node || !node->binding_) return false;
         auto* const current = static_cast<Map*>(node);
-        if (current->binding_->private_write_ || !current->layout_hook_.is_linked() || !current->range_.contains(request.virtual_range) ||
+        if (!current->layout_hook_.is_linked() || !current->range_.contains(request.virtual_range) ||
             !current->perms_.contains(request.perms) || &current->binding_->memory() != &memory) {
             return false;
         }
@@ -1135,10 +1143,7 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
     const auto page_count = request.virtual_range.page_count();
     libk_assert(page_count);
     const usize count = *page_count;
-    const bool private_write = request.private_write;
-    const Perms ceiling = vspace_access.intersect(
-        private_write ? Perms::of(Perm::Read, Perm::Write)
-                      : mem_auth.perms);
+    const Perms ceiling = vspace_access.intersect(mem_auth.perms);
     const bool invalid_access = !valid_perms(request.perms) || (request.perms.contains(Perm::Write) &&
                                                                 request.perms.contains(Perm::Execute));
     if (invalid_access) {
@@ -1146,15 +1151,12 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
     }
     if (!memory_ref || memory_ref.kind() != ObjMem || count == 0 ||
         request.object.size() != count || !request.object.within(memory.page_count()) ||
-        !mem_auth.range.contains(request.object) || !ceiling.contains(request.perms) ||
-        (private_write &&
-         (!request.perms.contains(Perm::Write) || !mem_auth.perms.contains(Perm::Read) ||
-          memory.kind() == BackingKind::Physical || memory.seal_state() != SealState::Executable))) {
+        !mem_auth.range.contains(request.object) || !ceiling.contains(request.perms)) {
         return std::unexpected(VSpaceError::InvalidAuthority);
     }
 
     auto binding_entry =
-        binding_pool_.create(quota_, *this, std::move(memory_ref), memory, private_write);
+        binding_pool_.create(quota_, *this, std::move(memory_ref), memory);
     if (!binding_entry) {
         return std::unexpected(node_error(binding_entry.error()));
     }
@@ -1202,7 +1204,7 @@ auto VSpace::map_impl(VmCtx ctx, MapReq request, object::ref<> memory_ref, Mem& 
         if (state_ != VSpaceState::Live || auth->invalid())
             return std::unexpected(VSpaceError::InvalidState);
         if (auto accepted = accept(ctx); !accepted) return std::unexpected(accepted.error());
-        auth->mappings_.push_back(*mapping);
+        auth->mappings_.insert(*mapping);
         link(*mapping);
     }
     layout.release(); binding.release();
@@ -1319,7 +1321,7 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
             }
             if (map->binding_ && edit.perms) {
                 auto& binding = *map->binding_;
-                const auto perms = binding.private_write_ ? Perms::of(Perm::Read) : *edit.perms;
+                const auto perms = *edit.perms;
                 const auto reserved = binding.memory_->protect(binding.memory_attachment_,
                     Perms::from_raw(binding.memory_attachment_.perms().raw() | perms.raw()));
                 if (!reserved) { mutation->abort(); return fail(memory_error(reserved.error())); }
@@ -1382,12 +1384,14 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
             const auto lo = std::max(map->range_.base(), edit.range.base());
             const auto hi = std::min(*map->range_.limit(), *edit.range.limit());
             unlink(*map);
+            if (map->binding_) map->binding_->mappings_.erase(*map);
             if (map->binding_) map->object_ = {map->object_.base() + (lo.raw() - map->range_.base().raw()) / page_size, (hi.raw() - lo.raw()) / page_size};
             map->range_ = {lo, hi.raw() - lo.raw()};
+            if (map->binding_) map->binding_->mappings_.insert(*map);
             for (usize i = 0; i < edit.tails.size(); ++i) {
                 auto*& tail = edit.tails[i];
                 if (tail && map == (i == 0 ? edit.first : edit.last)) {
-                    if (tail->binding_) tail->binding_->mappings_.push_back(*tail);
+                    if (tail->binding_) tail->binding_->mappings_.insert(*tail);
                     link(*tail); tail = nullptr;
                 }
             }
@@ -1422,7 +1426,8 @@ auto VSpace::advance_edit(VmCtx ctx) noexcept -> std::expected<VmStatus, VSpaceE
                 auto vp = VPage::from_base(page->address_); libk_assert(vp);
                 edit.page = va_t{page->address_.raw() + page_size};
                 if (edit.perms) {
-                    const auto perms = PageTable::user_perms(map->binding_->private_write_ && !page->private_owned() ? Perms::of(Perm::Read) : *edit.perms);
+                    const auto perms = PageTable::user_perms(!map->binding_->memory().writable(page->object_page_)
+                        ? edit.perms->intersect(Perms::of(Perm::Read, Perm::Execute)) : *edit.perms);
                     libk_assert(perms);
                     auto old = root_->protect(*vp, *perms); libk_assert(old);
                     op.flush_.invalidate(page->address_);
@@ -1527,7 +1532,7 @@ auto VSpace::fault(VmCtx ctx, va_t address, Perm perms, Source::Context* context
     }
 
     Map* mapping{};
-    MapPage* private_source{};
+    object::ref<> private_source;
     usize object_page{};
     {
         sync::Lock guard{lock_};
@@ -1549,18 +1554,23 @@ auto VSpace::fault(VmCtx ctx, va_t address, Perm perms, Source::Context* context
             if (!mapping->layout_hook_.is_linked() || !mapping->perms_.contains(perms)) {
                 return (FaultResult{.kind = FaultKind::AccessDenied});
             }
+            if (mapping->binding_->invalid()) return FaultResult{.kind=FaultKind::Busy};
             const auto mapping_offset = mapping->range_.page_offset(page_range.base());
             libk_assert(mapping_offset);
             object_page = mapping->object_.base() + *mapping_offset;
-            if (auto* existing = mapping->binding_->pages_.find(page_range.base())) {
-                if (perms == Perm::Write && mapping->binding_->private_write_ && !existing->private_owned()) {
-                    auto admitted = begin_edit(page_range, false);
-                    if (!admitted) return (FaultResult{.kind = FaultKind::Busy});
-                    private_source = existing;
+            if (mapping->binding_->pages_.find(page_range.base())) {
+                if (perms == Perm::Write && mapping->binding_->memory().needs_copy(object_page)) {
+                    private_source = mapping->binding_->memory_ref_;
                     break;
                 }
 
                 const auto vp = VPage::from_base(page_range.base());
+                if (perms == Perm::Write && mapping->binding_->memory().kind() == BackingKind::Pager) {
+                    auto dirty = mapping->binding_->memory().dirty(object_page);
+                    if (!dirty) return (FaultResult{.kind = fault_kind(dirty.error())});
+                    const auto p = PageTable::user_perms(mapping->perms_);
+                    if (!root_->protect(*vp, *p)) return std::unexpected(VSpaceError::TranslationCorrupt);
+                }
                 const auto touched = root_->touch(*vp, perms);
                 if (!touched) return std::unexpected(VSpaceError::TranslationCorrupt);
                 // Svade traps on A/D=0. A valid leaf can also be hidden by a
@@ -1580,72 +1590,17 @@ auto VSpace::fault(VmCtx ctx, va_t address, Perm perms, Source::Context* context
         } while (false);
     }
     libk_assert(mapping != nullptr);
-    if (private_source != nullptr) return copy_private_fault(ctx, *mapping, *private_source);
-    return materialize_fault(ctx, *mapping, page_range.base(), object_page, context);
-}
-
-auto VSpace::copy_private_fault(VmCtx ctx, Map& mapping, MapPage& source) noexcept
-    -> std::expected<FaultResult, VSpaceError> {
-    Edit editing{this};
-    if (!pmm_->is_ram(source.page())) return std::unexpected(VSpaceError::NotRam);
-    resource::Usage usage{};
-    if (quota_) {
-        auto acquired = resource::acquire(quota_, resource::Capacity{.memory = page_size});
-        if (!acquired) return std::unexpected(VSpaceError::ResourceExhausted);
-        usage = std::move(acquired).value();
+    if (private_source) {
+        auto mem = private_source.as<Mem>();
+        if (!context) return FaultResult{.kind=FaultKind::Busy};
+        auto r = mem->get().make_private(object_page, *context);
+        return FaultResult{.kind=r ? FaultKind::Ready : fault_kind(r.error())};
     }
-    auto allocated = pmm_->allocate_page();
-    if (!allocated) return std::unexpected(VSpaceError::OutOfMemory);
-    OwnedPage private_page = std::move(allocated).value();
-    memcpy(private_page.bytes(), pmm_->bytes(source.page()), page_size);
-
-    auto made = pages_.create(quota_, source.address_, source.object_page_, std::move(private_page),
-                              std::move(usage));
-    if (!made) return std::unexpected(node_error(made.error()));
-    MapPage* const replacement = made.value().object;
-    const usize object_page = source.object_page_;
-    const MapId mapping_key = mapping.key_;
-    replacement->binding_ = mapping.binding_;
-    auto rollback = libk::scope_exit{[&]() noexcept {
-        replacement->binding_ = nullptr;
-        pages_.destroy(*replacement);
-    }};
-
-    sync::Lock lock{lock_};
-    Binding& auth = *mapping.binding_;
-    if (state_ != VSpaceState::Live || auth.invalid()) {
-        lock.restore();
-        return std::unexpected(VSpaceError::Busy);
-    }
-    auto mutation = tlb_.begin();
-
-    auto& editor = *root_;
-    auto& retire = transaction().flush_;
-    const auto virtual_page = VPage::from_base(source.address_);
-    libk_assert(virtual_page);
-    const auto permissions = mm::PageTable::user_perms(mapping.perms_);
-    libk_assert(permissions);
-    auto replaced = editor.replace(*virtual_page, replacement->page(), *permissions);
-    libk_assert(replaced);
-    retire.invalidate(source.address_);
-    auto folded = fold_usage(source, *replaced);
-    libk_assert(folded);
-    auth.pages_.erase(source);
-    auth.pages_.insert(*replacement);
-    rollback.release();
-    queue_page(source, false);
-    auto committed = commit_flush(std::move(mutation), ctx, retire);
-    lock.restore();
-    editing.reset();
-    if (committed == VmStatus::Complete) finish_bindings();
-    return (FaultResult{.kind = FaultKind::Materialized,
-                        .mapping = mapping_key,
-                        .object_page = object_page,
-                        .status = committed});
+    return materialize_fault(ctx, *mapping, page_range.base(), object_page, context, perms);
 }
 
 auto VSpace::materialize_fault(VmCtx, Map& mapping, va_t page_address, usize object_page,
-                               Source::Context* context) noexcept
+                               Source::Context* context, Perm access) noexcept
     -> std::expected<FaultResult, VSpaceError> {
     Edit editing{this};
     Binding& auth = *mapping.binding_;
@@ -1672,11 +1627,17 @@ auto VSpace::materialize_fault(VmCtx, Map& mapping, va_t page_address, usize obj
         return std::unexpected(memory_error(resident.error()));
     }
     PageHold source = std::move(resident).value();
-    const Perms source_access = auth.private_write_ ? Perms::of(Perm::Read) : mapping.perms_;
-    if (!source.perms().contains(source_access)) {
+    const Perms source_access = mapping.perms_;
+    auto effective = source.perms();
+    if (access == Perm::Write && memory->kind() == BackingKind::Pager && !memory->needs_copy(object_page)) {
+        const auto dirty = memory->dirty(object_page);
+        if (!dirty) return fail(fault_kind(dirty.error()));
+        effective = Perms::from_raw(effective.raw() | static_cast<u8>(Perm::Write));
+    }
+    if (!effective.contains(source_access) && memory->kind() != BackingKind::Pager && !memory->private_pages()) {
         return fail(FaultKind::AccessDenied);
     }
-    const auto permissions = mm::PageTable::user_perms(source_access);
+    const auto permissions = mm::PageTable::user_perms(source_access.intersect(effective));
     if (!permissions) {
         return std::unexpected(VSpaceError::InvalidAccess);
     }
@@ -1699,10 +1660,11 @@ auto VSpace::materialize_fault(VmCtx, Map& mapping, va_t page_address, usize obj
     TableReserve tables = std::move(table_reserve).value();
 
     sync::Lock lock{lock_};
-    if (state_ != VSpaceState::Live || auth.invalid()) {
+    if (state_ != VSpaceState::Live) {
         lock.restore();
         return std::unexpected(VSpaceError::InvalidState);
     }
+    if (auth.invalid()) return fail(FaultKind::Busy);
     auto mutation = tlb_.begin();
 
     auto& editor = *root_;
@@ -1791,13 +1753,45 @@ auto VSpace::sample_usage(VmCtx ctx, va_t address, bool clear) noexcept
     return usage;
 }
 
+auto Binding::sample(void* context, std::span<PagerPage> pages, u64 cursor) noexcept -> u64 {
+    auto& binding = *static_cast<Binding*>(context);
+    return binding.owner_->sample(binding, pages, cursor);
+}
+auto VSpace::sample(Binding& binding, std::span<PagerPage> pages, u64 cursor) noexcept -> u64 {
+    sync::Lock guard{lock_};
+    if (state_ != VSpaceState::Live || active_ || editing_ || draining_) {
+        for (auto& page : pages) page.flags |= PAGER_ACCESSED;
+        return 0;
+    }
+    auto mutation = tlb_.begin();
+    bool changed{};
+    auto* map = binding.mappings_.lower_bound(va_t{cursor});
+    for (usize step = 0; map && step < 8; ++step, map = binding.mappings_.next(*map)) for (auto& page : pages) {
+        if (!map->object_.contains(page.page)) continue;
+        const auto address = va_t{map->range_.base().raw() + (page.page - map->object_.base()) * page_size};
+        if (!binding.pages_.find(address)) continue;
+        const auto vp = VPage::from_base(address);
+        auto usage = root_->usage(*vp);
+        libk_assert(usage);
+        if (!usage->accessed) continue;
+        page.flags |= PAGER_ACCESSED;
+        libk_assert(root_->clear_usage(*vp));
+        transaction().flush_.invalidate(address);
+        changed = true;
+    }
+    const auto next = map ? map->range_.base().raw() : 0;
+    if (!changed) { mutation.abort(); return next; }
+    auto& cpu = current_cpu();
+    const auto status = commit_flush(std::move(mutation), {cpu.cpus, cpu.id}, transaction().flush_);
+    guard.restore();
+    if (status == VmStatus::Complete) finish_bindings();
+    return next;
+}
+
 auto VSpace::fold_usage(MapPage& page, PageUsage observed) noexcept -> std::expected<PageUsage, VSpaceError> {
     libk_assert(page.binding_ != nullptr);
-    if (!page.private_owned()) {
-        auto folded =
-            page.binding_->memory().observe_usage(page.object_page_, observed.accessed, observed.dirty);
-        if (!folded) return std::unexpected(memory_error(folded.error()));
-    }
+    auto folded = page.binding_->memory().observe_usage(page.object_page_, observed.accessed, false);
+    if (!folded) return std::unexpected(memory_error(folded.error()));
     return observed;
 }
 
@@ -1879,14 +1873,28 @@ auto VSpace::start_invalidation(VmCtx ctx, Binding& auth) noexcept -> std::expec
     auto& retire = transaction().flush_;
     auto& editor = *root_;
     usize remaining = 8;
-    auto* page = keep_maps ? auth.pages_.lower_bound(auth.trim_cursor_) : auth.pages_.minimum();
-    while (page && remaining) {
+    auto next_map = [&]() noexcept -> Map* {
+        auto* next = auth.mappings_.lower_bound(auth.trim_cursor_);
+        auto* previous = next ? auth.mappings_.previous(*next) : auth.mappings_.maximum();
+        return previous && previous->range_.contains(auth.trim_cursor_) ? previous : next;
+    };
+    while (remaining) {
         --remaining;
-        auto* next = auth.pages_.next(*page);
-        if (keep_maps) auth.trim_cursor_ = va_t{page->address_.raw() + page_size};
-        if (keep_maps && !trim.contains(page->object_page_)) {
-            page = next;
-            continue;
+        MapPage* page;
+        if (keep_maps) {
+            auto* map = next_map();
+            if (!map) break;
+            const auto lo = std::max(trim.base(), map->object_.base());
+            const auto hi = std::min(*trim.limit(), *map->object_.limit());
+            if (lo >= hi) { auth.trim_cursor_ = *map->range_.limit(); continue; }
+            const va_t begin{map->range_.base().raw() + (lo - map->object_.base()) * page_size};
+            const va_t end{map->range_.base().raw() + (hi - map->object_.base()) * page_size};
+            page = auth.pages_.lower_bound(std::max(begin, auth.trim_cursor_));
+            if (!page || page->address_ >= end) { auth.trim_cursor_ = *map->range_.limit(); continue; }
+            auth.trim_cursor_ = va_t{page->address_.raw() + page_size};
+        } else {
+            page = auth.pages_.minimum();
+            if (!page) break;
         }
         auth.pages_.erase(*page);
         const auto virtual_page = VPage::from_base(page->address_);
@@ -1900,20 +1908,19 @@ auto VSpace::start_invalidation(VmCtx ctx, Binding& auth) noexcept -> std::expec
             retire_table(retire, std::move(table));
         }
         queue_page(*page);
-        page = next;
     }
-    if (keep_maps) auth.trim_scanned_ = !page;
+    if (keep_maps) auth.trim_scanned_ = !next_map();
     else if (auth.pages_.empty()) {
         // No Map can retire its Binding before all installed pages and
         // borrowed consumers have left. Each batch owns a separate receipt.
         if (auth.views_.empty()) {
-            for (auto& mapping : auth.mappings_) {
+            for (auto* mapping = auth.mappings_.minimum(); mapping; mapping = auth.mappings_.next(*mapping)) {
                 if (!remaining) break;
-                if (!mapping.layout_hook_.is_linked()) continue;
+                if (!mapping->layout_hook_.is_linked()) continue;
                 --remaining;
-                unlink(mapping);
-                mapping.restore_ = mapping.claim_ && state_ == VSpaceState::Live;
-                queue_layout(mapping);
+                unlink(*mapping);
+                mapping->restore_ = mapping->claim_ && state_ == VSpaceState::Live;
+                queue_layout(*mapping);
             }
         }
     }

@@ -70,8 +70,6 @@ CALL(SCOPE_ADOPT, 74, scope_adopt, Call) /* a0=object(Adopt), a1=source(Manage),
 
 CALL(MEMORY_SEAL, 64, memory_seal, Call) /* a0=MemoryObject */
 CALL(QUOTA_CLOSE, 65, quota_close, Call) /* a0=Quota; OK=close intent accepted, value=state */
-CALL(MEM_TRIM, 70, mem_call, Call) /* Manage Mem, a1=first page, a2=count; fixed Wait on trim Source; result=CLEAN/DIRTY/BUSY/CANCELED after actual drain */
-CALL(MEM_WRITEBACK, 69, mem_call, Call) /* Manage Mem, a1=page; emits a Pager writeback request */
 CALL(MEMORY_POPULATE, 67, mem_call, Call) /* a0=Memory (Manage), a1=page index; waits for residency, no mapping or pin */
 CALL(MEMORY_WRITE, 66, memory_copy, Call) /* a0=Memory, a1=byte offset, a2=IPC offset, a3=bytes; Map + Write view, anonymous RAM, at most one page */
 CALL(MEMORY_READ, 68, memory_copy, Call) /* a0=Memory(Map), a1=byte offset, a2=IPC offset, a3=bytes (1..4096), within one source page; bounded copy */
@@ -107,11 +105,11 @@ CALL(CLOCK_FREQUENCY, 129, clock_frequency, Call)
 
 CALL(PAGER_CLAIM, 131, pg_call, Call) /* a0=pager; writes the tagged request to the registered IPC buffer */
 CALL(PAGER_REQUEUE, 132, pg_call, Call) /* a0=pager, a1=request id */
-CALL(PAGER_COMPLETE, 133, pg_call, Call) /* a0=pager, a1=target memory, a2=request id */
-CALL(PAGER_FAIL, 134, pg_call, Call) /* a0=pager, a1=target memory, a2=request id */
+CALL(PAGER_COMPLETE, 133, pg_call, Call) /* a0=pager, a1=request id */
+CALL(PAGER_FAIL, 134, pg_call, Call) /* a0=pager, a1=request id */
 CALL(IRQ_OBSERVE, 136, pg_call, Call) /* a0=irq */
 CALL(IRQ_ACK, 137, pg_call, Call) /* a0=irq, a1=generation, a2=sequence */
-CALL(PAGER_SUPPLY, 138, pg_call, Call) /* a0=pager, a1=target memory, a2=staging memory, a3=source page, a4=request id */
+CALL(PAGER_SUPPLY, 138, pg_call, Call) /* a0=pager, a1=request id, a2=staging memory, a3=source page, a4=flags(0 move, PAGER_SUPPLY_COPY) */
 CALL(EXIT_QUERY, 139, exit_call, Call) /* a0=Thread; returns finished/status */
 
 CALL(IO_SUBMIT, 144, io_submit, Create) /* a0=Quota, a1=IOSpace, a2=IO operation, a3=IPC offset, a6=Scope; PENDING + Op */
@@ -124,3 +122,14 @@ CALL(SCOPE_QUERY, 150, scope_query, Call) /* a0=Scope(Inspect), a1=Object ID, a2
 CALL(VSPACE_STOP, 152, vm_exec, Call) /* a0=whole VSpace(Control); irreversible execution quiesce */
 CALL(VSPACE_EXIT, 153, vm_exec, Call) /* a0=whole VSpace(Observe), a1=IPC offset; ExecInfo */
 CALL(DOMAIN_EXECUTION, 151, domain_configure, Call) /* a0=Domain(Control), a1=enabled; returns intent sequence */
+
+CALL(PAGER_RECORDS, 154, pg_call, Call) /* Pager(Inspect), key(0=first), page cursor; PagerRecords in IPC */
+CALL(PAGER_RECLAIM, 155, pg_call, Call) /* Pager(Manage), key, page, optional snapshot Mem, snapshot page; asynchronous */
+CALL(PAGER_DIRTY, 156, pg_call, Call) /* Pager(Manage), key, page; invalidate retained backing */
+CALL(MEMORY_BIND_PAGER, 157, memory_bind_pager, Call) /* Mem(Manage), Pager(Attach); initialize then bind without moving pins */
+CALL(MEMORY_CLONE, 158, memory_clone, Create) /* Quota, source Mem(Map+Read), first, count, optional Pager(Attach), Scope */
+CALL(MEMORY_INFO, 160, phys_call, Call) /* full Phys(Inspect); MemoryInfo in IPC */
+CALL(MEMORY_WATCH, 161, phys_call, Call) /* full Phys(Control), low/high/reserve bytes */
+CALL(PAGER_BUFFER, 162, pg_call, Call) /* Pager(Manage), op(0 register,1 refill,2 remove), Mem/slot, page */
+CALL(PAGER_RESTORE, 163, pg_call, Call) /* Pager(Manage), key, page; initiate/merge PageIn without waiting */
+CALL(PAGER_CONFIGURE, 164, pg_call, Call) /* Pager(Manage), set flag, logical byte limit; PagerInfo in IPC */

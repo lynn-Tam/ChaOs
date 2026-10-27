@@ -126,8 +126,6 @@ static_assert(offsetof(CapView, words) == 16);
 #define RIGHT_SEND                (U64_C(1) << 18)
 #define RIGHT_SERVE               (U64_C(1) << 19)
 #define RIGHT_SUPPLY              (U64_C(1) << 20)
-#define RIGHT_FAIL                (U64_C(1) << 21)
-#define RIGHT_WRITEBACK_ACK       (U64_C(1) << 22)
 #define RIGHT_ROUTE               (U64_C(1) << 23)
 #define RIGHT_OBSERVE             (U64_C(1) << 24)
 #define RIGHT_ATTACH              (U64_C(1) << 25)

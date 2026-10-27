@@ -3,7 +3,6 @@
 #include <map>
 
 using mgr_context = std::map<std::string, ubus_msg, std::less<>>;
-
 // Package references are resolved here, with real capabilities, before handing
 // the ordinary recipe to the mechanism. They never become startup ABI keys.
 static auto append(ubus_data& data, std::string_view name, ubus_value value, ubus_msg& out,
@@ -147,43 +146,62 @@ int main() {
     self = &owner;
     status = owner.open(); if (status != STATUS_OK) return status;
     std::deque<std::unique_ptr<_ch_pair>> channels;
-    for (const auto object : config["objects"].values()) {
-        const auto kind = object["kind"].as<std::string_view>(); if (!kind) return STATUS_BAD_ARGS;
-        if (*kind == "Manager") {
-            const auto rights = object["rights"].as<uint64_t>();
-            if (!rights || !*rights || (*rights & ~(mgr_observe | mgr_control | mgr_create | mgr_debug))) return STATUS_BAD_ARGS;
-            auto cap = owner.connector(*rights); if (!cap) return cap.error();
-            ubus_msg value;
-            const auto cap_idx = value.offer(std::move(*cap), RIGHT_SEND | RIGHT_DUPLICATE);
-            if (!cap_idx) return cap_idx.error();
-            value.data.cap("value", *cap_idx);
-            context.emplace(std::string{object.name()}, std::move(value));
-        } else if (*kind == "Channel") {
-            auto pair = std::make_unique<_ch_pair>();
-            status = pair->open(env.alloc(), object["depth"].as<uint64_t>().value_or(16), object["caps"].as<uint64_t>().value_or(0));
-            if (status != STATUS_OK) return status;
-            for (size_t side = 0; side < 2; ++side) {
+    std::vector<ubus_value> objects;
+    for (const auto object : config["objects"].values()) objects.push_back(object);
+    while (!objects.empty()) {
+        bool progress{};
+        for (size_t i = 0; i < objects.size();) {
+            const auto object = objects[i];
+            if (const auto ref = object["scope"]["$ref"].as<std::string_view>(); ref && !context.contains(*ref)) { ++i; continue; }
+            const auto kind = object["kind"].as<std::string_view>(); if (!kind) return STATUS_BAD_ARGS;
+            if (*kind == "Manager") {
+                const auto rights = object["rights"].as<uint64_t>();
+                if (!rights || !*rights || (*rights & ~(mgr_observe | mgr_control | mgr_create | mgr_debug))) return STATUS_BAD_ARGS;
+                auto cap = owner.connector(*rights); if (!cap) return cap.error();
                 ubus_msg value;
-                const auto cap_idx = value.attach(pair->ends[side].selector(), ~uint64_t{});
+                const auto cap_idx = value.offer(std::move(*cap), RIGHT_SEND | RIGHT_DUPLICATE);
                 if (!cap_idx) return cap_idx.error();
                 value.data.cap("value", *cap_idx);
-                const auto info = _cap_copy<CapInfo>(_cap_info(pair->ends[side].selector())); if (!info) return info.error();
-                value.transfers[0].rights = info->view.rights;
-                auto owned = value.clone(); if (!owned) return owned.error();
-                context.emplace(std::string{object.name()} + "." + std::to_string(side), std::move(*owned));
+                context.emplace(std::string{object.name()}, std::move(value));
+            } else if (*kind == "Channel") {
+                auto pair = std::make_unique<_ch_pair>();
+                status = pair->open(env.alloc(), object["depth"].as<uint64_t>().value_or(16), object["caps"].as<uint64_t>().value_or(0));
+                if (status != STATUS_OK) return status;
+                for (size_t side = 0; side < 2; ++side) {
+                    ubus_msg value;
+                    const auto cap_idx = value.attach(pair->ends[side].selector(), ~uint64_t{});
+                    if (!cap_idx) return cap_idx.error();
+                    value.data.cap("value", *cap_idx);
+                    const auto info = _cap_copy<CapInfo>(_cap_info(pair->ends[side].selector())); if (!info) return info.error();
+                    value.transfers[0].rights = info->view.rights;
+                    auto owned = value.clone(); if (!owned) return owned.error();
+                    context.emplace(std::string{object.name()} + "." + std::to_string(side), std::move(*owned));
+                }
+                channels.push_back(std::move(pair));
+            } else {
+                ubus_msg placement;
+                auto auth = env.alloc();
+                if (const auto scope = object["scope"]) {
+                    const auto status = append(placement.data, "scope", scope, placement, config_source, context);
+                    if (status != STATUS_OK) return status;
+                    auto owned = placement.clone(); if (!owned) return owned.error();
+                    placement = std::move(*owned);
+                    auth.scope = placement.capability(placement.data["scope"]);
+                    if (!auth.scope) return STATUS_BAD_ARGS;
+                }
+                const auto made = *kind == "Quota" ? _quota_create(auth,
+                    object["bytes"].as<uint64_t>().value_or(0), object["caps"].as<uint64_t>().value_or(0),
+                    object["kinds"].as<uint64_t>().value_or(OBJ_KINDS)) : *kind == "Scope" ? _scope_create(auth) : *kind == "Pager" ? _pager_create(auth) : _sys_result{.status=STATUS_BAD_ARGS};
+                if (made.status != STATUS_OK) return made.status;
+                ubus_msg value;
+                const auto cap_idx = value.give(_cap_owner{made.value});
+                if (!cap_idx) return cap_idx.error();
+                value.data.cap("value", *cap_idx);
+                context.emplace(std::string{object.name()}, std::move(value));
             }
-            channels.push_back(std::move(pair));
-        } else {
-            const auto made = *kind == "Quota" ? _quota_create(env.alloc(),
-                object["bytes"].as<uint64_t>().value_or(0), object["caps"].as<uint64_t>().value_or(0),
-                object["kinds"].as<uint64_t>().value_or(OBJ_KINDS)) : *kind == "Scope" ? _scope_create(env.alloc()) : _sys_result{.status=STATUS_BAD_ARGS};
-            if (made.status != STATUS_OK) return made.status;
-            ubus_msg value;
-            const auto cap_idx = value.give(_cap_owner{made.value});
-            if (!cap_idx) return cap_idx.error();
-            value.data.cap("value", *cap_idx);
-            context.emplace(std::string{object.name()}, std::move(value));
+            objects.erase(objects.begin() + i); progress = true;
         }
+        if (!progress) return STATUS_NOT_FOUND;
     }
     const auto recipe_for = [&](ubus_value child) -> std::expected<ubus_msg, status_t> {
         ubus_msg recipe;

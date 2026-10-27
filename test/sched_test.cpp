@@ -205,15 +205,16 @@ bool test_object_store_unpublished_construction_rolls_back(
     if (!storage.initialize()) {
         return false;
     }
-    // KSpace owns mapped guarded stack slots as a reusable pool. Warm
-    // one slot so this test measures Thread construction rollback, not pool
-    // growth.
+    // Warm both guarded stacks and the bounded object metadata slab, then
+    // measure payload rollback and reuse rather than cold pool growth.
     {
         auto warm = mm::Stack::create(*sched_test_kernel);
-        if (!warm) {
-            return false;
-        }
+        if (!warm) return false;
+        auto pending = sched_test_tasks->get<Thread>().create(std::move(*warm), Env::kernel(*sched_test_kernel),
+            Thread::KernelStart{unused_thread_entry, nullptr});
+        if (!pending) return false;
     }
+    while (sched_work->run()) {}
     const usize free_before = sched_test_pmm->free_page_count();
     {
         auto stack = mm::Stack::create(*sched_test_kernel);

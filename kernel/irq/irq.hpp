@@ -21,7 +21,7 @@ public:
     ~Ctl() noexcept;
     auto open() noexcept -> status_t;
     void activate() noexcept;
-    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return bindings_.admit(std::forward<Publish>(publish)); }
+    template<class Publish> auto admit(Publish&& publish, usize count) noexcept -> status_t { return bindings_.admit(std::forward<Publish>(publish), {}, count); }
     void links(u64 cursor, LinkRecords& out) const noexcept;
     auto line(u32) noexcept -> std::expected<Line, status_t>;
     void bind_work(WorkQueue&, object::Key owner) noexcept { job_.bind(owner); bindings_.bind(owner); }
@@ -65,7 +65,7 @@ public:
     ~Irq() noexcept;
     [[nodiscard]] auto source() const noexcept -> Line { return route_.line_; }
     auto events() noexcept -> Source& { return events_; }
-    template<class Publish> auto admit(Publish&& publish) noexcept -> status_t { return bindings_.admit(std::forward<Publish>(publish)); }
+    template<class Publish> auto admit(Publish&& publish, usize count) noexcept -> status_t { return bindings_.admit(std::forward<Publish>(publish), {}, count); }
     void bind_work(WorkQueue& work, object::Key key) noexcept { bindings_.bind(key); key_ = key; events_.bind_work(work, key); }
     void links(u64 cursor, LinkRecords& out) const noexcept;
     [[nodiscard]] auto enable(bool) noexcept -> std::expected<u64, Error>;

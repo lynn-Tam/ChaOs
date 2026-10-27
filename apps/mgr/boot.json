@@ -32,6 +32,15 @@
     "debug": {
       "kind": "Manager",
       "rights": 11
+    },
+    "pager.scope": {
+      "kind": "Scope"
+    },
+    "pager": {
+      "kind": "Pager",
+      "scope": {
+        "$ref": "pager.scope"
+      }
     }
   },
   "routes": {
@@ -58,6 +67,14 @@
     "hardware": {
       "child": "devices",
       "name": "inventory"
+    },
+    "memory": {
+      "child": "memory",
+      "name": "memory"
+    },
+    "memory.admin": {
+      "child": "memory",
+      "name": "admin"
     }
   },
   "children": [
@@ -202,6 +219,47 @@
       "restart": true
     },
     {
+      "name": "memory",
+      "program": "/boot/mem.elf",
+      "start": true,
+      "resources": {
+        "bytes": 4194304,
+        "caps": 256,
+        "max_bytes": 16777216
+      },
+      "exports": [
+        "memory",
+        "admin"
+      ],
+      "routes": {
+        "block": {
+          "child": "devices",
+          "name": "block"
+        },
+        "hardware": {
+          "child": "devices",
+          "name": "inventory"
+        }
+      },
+      "setup": {
+        "pager": {
+          "$ref": "pager"
+        },
+        "physical": {
+          "$ref": "physical",
+          "rights": {
+            "$const": "RIGHT_INSPECT | RIGHT_CONTROL | RIGHT_DUPLICATE"
+          }
+        },
+        "scope": {
+          "$ref": "pager.scope",
+          "rights": {
+            "$const": "RIGHT_MANAGE | RIGHT_CREATE | RIGHT_INSPECT | RIGHT_DUPLICATE"
+          }
+        }
+      }
+    },
+    {
       "name": "shell",
       "program": "/boot/shell.elf",
       "start": true,
@@ -240,6 +298,12 @@
           },
           "hardware": {
             "parent": "hardware"
+          },
+          "memory.admin": {
+            "parent": "memory.admin"
+          },
+          "memory": {
+            "parent": "memory"
           }
         },
         "commands": {
@@ -255,7 +319,8 @@
               "hardware": {
                 "parent": "hardware"
               }
-            }
+            },
+            "resident": true
           },
           "svc": {
             "setup": {
@@ -263,7 +328,8 @@
                 "$ref": "control"
               },
               "scope.name": "system"
-            }
+            },
+            "resident": true
           },
           "bus": {
             "setup": {
@@ -281,7 +347,8 @@
               "*": {
                 "parent": true
               }
-            }
+            },
+            "resident": true
           },
           "control-test": {
             "setup": {
@@ -370,6 +437,16 @@
               "fs",
               "append"
             ]
+          },
+          "swap": {
+            "resident": true
+          },
+          "memcheck": {
+            "resources": {
+              "bytes": 16777216,
+              "caps": 256,
+              "children": true
+            }
           }
         },
         "profiles": {
@@ -431,6 +508,12 @@
               }
             }
           }
+        },
+        "pager": {
+          "$ref": "pager",
+          "rights": {
+            "$const": "RIGHT_ATTACH | RIGHT_DUPLICATE"
+          }
         }
       },
       "routes": {
@@ -464,6 +547,14 @@
         "hardware": {
           "child": "devices",
           "name": "inventory"
+        },
+        "memory.admin": {
+          "child": "memory",
+          "name": "admin"
+        },
+        "memory": {
+          "child": "memory",
+          "name": "memory"
         }
       }
     }

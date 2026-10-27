@@ -29,7 +29,7 @@ int main() {
     auto memory = response.take(response.data["buffer"]);
     test_image image;
     if (const auto rc =
-            image.open(info.vspace, memory.selector(), buffer->size, VM_READ | VM_EXECUTE | VM_MAP_PRIVATE);
+            image.open(info.vspace, memory.selector(), buffer->size, VM_READ | VM_EXECUTE);
         rc != STATUS_OK)
         _thread_exit(rc);
     test_tasks tasks;

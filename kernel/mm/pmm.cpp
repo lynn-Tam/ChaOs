@@ -476,6 +476,7 @@ auto Pmm::push_free(Arena& arena, usize index) noexcept -> void {
     descriptor.next = arena.free_head;
     arena.free_head = index;
     ++arena.free_count;
+    ++free_; pressure();
 }
 
 auto Pmm::pop_free(Arena& arena) noexcept -> usize {
@@ -488,11 +489,28 @@ auto Pmm::pop_free(Arena& arena) noexcept -> usize {
     arena.free_head = descriptor.next;
     descriptor.next = Nil;
     --arena.free_count;
+    --free_; pressure();
     return index;
 }
 
-auto Pmm::allocate_page() noexcept -> AllocateResult {
+void Pmm::watch(Notify observer) noexcept { sync::Lock guard{lock_}; observer_ = observer; }
+auto Pmm::configure(usize low, usize high, usize floor) noexcept -> bool {
+    const auto total = page_count();
     sync::Lock guard{lock_};
+    if (floor >= low || low >= high || high >= total) return false;
+    low_ = low; high_ = high; floor_ = floor; pressure(); if (observer_) observer_(); return true;
+}
+auto Pmm::pressured() const noexcept -> bool { sync::Lock guard{lock_}; return pressure_; }
+auto Pmm::reserve_pages() const noexcept -> usize { sync::Lock guard{lock_}; return floor_; }
+void Pmm::pressure() noexcept {
+    const auto active = pressure_ ? free_ < high_ : low_ && free_ <= low_;
+    if (active != pressure_) { pressure_ = active; if (observer_) observer_(); }
+}
+auto Pmm::allocate_page() noexcept -> AllocateResult { return allocate_page(false); }
+auto Pmm::allocate_reserved() noexcept -> AllocateResult { return allocate_page(true); }
+auto Pmm::allocate_page(bool reserve) noexcept -> AllocateResult {
+    sync::Lock guard{lock_};
+    if (!reserve && free_ <= floor_) return std::unexpected(AllocError::NoMemory);
     for (auto& arena : arenas_) {
         const usize index = pop_free(arena);
         if ((index == Nil)) {
@@ -529,6 +547,7 @@ auto Pmm::descriptor(usize id) noexcept -> Desc& {
 
 auto Pmm::allocate_page_into(PageGroup& group) noexcept -> GroupAllocateResult {
     sync::Lock guard{lock_};
+    if (free_ <= floor_) return std::unexpected(AllocError::NoMemory);
     libk_assert(group.owner_.get() == this);
     libk_assert((group.id_ != Nil));
 
@@ -568,7 +587,7 @@ auto Pmm::grow(PageGroup& group, usize n) noexcept -> bool {
     sync::Lock guard{lock_};
     usize available{};
     for (const auto& arena : arenas_) available += arena.free_count;
-    if (n > available) return false;
+    if (n > available - std::min(available, floor_)) return false;
     for (auto& arena : arenas_) {
         const auto count = std::min(n, arena.free_count);
         for (usize i = 0; i < count; ++i) {
@@ -907,12 +926,7 @@ auto Pmm::page_count() const noexcept -> size_t {
 }
 
 auto Pmm::free_page_count() const noexcept -> size_t {
-    sync::Lock guard{lock_};
-    size_t count = 0;
-    for (const auto& arena : arenas_) {
-        count += arena.free_count;
-    }
-    return count;
+    sync::Lock guard{lock_}; return free_;
 }
 
 auto Pmm::arena_count() const noexcept -> size_t {

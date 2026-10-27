@@ -132,7 +132,8 @@ static auto _prepare(_entry entry, void* argument, const _thread_attr& attr, boo
         const auto tp = (storage.stack.address + storage.stack.size - tls_size) & ~(alignment - 1);
         ::memcpy(reinterpret_cast<void*>(tp), __tls_start, __tls_data_end - __tls_start);
         // Fresh anonymous backing supplies TLS BSS without eagerly touching it.
-        auto ipc = _vm_area::create(env.alloc(), _vm(), 0, 4096);
+        auto wired = _vm(); wired.pager = 0;
+        auto ipc = _vm_area::create(env.alloc(), wired, 0, 4096);
         if (!ipc) return ipc.error();
         storage.ipc = std::move(*ipc);
         const auto tls_offset = reinterpret_cast<uintptr_t>(&_local) - reinterpret_cast<uintptr_t>(__builtin_thread_pointer());
@@ -155,6 +156,10 @@ static auto _prepare(_entry entry, void* argument, const _thread_attr& attr, boo
         if (status != STATUS_OK) return status;
         auto home = cpus;
         for (auto skip = (record->id - 1) % std::popcount(cpus); skip; --skip) home &= home - 1;
+        if (env.pager && !internal) {
+            status = _memory_bind_pager(storage.stack.memory.selector(), env.pager).status;
+            if (status != STATUS_OK) return status;
+        }
         const auto made = _thread_create(env.alloc(), env.vspace, env.cspace, descriptor.selector(), 0, std::countr_zero(home));
         storage.thread = _cap_owner{made.value}; _destroy(descriptor);
         if (made.status != STATUS_OK) return made.status;

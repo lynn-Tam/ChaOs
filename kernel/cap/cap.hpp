@@ -91,8 +91,6 @@ enum class Right : u64 {
     Send = RIGHT_SEND,
     Serve = RIGHT_SERVE,
     Supply = RIGHT_SUPPLY,
-    Fail = RIGHT_FAIL,
-    WritebackAck = RIGHT_WRITEBACK_ACK,
     Route = RIGHT_ROUTE,
     Observe = RIGHT_OBSERVE,
     Attach = RIGHT_ATTACH,

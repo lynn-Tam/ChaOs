@@ -361,7 +361,8 @@ public:
             ubus_msg request; request.data.put("bytes", need).put("caps", budget.cap_limit);
             status = environment.invoke("Resource", std::move(request), response); if (status != STATUS_OK) return status;
         }
-        auto buffer = _vm_area::create(_startup().alloc(), _vm(), 0, 4096); if (!buffer) return buffer.error();
+        auto wired = _vm(); wired.pager = 0;
+        auto buffer = _vm_area::create(_startup().alloc(), wired, 0, 4096); if (!buffer) return buffer.error();
         uint64_t offset{};
         for (;;) {
             ubus_msg request;
@@ -378,7 +379,8 @@ public:
     auto save(const ed_buffer& text) -> status_t {
         if (!document_.token("Save")) return STATUS_DENIED;
         const auto size = (std::max(text.size(), size_t{1}) + 4095) & ~size_t{4095};
-        auto buffer = _vm_area::create(_startup().alloc(), _vm(), 0, size); if (!buffer) return buffer.error();
+        auto wired = _vm(); wired.pager = 0;
+        auto buffer = _vm_area::create(_startup().alloc(), wired, 0, size); if (!buffer) return buffer.error();
         ::memcpy(reinterpret_cast<void*>(buffer->address), text.before(), text.cursor());
         ::memcpy(reinterpret_cast<void*>(buffer->address + text.cursor()), text.after(), text.after_size());
         ubus_msg request, response;

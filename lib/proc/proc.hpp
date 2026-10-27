@@ -6,7 +6,7 @@
 
 inline constexpr word_t _proc_base_kinds = OBJ_BIT(ObjThread) | OBJ_BIT(ObjSc) | OBJ_BIT(ObjDomain)
     | OBJ_BIT(ObjCSpace) | OBJ_BIT(ObjMem) | OBJ_BIT(ObjVSpace)
-    | OBJ_BIT(ObjChannel) | OBJ_BIT(ObjIoOp) | OBJ_BIT(ObjVmOp) | OBJ_BIT(ObjQuota) | OBJ_BIT(ObjScope) | OBJ_BIT(ObjNotification) | OBJ_BIT(ObjPort);
+    | OBJ_BIT(ObjChannel) | OBJ_BIT(ObjIoOp) | OBJ_BIT(ObjVmOp) | OBJ_BIT(ObjQuota) | OBJ_BIT(ObjScope) | OBJ_BIT(ObjNotification) | OBJ_BIT(ObjPort) | OBJ_BIT(ObjPager);
 
 struct _proc_limits {
     word_t bytes{1024 * 1024}, caps{256}, kinds{_proc_base_kinds};
@@ -39,7 +39,7 @@ struct _proc_layout {
 };
 struct _proc_opts {
     std::span<const std::string_view> argv{}, envp{};
-    cap_t bootstrap{};
+    cap_t bootstrap{}, pager{};
     _proc_limits resources{};
     _proc_layout layout{};
     std::optional<unsigned> cpu{};

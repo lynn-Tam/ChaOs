@@ -91,8 +91,8 @@ constexpr Rights channel_rights = Rights::of(
 
 constexpr Rights pager_rights = Rights::of(
     Right::Duplicate, Right::Delegate, Right::Inspect, Right::Attach,
-    Right::Serve,
-    Right::Supply, Right::Fail, Right::WritebackAck, Right::Close,
+    Right::Serve, Right::Manage,
+    Right::Supply, Right::Close,
     Right::Destroy, Right::Adopt, Right::Reassign, Right::Revoke);
 
 constexpr Rights irq_rights = Rights::of(
