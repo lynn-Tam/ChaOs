@@ -40,7 +40,7 @@ class Batch;
 enum class XferOp : u8 { Copy, Move, Derive };
 using XferLimit = std::variant<Rights, View, Attenuation>;
 struct XferSpec final {
-    Handle source{};
+    cSelector source{};
     XferLimit limit{Rights{}};
     XferOp op{XferOp::Copy};
 };
@@ -75,7 +75,7 @@ public:
         auto operator=(Reservation&& other) noexcept -> Reservation&;
         ~Reservation() noexcept;
 
-        [[nodiscard]] auto handle() const noexcept -> Handle {
+        [[nodiscard]] auto handle() const noexcept -> cSelector {
             return handle_;
         }
 
@@ -85,7 +85,7 @@ public:
         friend class ipc::Channel;
         Reservation(
             CSpace& owner,
-            Handle handle,
+            cSelector handle,
             resource::Usage&& usage) noexcept
             : owner_(&owner),
               handle_(handle),
@@ -97,7 +97,7 @@ public:
         }
 
         CSpace* owner_{};
-        Handle handle_{};
+        cSelector handle_{};
         resource::Usage usage_{};
     };
 
@@ -107,7 +107,7 @@ public:
         NewCap() noexcept = default;
         NewCap(NewCap&&) noexcept = default;
         auto operator=(NewCap&&) noexcept -> NewCap& = default;
-        auto handle() const noexcept -> Handle { return slot_.handle(); }
+        auto handle() const noexcept -> cSelector { return slot_.handle(); }
 
     private:
         friend class CSpace;
@@ -125,11 +125,11 @@ public:
         -> std::expected<Reservation, CSpaceError>;
     [[nodiscard]] auto insert(
         GrantRef&& grant,
-        View view) noexcept -> std::expected<Handle, CSpaceError>;
+        View view) noexcept -> std::expected<cSelector, CSpaceError>;
     [[nodiscard]] auto insert(
         Reservation&& reservation,
         GrantRef&& grant,
-        View view) noexcept -> std::expected<Handle, CSpaceError>;
+        View view) noexcept -> std::expected<cSelector, CSpaceError>;
     [[nodiscard]] auto prepare(Reservation&&, GrantRef&&, View) noexcept
         -> std::expected<NewCap, CSpaceError>;
     // All slots become visible under one lock, or none do. No allocation here.
@@ -141,9 +141,9 @@ public:
     using PublishError = std::variant<resource::errc, GrantError, CSpaceError>;
     template<usize N, class Make, class Bind>
     auto publish(const std::array<View, N>& views, Make&& make, Bind&& bind) noexcept
-        -> std::expected<std::array<Handle, N>, PublishError> {
+        -> std::expected<std::array<cSelector, N>, PublishError> {
         std::array<NewCap, N> caps;
-        std::array<Handle, N> handles;
+        std::array<cSelector, N> handles;
         for (usize i = 0; i < N; ++i) {
             auto slot = reserve();
             if (!slot) return std::unexpected(slot.error());
@@ -163,17 +163,17 @@ public:
     auto publish(const std::array<View, N>& views, Make&& make) noexcept {
         return publish(views, std::forward<Make>(make), [](auto&, usize) { return true; });
     }
-    [[nodiscard]] auto close(Handle handle) noexcept
+    [[nodiscard]] auto close(cSelector handle) noexcept
         -> std::expected<void, CSpaceError>;
-    [[nodiscard]] auto transfer(Handle, CSpace&, XferOp, XferLimit = Rights{}, resource::Reservation reservation = {}) noexcept
-        -> std::expected<Handle, CSpaceError>;
-    [[nodiscard]] auto revoke(Handle, Source::Context* = nullptr, GrantId selected = {}) noexcept -> std::expected<WaitResult, CSpaceError>;
-    [[nodiscard]] auto destroy(Handle source) noexcept
+    [[nodiscard]] auto transfer(cSelector, CSpace&, XferOp, XferLimit = Rights{}, resource::Reservation reservation = {}) noexcept
+        -> std::expected<cSelector, CSpaceError>;
+    [[nodiscard]] auto revoke(cSelector, Source::Context* = nullptr, GrantId selected = {}) noexcept -> std::expected<WaitResult, CSpaceError>;
+    [[nodiscard]] auto destroy(cSelector source) noexcept
         -> std::expected<void, CSpaceError>;
 
     template<typename T>
     [[nodiscard]] auto resolve(
-        Handle handle,
+        cSelector handle,
         Rights requested) noexcept -> std::expected<Resolved<T>, CSpaceError> {
         static_assert(std::is_void_v<T> || object::kind<T> != ObjInvalid);
         auto copied = snapshot(handle);
@@ -210,9 +210,9 @@ public:
         return transaction([&](auto&& visit) { visit(usage_); }, [] {});
     }
     auto inspect(GrantQuery, usize depth, GrantRecords&) noexcept -> status_t;
-    auto observe(Handle seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, status_t>;
-    auto inspect(Handle cursor, CSpaceInfo&, u64 epoch = 0) noexcept -> std::expected<void, CSpaceError>;
-    auto inspect(Handle) noexcept -> std::expected<CapInfo, CSpaceError>;
+    auto observe(cSelector seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, status_t>;
+    auto inspect(cSelector cursor, CSpaceInfo&, u64 epoch = 0) noexcept -> std::expected<void, CSpaceError>;
+    auto inspect(cSelector) noexcept -> std::expected<CapInfo, CSpaceError>;
     void bind_work(WorkQueue& work, object::Key owner) noexcept { work_ = &work; job_.bind(owner); }
     void retire() noexcept;
     void retire(object::cleanup&&) noexcept;
@@ -285,13 +285,13 @@ private:
 
     auto install(std::span<Capability*>, std::span<Reservation*>, Graph::Admission,
         std::span<const object::ref<>*>, libk::delegate<void() noexcept>, std::span<const Graph::Attach> = {}) noexcept -> std::expected<void, CSpaceError>;
-    [[nodiscard]] auto snapshot(Handle handle) noexcept
+    [[nodiscard]] auto snapshot(cSelector handle) noexcept
         -> std::expected<Snapshot, CSpaceError>;
     struct Xfer final {
         Reservation slot;
         GrantPin pin;
         GrantRef grant;
-        Handle source;
+        cSelector source;
         View original, view;
         XferOp op;
     };
@@ -301,7 +301,7 @@ private:
         -> std::expected<void, CSpaceError>;
     [[nodiscard]] auto reserved(const Reservation&) noexcept -> Slot*;
     void publish(Reservation&, Capability&&) noexcept;
-    void rollback(Handle handle) noexcept;
+    void rollback(cSelector handle) noexcept;
     void run_work() noexcept;
     void release() noexcept;
     void finish_retire() noexcept;
@@ -311,7 +311,7 @@ private:
     [[nodiscard]] auto reserve_grant() noexcept
         -> std::expected<resource::Reservation, CSpaceError>;
     [[nodiscard]] auto escrow_move(
-        Handle source,
+        cSelector source,
         Capability& cap,
         Reservation& reservation) noexcept
         -> std::expected<void, CSpaceError>;
@@ -371,14 +371,14 @@ private:
 class Batch final : private libk::noncopyable {
 public:
     using Specs = libk::inplace_vector<XferSpec, IPC_MAX_CAPS>;
-    using Handles = libk::inplace_vector<Handle, IPC_MAX_CAPS>;
+    using Selectors = libk::inplace_vector<cSelector, IPC_MAX_CAPS>;
     Batch() noexcept = default;
     Batch(Batch&&) noexcept = default;
     auto operator=(Batch&&) noexcept -> Batch& = default;
     [[nodiscard]] static auto prepare(Batch&, CSpace&, CSpace&, const Specs&) noexcept
         -> std::expected<void, CSpaceError>;
-    [[nodiscard]] auto commit() noexcept -> std::expected<Handles, CSpaceError>;
-    [[nodiscard]] auto handles() const noexcept -> Handles;
+    [[nodiscard]] auto commit() noexcept -> std::expected<Selectors, CSpaceError>;
+    [[nodiscard]] auto handles() const noexcept -> Selectors;
     void abort() noexcept { entries_.clear(); source_ = destination_ = nullptr; }
     [[nodiscard]] auto empty() const noexcept -> bool { return entries_.empty(); }
 private:

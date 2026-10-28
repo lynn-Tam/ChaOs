@@ -68,7 +68,7 @@ struct Result final {
 
 [[nodiscard]] auto read_desc_bytes(
     Call& inv,
-    cap::Handle handle,
+    cap::cSelector handle,
     usize offset,
     std::span<byte> dest) noexcept
     -> std::expected<void, status_t>;
@@ -76,7 +76,7 @@ struct Result final {
 template<typename Descriptor>
 [[nodiscard]] auto read_desc(
     Call& inv,
-    cap::Handle handle,
+    cap::cSelector handle,
     usize offset) noexcept -> std::expected<Descriptor, status_t> {
     Descriptor descriptor{};
     auto read = read_desc_bytes(
@@ -90,7 +90,7 @@ template<typename Descriptor>
     return (descriptor);
 }
 [[nodiscard]] auto mem_status(mm::MemErr error) noexcept -> status_t;
-[[nodiscard]] auto handle_of(usize raw) noexcept -> cap::Handle;
+[[nodiscard]] auto handle_of(usize raw) noexcept -> cap::cSelector;
 [[nodiscard]] auto rights_of(usize raw) noexcept
     -> std::optional<cap::Rights>;
 [[nodiscard]] auto perms_of(usize raw) noexcept

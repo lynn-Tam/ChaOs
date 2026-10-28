@@ -802,7 +802,7 @@ bool test_cap_batch_has_one_publication(const TestContext&) noexcept {
     if (!f.initialize()) return false;
     for (unsigned mode : {0U, 1U, 2U}) {
         std::array<CSpace::NewCap, 2> caps;
-        std::array<cap::Handle, 2> ids;
+        std::array<cap::cSelector, 2> ids;
         for (usize i = 0; i < caps.size(); ++i) {
             auto grant = f.root(i);
             auto slot = mode == 0 && i == 1 ? f.b().reserve() : f.a().reserve();
@@ -1531,7 +1531,7 @@ bool test_destroy_allocation_progress_and_quota_close(const TestContext&) noexce
     auto pending = cap_test_quotas->create(limit);
     if (!pending) return false;
     auto pool = std::move(pending).value().publish();
-    cap::Handle handles[2]{};
+    cap::cSelector handles[2]{};
     const auto rights = Rights::of(Right::Inspect, Right::Destroy);
     for (usize index = 0; index < 2; ++index) {
         auto quota_ref = object::ref<>{pool};

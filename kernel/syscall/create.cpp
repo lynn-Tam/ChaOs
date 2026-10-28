@@ -106,7 +106,7 @@ static auto check_create(Call& inv, cap::Resolved<resource::Quota>& pool, resour
 }
 
 template <usize N>
-static auto publication(std::expected<std::array<cap::Handle, N>, cap::CSpace::PublishError> handles) noexcept
+static auto publication(std::expected<std::array<cap::cSelector, N>, cap::CSpace::PublishError> handles) noexcept
     -> Result {
     if (!handles)
         return returned(std::visit(
@@ -127,7 +127,7 @@ template<class Pending, usize N, class Bind>
 static auto publish(Call& inv, Pending& object, cap::GrantRef& root,
                     cap::Resolved<resource::Quota>& pool, const std::array<cap::View, N>& views,
                     Bind&& bind) noexcept {
-    using Result = std::expected<std::array<cap::Handle, N>, cap::CSpace::PublishError>;
+    using Result = std::expected<std::array<cap::cSelector, N>, cap::CSpace::PublishError>;
     if constexpr (N == 1) {
         auto handles = inv.cspace.publish(views, [&](cap::View) -> std::expected<cap::GrantRef, cap::CSpace::PublishError> {
             return std::move(root);
@@ -866,7 +866,7 @@ struct ThreadStart final {
     IpcBinding ipc{};
 };
 
-[[nodiscard]] static auto start_snapshot(Call& inv, cap::Handle handle, usize offset) noexcept
+[[nodiscard]] static auto start_snapshot(Call& inv, cap::cSelector handle, usize offset) noexcept
     -> std::expected<ThreadStart, status_t> {
     auto snapshot = read_desc<ThreadInit>(inv, handle, offset);
     if (!snapshot) {

@@ -139,7 +139,7 @@ public:
         cap::CSpace& destination,
         u64 badge,
         cap::Rights rights) noexcept
-        -> std::expected<cap::Handle, ChannelError>;
+        -> std::expected<cap::cSelector, ChannelError>;
 
     // Bound during construction. Revoking the exact side-root grant closes
     // that protocol side through the cap graph's lifecycle edge.

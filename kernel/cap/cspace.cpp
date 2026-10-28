@@ -12,7 +12,7 @@
 
 namespace cap {
 
-auto CSpace::inspect(Handle handle) noexcept -> std::expected<CapInfo, CSpaceError> {
+auto CSpace::inspect(cSelector handle) noexcept -> std::expected<CapInfo, CSpaceError> {
     auto* cell = handle ? slot(handle.index()) : nullptr;
     if (!cell) return std::unexpected(CSpaceError::InvalidHandle);
     sync::Lock guard{cell->lock};
@@ -27,7 +27,7 @@ auto CSpace::inspect(Handle handle) noexcept -> std::expected<CapInfo, CSpaceErr
     return info;
 }
 
-auto CSpace::inspect(Handle cursor, CSpaceInfo& info, u64 epoch) noexcept -> std::expected<void, CSpaceError> {
+auto CSpace::inspect(cSelector cursor, CSpaceInfo& info, u64 epoch) noexcept -> std::expected<void, CSpaceError> {
     sync::Lock guard{lock_};
     if (!accepting_ || reassigning_) return std::unexpected(CSpaceError::InvalidState);
     if (epoch_ == std::numeric_limits<u64>::max() || (cursor && !epoch) || (epoch && epoch != epoch_))
@@ -46,7 +46,7 @@ auto CSpace::inspect(Handle cursor, CSpaceInfo& info, u64 epoch) noexcept -> std
         auto& row = *slot(index);
         const auto& cap = row.storage.capability;
         auto& record = info.records[info.count++];
-        record.selector = Handle::make(index, row.generation).raw();
+        record.selector = cSelector::make(index, row.generation).raw();
         record.object_id = cap.grant.target_id().value;
         record.grant_id = cap.grant.id().value;
         record.state = CAP_INFO_UNAVAILABLE;
@@ -62,7 +62,7 @@ auto CSpace::inspect(Handle cursor, CSpaceInfo& info, u64 epoch) noexcept -> std
 
 auto CSpace::inspect(GrantQuery query, usize depth, GrantRecords& out) noexcept -> status_t {
     sync::Lock guard{lock_};
-    auto handle = Handle{query.selector};
+    auto handle = cSelector{query.selector};
     auto* cell = slot(handle.index());
     if (!handle || !cell || cell->generation != handle.generation() || cell->state != SlotState::Occupied)
         return STATUS_STALE;
@@ -70,7 +70,7 @@ auto CSpace::inspect(GrantQuery query, usize depth, GrantRecords& out) noexcept 
     return grant.graph().inspect(grant.key(), query, depth, out);
 }
 
-auto CSpace::observe(Handle seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, status_t> {
+auto CSpace::observe(cSelector seed, GrantId selected, usize depth) noexcept -> std::expected<Graph::Sample, status_t> {
     sync::Lock guard{lock_};
     auto* cell = seed ? slot(seed.index()) : nullptr;
     if (!cell || cell->generation != seed.generation() || cell->state != SlotState::Occupied)
@@ -88,7 +88,7 @@ CSpace::CSpace(mm::Pmm& pmm, Quota quota) noexcept
 
 CSpace::Reservation::Reservation(Reservation&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)),
-      handle_(std::exchange(other.handle_, Handle{})),
+      handle_(std::exchange(other.handle_, cSelector{})),
       usage_(std::move(other.usage_)) {}
 
 auto CSpace::Reservation::operator=(Reservation&& other) noexcept
@@ -96,7 +96,7 @@ auto CSpace::Reservation::operator=(Reservation&& other) noexcept
     if (this != &other) {
         reset();
         owner_ = std::exchange(other.owner_, nullptr);
-        handle_ = std::exchange(other.handle_, Handle{});
+        handle_ = std::exchange(other.handle_, cSelector{});
         usage_ = std::move(other.usage_);
     }
     return *this;
@@ -108,7 +108,7 @@ CSpace::Reservation::~Reservation() noexcept {
 
 void CSpace::Reservation::reset() noexcept {
     CSpace* const owner = std::exchange(owner_, nullptr);
-    const Handle handle = std::exchange(handle_, Handle{});
+    const cSelector handle = std::exchange(handle_, cSelector{});
     if (owner != nullptr) {
         owner->rollback(handle);
     }
@@ -166,7 +166,7 @@ auto CSpace::reserve() noexcept
                 free_head_ = available->next;
                 available->next = invalid_index;
 
-                if (available->generation == Handle::max_generation) {
+                if (available->generation == cSelector::max_generation) {
                     available->state = SlotState::Quarantined;
                     ++quarantined_slots_;
                     continue;
@@ -175,7 +175,7 @@ auto CSpace::reserve() noexcept
                 ++available->generation;
                 available->state = SlotState::Reserved;
                 ++live_slots_;
-                const Handle handle = Handle::make(
+                const cSelector handle = cSelector::make(
                     index, available->generation);
                 libk_assert(handle);
                 return (Reservation{
@@ -219,7 +219,7 @@ auto CSpace::reserve_grant() noexcept
 
 auto CSpace::insert(
     GrantRef&& grant,
-    View view) noexcept -> std::expected<Handle, CSpaceError> {
+    View view) noexcept -> std::expected<cSelector, CSpaceError> {
     auto reserved = reserve();
     if (!reserved) {
         return std::unexpected(reserved.error());
@@ -235,12 +235,12 @@ auto CSpace::prepare(Reservation&& slot, GrantRef&& grant, View view) noexcept
 }
 
 auto CSpace::insert(Reservation&& slot, GrantRef&& grant, View view) noexcept
-    -> std::expected<Handle, CSpaceError> {
+    -> std::expected<cSelector, CSpaceError> {
     auto cap = prepare(std::move(slot), std::move(grant), view);
     if (!cap) return std::unexpected(cap.error());
-    const Handle handle = cap->handle();
+    const cSelector handle = cap->handle();
     auto done = insert(std::span{&*cap, 1});
-    return done ? std::expected<Handle, CSpaceError>{handle}
+    return done ? std::expected<cSelector, CSpaceError>{handle}
         : std::unexpected(done.error());
 }
 
@@ -318,7 +318,7 @@ auto CSpace::install(std::span<Capability*> caps, std::span<Reservation*> reserv
     return done ? std::expected<void, CSpaceError>{} : std::unexpected(CSpaceError::GrantUnavailable);
 }
 
-auto CSpace::close(Handle handle) noexcept
+auto CSpace::close(cSelector handle) noexcept
     -> std::expected<void, CSpaceError> {
     libk::scope_exit notify{[&]() noexcept { post(); }};
     Capability released{};
@@ -484,16 +484,16 @@ auto CSpace::commit_xfers(CSpace& dst, std::span<Xfer> entries) noexcept
     return {};
 }
 
-auto CSpace::transfer(Handle source, CSpace& dst, XferOp op, XferLimit limit, resource::Reservation reservation) noexcept
-    -> std::expected<Handle, CSpaceError> {
+auto CSpace::transfer(cSelector source, CSpace& dst, XferOp op, XferLimit limit, resource::Reservation reservation) noexcept
+    -> std::expected<cSelector, CSpaceError> {
     auto entry = prepare_xfer(dst, {source, std::move(limit), op}, std::move(reservation));
     if (!entry) return std::unexpected(entry.error());
     const auto handle = entry->slot.handle();
     auto done = commit_xfers(dst, std::span{&*entry, 1});
-    return done ? std::expected<Handle, CSpaceError>{handle} : std::unexpected(done.error());
+    return done ? std::expected<cSelector, CSpaceError>{handle} : std::unexpected(done.error());
 }
 
-auto CSpace::revoke(Handle handle, Source::Context* context, GrantId selected) noexcept -> std::expected<WaitResult, CSpaceError> {
+auto CSpace::revoke(cSelector handle, Source::Context* context, GrantId selected) noexcept -> std::expected<WaitResult, CSpaceError> {
     libk::scope_exit notify{[&]() noexcept { post(); }};
     sync::Lock guard{lock_};
     auto* found = handle ? slot(handle.index()) : nullptr;
@@ -508,7 +508,7 @@ auto CSpace::revoke(Handle handle, Source::Context* context, GrantId selected) n
     return result;
 }
 
-auto CSpace::destroy(Handle source_handle) noexcept
+auto CSpace::destroy(cSelector source_handle) noexcept
     -> std::expected<void, CSpaceError> {
     auto copied = snapshot(source_handle);
     if (!copied) {
@@ -532,7 +532,7 @@ auto CSpace::destroy(Handle source_handle) noexcept
         : std::unexpected(CSpaceError::GrantUnavailable);
 }
 
-auto CSpace::snapshot(Handle handle) noexcept -> std::expected<Snapshot, CSpaceError> {
+auto CSpace::snapshot(cSelector handle) noexcept -> std::expected<Snapshot, CSpaceError> {
     auto* occupied = handle ? slot(handle.index()) : nullptr;
     if (!occupied) return std::unexpected(CSpaceError::InvalidHandle);
     // The successful Grant operation is the use-admission point. Slot removal
@@ -572,7 +572,7 @@ void CSpace::publish(Reservation& r, Capability&& cap) noexcept {
     r.disarm();
 }
 
-void CSpace::rollback(Handle handle) noexcept {
+void CSpace::rollback(cSelector handle) noexcept {
     {
         sync::Lock guard{lock_};
         Slot* const reserved = handle ? slot(handle.index()) : nullptr;
@@ -730,7 +730,7 @@ auto CSpace::slot(usize index) noexcept -> Slot* {
 auto CSpace::slot(usize index) const noexcept -> const Slot* {
     // Published pages stay until the actual Env binding / CSpace use drains.
     auto* root = root_.load(std::memory_order_acquire);
-    if (index > Handle::max_index || !root) return nullptr;
+    if (index > cSelector::max_index || !root) return nullptr;
     const auto leaf_number = index >> leaf_bits;
     auto* mid = static_cast<const DirPage*>(root->children[leaf_number >> dir_bits].load(std::memory_order_acquire));
     auto* leaf = mid ? static_cast<const LeafPage*>(mid->children[leaf_number & (dir_entries - 1)].load(std::memory_order_acquire)) : nullptr;
@@ -738,7 +738,7 @@ auto CSpace::slot(usize index) const noexcept -> const Slot* {
 }
 
 void CSpace::push_free(usize index, Slot& empty) noexcept {
-    libk_assert(index <= Handle::max_index);
+    libk_assert(index <= cSelector::max_index);
     libk_assert(empty.state == SlotState::Empty);
     libk_assert(empty.previous == invalid_index);
     empty.next = free_head_;
@@ -747,7 +747,7 @@ void CSpace::push_free(usize index, Slot& empty) noexcept {
 
 void CSpace::link_occupied(usize index, Slot& occupied) noexcept {
     changed();
-    libk_assert(index <= Handle::max_index);
+    libk_assert(index <= cSelector::max_index);
     libk_assert(occupied.state == SlotState::Occupied);
     libk_assert(occupied.next == invalid_index);
     libk_assert(occupied.previous == invalid_index);
@@ -764,7 +764,7 @@ void CSpace::link_occupied(usize index, Slot& occupied) noexcept {
 
 void CSpace::unlink_occupied(usize index, Slot& occupied) noexcept {
     changed();
-    libk_assert(index <= Handle::max_index);
+    libk_assert(index <= cSelector::max_index);
     libk_assert(occupied.state == SlotState::Occupied);
     if (occupied.previous == invalid_index) {
         libk_assert(occupied_head_ == index);
@@ -868,7 +868,7 @@ void CSpace::detach_execution() noexcept {
 }
 
 auto CSpace::escrow_move(
-    Handle source_handle,
+    cSelector source_handle,
     Capability& cap,
     Reservation& reservation) noexcept
     -> std::expected<void, CSpaceError> {
@@ -904,7 +904,7 @@ auto CSpace::escrow_restore(
     if (!accepting_ || reservation.owner_ != this || !cap.grant) {
         return false;
     }
-    const Handle handle = reservation.handle_;
+    const cSelector handle = reservation.handle_;
     Slot* const target = handle ? slot(handle.index()) : nullptr;
     if (target == nullptr || target->generation != handle.generation()
         || target->state != SlotState::Reserved) {
@@ -926,7 +926,7 @@ auto CSpace::escrow_drop(
     {
         sync::Lock guard{lock_};
         libk_assert(reservation.owner_ == this);
-        const Handle handle = reservation.handle_;
+        const cSelector handle = reservation.handle_;
         Slot* const target = handle ? slot(handle.index()) : nullptr;
         libk_assert(target != nullptr
             && target->generation == handle.generation()
@@ -1085,13 +1085,13 @@ auto Batch::prepare(Batch& batch, CSpace& src, CSpace& dst, const Specs& specs) 
     return {};
 }
 
-auto Batch::handles() const noexcept -> Handles {
-    Handles result;
+auto Batch::handles() const noexcept -> Selectors {
+    Selectors result;
     for (auto& entry : entries_) libk_assert(result.try_push_back(entry.slot.handle()));
     return result;
 }
 
-auto Batch::commit() noexcept -> std::expected<Handles, CSpaceError> {
+auto Batch::commit() noexcept -> std::expected<Selectors, CSpaceError> {
     if (!source_ || !destination_) return std::unexpected(CSpaceError::InvalidState);
     auto result = handles();
     auto done = source_->commit_xfers(*destination_, {entries_.data(), entries_.size()});

@@ -76,15 +76,15 @@ constexpr mm::va_t root_stack_address{root_info_address.raw() - mm::page_size - 
 [[nodiscard]] static auto install_cap(cap::Graph& grants, cap::CSpace& cspace,
                                       resource::Reservation&& usage, object::ref<> object,
                                       cap::Rights rights, cap::Limits limit = {}) noexcept
-    -> std::expected<cap::Handle, BootErr> {
+    -> std::expected<cap::cSelector, BootErr> {
     auto grant =
         grants.create_root(std::move(usage), std::move(object), cap::View{rights, limit});
     if (!grant) {
         return std::unexpected(BootErr::CapabilityFailed);
     }
     auto cap = cspace.insert(std::move(grant).value(), cap::View{rights, limit});
-    return cap ? std::expected<cap::Handle, BootErr>{(cap.value())}
-               : std::expected<cap::Handle, BootErr>{std::unexpected(BootErr::CapabilityFailed)};
+    return cap ? std::expected<cap::cSelector, BootErr>{(cap.value())}
+               : std::expected<cap::cSelector, BootErr>{std::unexpected(BootErr::CapabilityFailed)};
 }
 
 // First user thread only. Failure aborts boot; this is not a process service
@@ -155,12 +155,12 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
     // The group owns retirement, independently of storage references held by
     // maps or capability slots. Private boot pages need the same protocol.
     auto own = [&](auto& pending, cap::View view,
-                   cap::CSpace* space = nullptr) noexcept -> std::expected<cap::Handle, BootErr> {
+                   cap::CSpace* space = nullptr) noexcept -> std::expected<cap::cSelector, BootErr> {
         auto fee = reserve(cap::Graph::node_usage());
         if (!fee) return std::unexpected(fee.error());
         auto root = boot.grants.create_root(std::move(*fee), pending.reference(), view);
         if (!root) return std::unexpected(BootErr::CapabilityFailed);
-        cap::Handle handle;
+        cap::cSelector handle;
         if (space) {
             auto pin = root->acquire();
             if (!pin) return std::unexpected(BootErr::CapabilityFailed);
@@ -317,7 +317,7 @@ auto boot_root(Boot& boot, Cpu& runtime, const BootInfo& handoff,
         info_page.bytes = sizeof(RootInfo);
         info_page.bundle_bytes = module.size;
         info_page.boot_hart = runtime.hw.raw;
-        auto install = [&] [[gnu::noinline]] (auto& object, cap::View view) noexcept -> std::expected<cap::Handle, BootErr> {
+        auto install = [&] [[gnu::noinline]] (auto& object, cap::View view) noexcept -> std::expected<cap::cSelector, BootErr> {
             if constexpr (requires { object.publish(); }) {
                 return own(object, view, &space);
             } else {

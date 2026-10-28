@@ -257,7 +257,7 @@ public:
     }
     [[nodiscard]] auto pin() const noexcept -> const GrantPin& { return pin_; }
     auto token() const noexcept -> u64 { return token_; }
-    auto selector() const noexcept -> Handle { return selector_; }
+    auto selector() const noexcept -> cSelector { return selector_; }
     void reset() noexcept { pin_.reset(); }
     [[nodiscard]] auto source() const noexcept -> CSpace& { return *source_; }
 
@@ -266,13 +266,13 @@ private:
     Resolved(
         CSpace& source,
         GrantPin&& pin,
-        View view, Handle selector, u64 token) noexcept
+        View view, cSelector selector, u64 token) noexcept
         : source_(&source), selector_(selector), token_(token),
           pin_(std::move(pin)),
           view_(view) {}
 
     CSpace* source_{};
-    Handle selector_;
+    cSelector selector_;
     u64 token_{};
     GrantPin pin_;
     View view_{};

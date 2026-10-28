@@ -592,7 +592,7 @@ auto Channel::mint(
     cap::CSpace& destination,
     u64 badge,
     cap::Rights rights) noexcept
-    -> std::expected<cap::Handle, ChannelError> {
+    -> std::expected<cap::cSelector, ChannelError> {
     const auto side_value = side_for(cap, cap::Right::Delegate);
     if (!side_value || badge == 0) {
         return std::unexpected(ChannelError::Denied);
@@ -848,7 +848,7 @@ auto Channel::make_escrow(
     if (!kind || !rights || spec.flags != 0) {
         return std::unexpected(ChannelError::Invalid);
     }
-    const cap::Handle source_handle = cap::Handle::from_raw(spec.source);
+    const cap::cSelector source_handle = cap::cSelector::from_raw(spec.source);
     auto copied = source.snapshot(source_handle);
     if (!copied) {
         return std::unexpected(cap_error(copied.error()));

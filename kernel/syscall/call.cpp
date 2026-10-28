@@ -66,7 +66,7 @@ auto cap_status(cap::CSpaceError error) noexcept -> status_t {
 
 auto read_desc_bytes(
     Call& inv,
-    cap::Handle handle,
+    cap::cSelector handle,
     usize offset,
     std::span<byte> dest) noexcept
     -> std::expected<void, status_t> {
@@ -119,8 +119,8 @@ auto read_desc_bytes(
 
 
 
-auto handle_of(usize raw) noexcept -> cap::Handle {
-    return cap::Handle::from_raw(static_cast<u64>(raw));
+auto handle_of(usize raw) noexcept -> cap::cSelector {
+    return cap::cSelector::from_raw(static_cast<u64>(raw));
 }
 
 auto rights_of(usize raw) noexcept -> std::optional<cap::Rights> {
@@ -149,7 +149,7 @@ auto range_of(usize base, usize size) noexcept
 
 [[nodiscard]] auto dest(
     cap::CSpace& current,
-    cap::Handle handle) noexcept
+    cap::cSelector handle) noexcept
     -> std::expected<cap::Resolved<cap::CSpace>, cap::CSpaceError> {
     return current.resolve<cap::CSpace>(
         handle, cap::Rights::of(cap::Right::Manage));
@@ -158,7 +158,7 @@ auto range_of(usize base, usize size) noexcept
 template<typename Operation>
 [[nodiscard]] auto with_dest(
     cap::CSpace& current,
-    cap::Handle target,
+    cap::cSelector target,
     Operation&& op) noexcept -> Result {
     if (!target) {
         auto outcome = op(current);
@@ -204,7 +204,7 @@ auto cap_call(Call& inv) noexcept -> Result {
     Thread* const thread = inv.target;
 
     if constexpr (op == SYS_CAP_CLOSE) {
-        const cap::Handle source = handle_of(trap.arg(0));
+        const cap::cSelector source = handle_of(trap.arg(0));
         const usize destination_raw = trap.arg(1);
         if (!source) {
             return returned(STATUS_INVALID_CAP);
@@ -215,7 +215,7 @@ auto cap_call(Call& inv) noexcept -> Result {
                 closed ? STATUS_OK : cap_status(closed.error()));
         }
 
-        const cap::Handle target = handle_of(destination_raw);
+        const cap::cSelector target = handle_of(destination_raw);
         if (!target) {
             return returned(STATUS_INVALID_CAP);
         }
@@ -228,9 +228,9 @@ auto cap_call(Call& inv) noexcept -> Result {
             closed ? STATUS_OK : cap_status(closed.error()));
     }
     if constexpr (op == SYS_CAP_TYPED_DELEGATE) {
-        const cap::Handle source = handle_of(trap.arg(0));
-        const cap::Handle target = handle_of(trap.arg(1));
-        const cap::Handle descriptor = handle_of(trap.arg(2));
+        const cap::cSelector source = handle_of(trap.arg(0));
+        const cap::cSelector target = handle_of(trap.arg(1));
+        const cap::cSelector descriptor = handle_of(trap.arg(2));
         if (!source || !descriptor) {
             return returned(STATUS_BAD_ARGS);
         }
@@ -267,8 +267,8 @@ auto cap_call(Call& inv) noexcept -> Result {
     }
     if constexpr (op == SYS_CAP_DUPLICATE
         || op == SYS_CAP_DELEGATE) {
-        const cap::Handle source = handle_of(trap.arg(0));
-        const cap::Handle target = handle_of(trap.arg(1));
+        const cap::cSelector source = handle_of(trap.arg(0));
+        const cap::cSelector target = handle_of(trap.arg(1));
         const auto rights = rights_of(trap.arg(2));
         if (!source || !rights) {
             return returned(STATUS_BAD_ARGS);
@@ -284,8 +284,8 @@ auto cap_call(Call& inv) noexcept -> Result {
         });
     }
     if constexpr (op == SYS_CAP_MOVE) {
-        const cap::Handle source = handle_of(trap.arg(0));
-        const cap::Handle target = handle_of(trap.arg(1));
+        const cap::cSelector source = handle_of(trap.arg(0));
+        const cap::cSelector target = handle_of(trap.arg(1));
         if (!source) {
             return returned(STATUS_BAD_ARGS);
         }
@@ -1085,7 +1085,7 @@ template<usize op>
 auto vm_call(Call& inv) noexcept -> Result {
     arch::TrapCtx& trap = inv.trap;
     cap::CSpace& cspace = inv.cspace;
-    const cap::Handle vspace_handle = handle_of(trap.arg(0));
+    const cap::cSelector vspace_handle = handle_of(trap.arg(0));
     const auto required = op == SYS_VM_SLICE ? cap::Right::Delegate : cap::Right::Reserve;
     if (!vspace_handle) {
         return returned(STATUS_BAD_ARGS);
@@ -1107,7 +1107,7 @@ auto vm_call(Call& inv) noexcept -> Result {
         if (!ipc || trap.arg(2) || trap.arg(3) || trap.arg(4) || trap.arg(5)
             || !ipc->read(trap.arg(1), std::span{reinterpret_cast<byte*>(&request), sizeof(request)}))
             return returned(STATUS_BAD_ARGS);
-        cap::Handle handle{};
+        cap::cSelector handle{};
         auto publish = [&](cap::VmLimit limit) noexcept -> status_t {
             const auto rights = effective.rights.intersect(cap::Rights::of(cap::Right::Reserve,
                 cap::Right::Map, cap::Right::Unmap, cap::Right::Protect,
@@ -1164,7 +1164,7 @@ template<usize op>
     if (!ctx) {
         return returned(cap_status(ctx.error()));
     }
-    const cap::Handle target = handle_of(inv.trap.arg(1));
+    const cap::cSelector target = handle_of(inv.trap.arg(1));
     auto thread = inv.cspace.resolve<Thread>(
         target,
         cap::Rights::of(cap::Right::Control));

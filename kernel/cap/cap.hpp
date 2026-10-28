@@ -15,7 +15,8 @@
 
 namespace cap {
 
-class Handle final {
+// Non-owning, CSpace-relative slot index and generation.
+class cSelector final {
 public:
     static constexpr usize index_bits = 24;
     static constexpr usize generation_bits = 64 - index_bits;
@@ -23,7 +24,7 @@ public:
     static constexpr u64 max_generation =
         (u64{1} << generation_bits) - 1;
 
-    constexpr Handle() noexcept = default;
+    constexpr cSelector() noexcept = default;
 
     [[nodiscard]] constexpr explicit operator bool() const noexcept {
         return value_ != 0;
@@ -39,35 +40,35 @@ public:
     }
 
     [[nodiscard]] static constexpr auto from_raw(u64 value) noexcept
-        -> Handle {
-        const Handle handle{value};
+        -> cSelector {
+        const cSelector handle{value};
         return handle.generation() != 0 && handle.index() <= max_index
             ? handle
-            : Handle{};
+            : cSelector{};
     }
 
     [[nodiscard]] friend constexpr auto operator==(
-        Handle, Handle) noexcept -> bool = default;
+        cSelector, cSelector) noexcept -> bool = default;
 
 private:
     friend class CSpace;
 
     [[nodiscard]] static constexpr auto make(
         usize index,
-        u64 generation) noexcept -> Handle {
+        u64 generation) noexcept -> cSelector {
         return index <= max_index
                 && generation != 0
                 && generation <= max_generation
-            ? Handle{(generation << index_bits) | index}
-            : Handle{};
+            ? cSelector{(generation << index_bits) | index}
+            : cSelector{};
     }
 
-    explicit constexpr Handle(u64 value) noexcept : value_(value) {}
+    explicit constexpr cSelector(u64 value) noexcept : value_(value) {}
     u64 value_{};
 };
 
-static_assert(sizeof(Handle) == sizeof(u64));
-static_assert(!Handle{});
+static_assert(sizeof(cSelector) == sizeof(u64));
+static_assert(!cSelector{});
 
 enum class Right : u64 {
     Duplicate = RIGHT_DUPLICATE,
