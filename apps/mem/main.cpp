@@ -23,7 +23,7 @@ struct mem_session {
     bool batch{}, closing{};
     uint64_t last_object{}, last_page{UINT64_MAX};
 };
-enum class mem_mode { Off, On, Paused, Draining, Failed };
+enum class mem_mode { Off, On, Paused, Draining, Closing, Failed };
 struct mem_volume {
     std::string name;
     ubus_conn peer;
@@ -60,7 +60,7 @@ struct mem_job {
     mem_phase phase{mem_phase::Free};
 };
 struct mem_header { uint64_t magic{0x31504157534f594dULL}; uint32_t version{1}, page{page_size}; uint64_t bytes{}, identity{}; };
-enum class mem_step { None, Lookup, Bind, Device, Open, Adopt, Stat, Prepare, Header, HeaderIo, Register, Drain, Close };
+enum class mem_step { None, Lookup, Bind, Device, Open, Adopt, Stat, Prepare, Header, HeaderIo, Register, Drain };
 struct mem_control {
     uint64_t id{}, due{}; status_t status{STATUS_OK}; bool format{}, enable{}; size_t volume{};
     mem_step step{};
@@ -100,7 +100,7 @@ static auto cap(size_t id) -> cap_t { return session(id).pager.selector(); }
 static auto mode(mem_mode state) -> std::string_view {
     switch (state) {
     case mem_mode::Off: return "Off"; case mem_mode::On: return "On"; case mem_mode::Paused: return "Paused";
-    case mem_mode::Draining: return "Draining"; case mem_mode::Failed: return "Failed";
+    case mem_mode::Draining: return "Draining"; case mem_mode::Closing: return "Closing"; case mem_mode::Failed: return "Failed";
     }
     return "Failed";
 }
@@ -204,7 +204,6 @@ static auto command(mem_volume& v, std::string_view method = {}, size_t index = 
                 else v.registrations[v.buffer] = id;
             } else if (status == STATUS_OK && v.method == "Unregister") {
                 v.registrations[v.buffer] = 0;
-                if (control.status == STATUS_PENDING && v.mode == mem_mode::Draining) control.due = deadline(10000);
             }
             v.reply = status;
         }
@@ -226,6 +225,7 @@ static auto command(mem_volume& v, std::string_view method = {}, size_t index = 
     // provider closure; a local timeout cannot prove that DMA has exited.
     const auto status = v.peer.begin(method, std::move(q), true);
     if (status != STATUS_OK) return status;
+    if (method == "Close") v.mode = mem_mode::Closing;
     v.method = method; v.buffer = index; v.reply = STATUS_PENDING; return STATUS_PENDING;
 }
 static auto detach(mem_volume& v, size_t index) -> status_t {
@@ -270,16 +270,20 @@ static void finish_job(mem_job& j) {
     j.phase = mem_phase::Free; j.registration = j.request = 0; j.key = {}; j.slot = 0; j.format = j.flushed = j.migrating = j.inplace = j.background = j.restore = false;
 }
 static void fail_job(mem_job& j, status_t error, bool media = true) {
-    ++failures; auto& v = *volumes[j.volume]; v.error = error; if (media) v.mode = mem_mode::Failed;
+    ++failures; auto& v = *volumes[j.volume]; v.error = error; if (media || !j.slot) v.mode = mem_mode::Failed;
     if (j.request) (void)_pager_fail(cap(j.key.session), j.request, j.background && !media ? PAGER_FAIL_RETRY : 0);
     if (j.slot && !j.read && !j.inplace) v.release(j.slot);
     if (j.inplace && media) { const auto old = backing.find(j.key); if (old != backing.end()) erase(old); }
     if (j.migrating) volumes[j.destination]->release(j.destination_slot);
-    if (control.status == STATUS_PENDING && (control.volume == j.volume || (!control.enable && !control.format))) control.status = error;
+    if (control.status == STATUS_PENDING) {
+        const auto name = control.options["volume"].as<std::string_view>();
+        if (!name || v.name == *name) control.status = error;
+    }
     finish_job(j);
 }
 static void complete_io(size_t index, status_t status) {
     auto& j = jobs[index]; auto& v = *volumes[j.volume];
+    if (status == STATUS_PENDING) status = STATUS_PEER_FAULT;
     if (status != STATUS_OK) {
         v.error = status; v.mode = mem_mode::Failed;
     }
@@ -295,7 +299,7 @@ static void complete_io(size_t index, status_t status) {
     if (!j.slot) {
         if (j.format) {
             if (!j.flushed) { j.phase = mem_phase::Flush; return; }
-            control.step = mem_step::Close; control.index = 0;
+            v.mode = mem_mode::Draining; control.step = mem_step::Drain;
             finish_job(j); return;
         }
         mem_header header{};
@@ -366,8 +370,8 @@ static void pump_io() {
                 const bool restore = j.restore; finish_job(j);
                 if (!restore) prefetch_due = deadline(100);
                 if (restore && control.status == STATUS_PENDING && control.step == mem_step::Drain) {
-                    control.status = STATUS_NO_MEMORY;
-                    for (auto& v : volumes) if (v->mode == mem_mode::Draining) v->mode = mem_mode::Paused;
+                    const auto name = control.options["volume"].as<std::string_view>();
+                    if (!name || volumes[j.volume]->name == *name) control.status = STATUS_NO_MEMORY;
                 }
             } else if (status == STATUS_OK || status == STATUS_RETRY || status == STATUS_CLOSED) {
                 if (status != STATUS_OK && _pager_records(cap(j.key.session), j.key.object).status == STATUS_NOT_FOUND) {
@@ -387,8 +391,11 @@ static void pump_io() {
             }
         } else if (j.phase == mem_phase::Submit || j.phase == mem_phase::Header || j.phase == mem_phase::Flush) {
             const auto status = submit(index);
+            // An accepted header registration still owns its real completion.
+            // Demand jobs may time out; their volume retains any late lease.
+            if (status == STATUS_PENDING && !j.slot) continue;
             if (status != STATUS_OK && status != STATUS_PENDING && status != STATUS_BUSY && status != STATUS_NO_MEMORY && status != STATUS_RETRY) fail_job(j, status);
-            else if (status != STATUS_OK && now() - j.started > _startup().frequency * 5) fail_job(j, status, false);
+            else if (status != STATUS_OK && now() - j.started > _startup().frequency * 5) fail_job(j, STATUS_TIMED_OUT, false);
         }
     }
 }
@@ -599,35 +606,47 @@ static auto active() -> bool {
     return std::ranges::any_of(jobs, [](const auto& j) { return j.phase != mem_phase::Free; });
 }
 static void drain() {
-    if (control.status != STATUS_PENDING || control.step != mem_step::Drain) return;
-    bool remaining{};
+    const bool running = control.status == STATUS_PENDING && control.step == mem_step::Drain;
+    const auto name = running ? control.options["volume"].as<std::string_view>() : std::nullopt;
+    bool remaining{}, stalled{};
     for (size_t vi = 0; vi < volumes.size(); ++vi) {
-        auto& v = *volumes[vi]; if (v.mode != mem_mode::Draining) continue;
-        const bool external = v.desired_limit ? std::ranges::any_of(backing, [&](const auto& row) { return row.second.volume == vi && row.second.slot > v.desired_limit; }) : v.used != 0;
-        if (external || std::ranges::any_of(jobs, [=](const auto& j) { return j.phase != mem_phase::Free && (j.volume == vi || (j.migrating && j.destination == vi)); })) { remaining = true; continue; }
-        if (v.desired_limit) {
-            v.limit = std::exchange(v.desired_limit, 0); v.free.resize((v.limit + 64) / 64);
-            const auto end = (v.limit + 1) % 64; if (end) v.free.back() &= (uint64_t{1} << end) - 1;
-            v.cursor = 0; v.mode = mem_mode::On; continue;
+        auto& v = *volumes[vi];
+        const bool selected = running && (!name || v.name == *name);
+        // Closing is irreversible and survives the control operation's exit.
+        if (v.mode != mem_mode::Closing) {
+            if (v.mode != mem_mode::Draining) continue;
+            if (!selected) { v.mode = mem_mode::Paused; continue; }
+            const bool external = v.desired_limit ? std::ranges::any_of(backing, [&](const auto& row) { return row.second.volume == vi && row.second.slot > v.desired_limit; }) : v.used != 0;
+            if (external || std::ranges::any_of(jobs, [=](const auto& j) { return j.phase != mem_phase::Free && (j.volume == vi || (j.migrating && j.destination == vi)); })) { remaining = stalled = true; continue; }
+            if (v.desired_limit) {
+                v.limit = std::exchange(v.desired_limit, 0); v.free.resize((v.limit + 64) / 64);
+                const auto end = (v.limit + 1) % 64; if (end) v.free.back() &= (uint64_t{1} << end) - 1;
+                v.cursor = 0; v.mode = mem_mode::On; continue;
+            }
+            for (size_t i = 0; i < io_jobs; ++i) if (v.registrations[i]) {
+                const auto status = detach(v, i);
+                if (status == STATUS_PENDING || status == STATUS_BUSY || status == STATUS_RETRY) { remaining = true; break; }
+                if (status != STATUS_OK) { v.error = status; control.status = status; v.mode = mem_mode::Paused; return; }
+            }
+            if (std::ranges::any_of(v.registrations, [](auto r) { return r != 0; })) continue;
         }
-        for (size_t i = 0; i < io_jobs; ++i) if (v.registrations[i]) {
-            const auto status = detach(v, i);
-            if (status == STATUS_PENDING || status == STATUS_BUSY || status == STATUS_RETRY) { remaining = true; break; }
-            if (status != STATUS_OK) { v.error = status; control.status = status; v.mode = mem_mode::Paused; return; }
-        }
-        if (std::ranges::any_of(v.registrations, [](auto r) { return r != 0; })) continue;
         const auto status = command(v, "Close");
-        if (status == STATUS_PENDING || status == STATUS_BUSY || status == STATUS_RETRY) { remaining = true; continue; }
-        if (status != STATUS_OK && status != STATUS_CLOSED && status != STATUS_PEER_CLOSED) { control.status = status; v.mode = mem_mode::Paused; return; }
+        if (status == STATUS_PENDING || status == STATUS_BUSY || status == STATUS_RETRY) { remaining |= selected; continue; }
+        if (status != STATUS_OK && status != STATUS_CLOSED && status != STATUS_PEER_CLOSED) {
+            v.error = status; v.mode = mem_mode::Failed;
+            if (selected) { control.status = status; return; }
+            continue;
+        }
         (void)v.peer.close(); v.mode = mem_mode::Off;
     }
+    if (!running || control.status != STATUS_PENDING) return;
     if (!remaining) {
         control.status = STATUS_OK;
         if (backing.empty() && std::ranges::all_of(volumes, [](const auto& v) { return v->mode == mem_mode::Off; })) {
             nodes.clear(); nodes.shrink_to_fit();
             for (auto& v : volumes) { v->free.clear(); v->free.shrink_to_fit(); v->calls = {}; }
         }
-    } else if (now() >= control.due) {
+    } else if (stalled && now() >= control.due) {
         control.status = STATUS_NO_MEMORY;
         for (auto& v : volumes) if (v->mode == mem_mode::Draining) v->mode = mem_mode::Paused;
     }
@@ -641,7 +660,7 @@ static auto status(ubus_request&, ubus_msg& r) -> status_t {
     for (const auto& job : jobs) if (job.phase != mem_phase::Free) { if (job.read) ++reading; else ++writing; }
     ubus_data list{ubus_type::Array}, clients{ubus_type::Array};
     for (const auto& v : volumes) { ubus_data row; row.put("name", v->name).put("state", mode(v->mode)).put("bytes", v->limit * page_size)
-        .put("desired-bytes", v->desired_limit ? v->desired_limit * page_size : v->mode == mem_mode::Draining || v->mode == mem_mode::Off ? 0 : v->limit * page_size)
+        .put("desired-bytes", v->desired_limit ? v->desired_limit * page_size : v->mode == mem_mode::Draining || v->mode == mem_mode::Closing || v->mode == mem_mode::Off ? 0 : v->limit * page_size)
         .put("used", v->used * page_size).put("priority", v->priority).put("error", int64_t{v->error}); list.push(row); }
     for (const auto& [si, entry] : sessions) {
         PagerInfo info{}; if (_pager_configure(cap(si)).status == STATUS_OK) info = *reinterpret_cast<const PagerInfo*>(_ipc());
@@ -777,20 +796,10 @@ static void pump_control() {
                 v.mode = mem_mode::On; control.status = STATUS_OK; control.step = mem_step::None;
             }
             break;
-        case mem_step::Close:
-            if (control.index < io_jobs) {
-                status = command(v, "Unregister", control.index);
-                if (status == STATUS_OK) ++control.index;
-            } else {
-                status = command(v, "Close");
-                if (status == STATUS_CLOSED || status == STATUS_PEER_CLOSED) status = STATUS_OK;
-                if (status == STATUS_OK) { (void)v.peer.close(); v.mode = mem_mode::Off; control.status = STATUS_OK; control.step = mem_step::None; }
-            }
-            break;
         default: return;
         }
         if (status == STATUS_WOULD_BLOCK || status == STATUS_PENDING) return;
-        if ((status == STATUS_BUSY || status == STATUS_RETRY) && (control.step == mem_step::Register || control.step == mem_step::Close)) return;
+        if ((status == STATUS_BUSY || status == STATUS_RETRY) && control.step == mem_step::Register) return;
         if (status != STATUS_OK) {
             v.error = status; v.desired_limit = 0;
             if (control.format || control.enable) v.mode = mem_mode::Failed;
@@ -860,7 +869,8 @@ int main() {
         for (auto& v : volumes) if ((!name || v->name == *name) && (v->mode == mem_mode::On || v->mode == mem_mode::Paused || v->mode == mem_mode::Failed)) {
             v->desired_limit = 0; v->mode = mem_mode::Draining;
         }
-        control = {++next_operation, deadline(10000), STATUS_PENDING, false, false, 0, mem_step::Drain}; r.data.put("operation", control.id); return STATUS_OK;
+        control = {++next_operation, deadline(10000), STATUS_PENDING, false, false, 0, mem_step::Drain};
+        control.options = std::move(q.data); r.data.put("operation", control.id); return STATUS_OK;
     });
     if (result == STATUS_OK) result = admin.add("Query", {{"operation", ubus_type::U64}}, {{"result", ubus_type::I64}}, [](auto& q, auto& r) {
         if (*q.data["operation"].template as<uint64_t>() != control.id) return STATUS_NOT_FOUND;
@@ -869,7 +879,9 @@ int main() {
     if (result == STATUS_OK) result = admin.add("Cancel", {{"operation", ubus_type::U64}}, {}, [](auto& q, auto&) {
         if (*q.data["operation"].template as<uint64_t>() != control.id) return STATUS_NOT_FOUND;
         if (control.status != STATUS_PENDING) return STATUS_TOO_LATE;
-        if (control.step != mem_step::Drain) return STATUS_BUSY;
+        if (control.step != mem_step::Drain || control.format || control.enable) return STATUS_BUSY;
+        const auto name = control.options["volume"].as<std::string_view>();
+        if (std::ranges::any_of(volumes, [&](const auto& v) { return (!name || v->name == *name) && v->mode == mem_mode::Closing; })) return STATUS_TOO_LATE;
         for (auto& v : volumes) if (v->mode == mem_mode::Draining) v->mode = mem_mode::Paused;
         control.status = STATUS_CANCELED; return STATUS_OK;
     });
@@ -968,7 +980,7 @@ int main() {
         });
         drain();
         pressure.ack(); const auto observation = _source_info(physical.selector()); if (observation.status == STATUS_OK) (void)pressure.arm(observation.value2);
-        const auto wake = _ev_wait(&_events(), active() || control.status == STATUS_PENDING || std::ranges::any_of(volumes, [](const auto& v) { return !v->method.empty() && v->reply == STATUS_PENDING; }) || draining || shortage || sweep_needed || (enabled && slots_needed) || (serving && startup_volume != startup_volumes.values().end()) ? deadline(1) : enabled && (ram.pressure || targeted) ? deadline(5) : 0).status;
+        const auto wake = _ev_wait(&_events(), active() || control.status == STATUS_PENDING || std::ranges::any_of(volumes, [](const auto& v) { return v->mode == mem_mode::Closing || (!v->method.empty() && v->reply == STATUS_PENDING); }) || draining || shortage || sweep_needed || (enabled && slots_needed) || (serving && startup_volume != startup_volumes.values().end()) ? deadline(1) : enabled && (ram.pressure || targeted) ? deadline(5) : 0).status;
         if (wake != STATUS_OK && wake != STATUS_TIMED_OUT) return wake;
     }
 }

@@ -16,6 +16,8 @@ For a 16 MiB volume named pci-10:
 pause stops new allocations on that volume; existing pages can still be read.
 off drains its backing into RAM or another enabled volume. If resources are
 insufficient it returns an error and retains the backing in Paused state.
+Closing means the device connection is being retired; cancellation and re-enable
+cannot undo this phase. Wait for Off, then enable the volume again.
 Omit the volume to pause/off all volumes. Enable can also change an active
 volume's limit: growth prepays metadata, shrink drains the excluded slots.
 --offset and --bytes select an exclusive interval; --limit selects data capacity
