@@ -11,6 +11,7 @@ CALL(THREAD_INFO, 7, info_call, Call) /* a0=Thread(Inspect), 0=current; a1=IPC o
 CALL(QUOTA_RESIZE, 77, quota_resize, Call) /* a0=Quota(Control), a1=memory, a2=caps, a3=actual source(Split), optional for shrink */
 CALL(QUOTA_INFO, 10, info_call, Call) /* a0=Quota(Inspect), a1=IPC offset */
 CALL(VSPACE_INFO, 11, info_call, Call) /* a0=VSpace(Inspect), a1=IPC offset; whole-space authority */
+CALL(VSPACE_RUNTIME, 165, info_call, Call) /* a0=whole VSpace(Inspect), a1=IPC offset; VSpaceRuntime */
 CALL(EXECUTION_STOP, 15, execution_stop, Call) /* a0=Thread(Control); irreversible intent, Exit remains observable */
 CALL(VSPACE_RECORDS, 13, vm_records, Call) /* a0=VSpace(Inspect), a1=IPC offset, a2=address cursor; bounded records within VmLimit */
 CALL(CSPACE_INFO, 12, cspace_info, Call) /* a0=CSpace(Inspect), a1=IPC offset, a2=cursor, a3=structural epoch (0=first page) */

@@ -215,7 +215,7 @@ class Thread final : private libk::noncopyable_nonmovable {
     bool enabled_{}, applied_enabled_{};
     Src<THREAD_ENABLED | THREAD_APPLIED | THREAD_MIGRATING | THREAD_BOUND | THREAD_STOPPING | THREAD_STOPPED> events_{Source::Drained::bind<&Thread::sources_drained>(*this)};
     u64 requested_{}, applied_{};
-    u64 runtime_{}, recorded_at_{};
+    u64 recorded_at_{};
     CpuId cpu_{};
     u64 association_{};
     mutable sync::Spin lock_{};

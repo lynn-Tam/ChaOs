@@ -251,14 +251,9 @@ int main(int argc, char** argv) {
     }
     hidden = {}; hidden.data.put("rights", uint64_t{9});
     check(readonly.invoke("Delegate", std::move(hidden), denied) == STATUS_DENIED);
-    // Scope churn can invalidate a sample; a published sample pairs each
-    // execution Thread ID with its runtime, including runtime-owned threads.
-    const auto cpu = shell["cpu"].vector<uint64_t>();
-    check(bool(cpu) == shell["sampled"].as<uint64_t>().has_value());
-    if (cpu) {
-        check(cpu->size() % 2 == 0);
-        for (size_t i = 0; i < cpu->size(); i += 2) check((*cpu)[i] != 0);
-    }
+    check(shell["cpu_status"].as<int64_t>() == STATUS_OK);
+    check(shell["cpu_time"].as<uint64_t>().has_value());
+    check(shell["sampled"].as<uint64_t>().has_value());
 
     check(shell["runtime"].as<uint64_t>().has_value());
     check(shell["committed"].as<uint64_t>().value_or(0) > 0);

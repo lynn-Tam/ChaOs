@@ -18,6 +18,7 @@
 #include <panic.hpp>
 #include <sync.hpp>
 #include <task/thread.hpp>
+#include <time.hpp>
 #include <utility>
 
 namespace mm {
@@ -338,7 +339,7 @@ VSpace::~VSpace() noexcept {
     libk_assert(invalidations_.empty());
     libk_assert(!active_ && !control_ && !operation_ && !cleanup_);
 
-    libk_assert(bindings_ == 0);
+    libk_assert(bindings_.load(std::memory_order_acquire) == 0);
     libk_assert(!table_charge_);
 }
 
@@ -365,67 +366,76 @@ auto VSpace::state() const noexcept -> VSpaceState {
 }
 
 auto VSpace::binding_count() const noexcept -> usize {
-    sync::Lock guard{lock_};
-    return bindings_;
+    return bindings_.load(std::memory_order_acquire);
 }
 
 auto VSpace::attach_execution() noexcept -> bool {
-    sync::Lock guard{lock_};
-    if (state_ != VSpaceState::Live || (exec_flags_ & (EXEC_STOPPING | EXEC_STOPPED)) || bindings_ == std::numeric_limits<usize>::max()) {
-        return false;
-    }
-    ++bindings_;
+    sync::Lock guard{exec_lock_};
+    const auto count = bindings_.load(std::memory_order_relaxed);
+    // Retirement closes execution admission before touching the VM state.
+    if ((exec_flags_ & (EXEC_STOPPING | EXEC_STOPPED)) || count == std::numeric_limits<usize>::max()) return false;
+    bindings_.store(count + 1, std::memory_order_relaxed);
     return true;
 }
 
 void VSpace::detach_execution() noexcept {
     Source::Publication publication;
-    bool ready;
+    usize count;
     {
-        sync::Lock guard{lock_};
-        libk_assert(bindings_);
-        --bindings_;
-        if (!bindings_ && (exec_flags_ & EXEC_STOPPING)) {
+        sync::Lock guard{exec_lock_};
+        count = bindings_.load(std::memory_order_relaxed);
+        libk_assert(count);
+        if (!--count && (exec_flags_ & EXEC_STOPPING)) {
             libk_assert(execs_.empty());
             exec_flags_ = (exec_flags_ & EXEC_FAILED) | EXEC_STOPPED;
             publication = exec_events_.prepare(exec_flags_, true);
         }
-        ready = state_ == VSpaceState::Stopping && !bindings_;
+        bindings_.store(count, std::memory_order_release);
     }
-    if (ready) work_->post(job_);
+    if (!count && state() == VSpaceState::Stopping) work_->post(job_);
 }
 
 auto VSpace::bind_exec(Exec& exec, object::Key owner, Source::Action stop) noexcept -> bool {
-    sync::Lock guard{lock_};
-    if (state_ != VSpaceState::Live || (exec_flags_ & (EXEC_STOPPING | EXEC_STOPPED))) return false;
-    libk_assert(bindings_ && !exec.hook.is_linked() && owner.valid() && stop);
+    sync::Lock guard{exec_lock_};
+    if (exec_flags_ & (EXEC_STOPPING | EXEC_STOPPED)) return false;
+    libk_assert(bindings_.load(std::memory_order_relaxed) && !exec.hook.is_linked() && owner.valid() && stop);
+    libk_assert(!exec.runtime.load(std::memory_order_relaxed));
     exec.owner = owner; exec.stop = stop;
     execs_.push_back(exec);
     return true;
 }
 void VSpace::unbind_exec(Exec& exec) noexcept {
-    sync::Lock guard{lock_};
+    sync::Lock guard{exec_lock_};
     libk_assert(exec.hook.is_linked());
+    // The execution is no longer schedulable. Transfer its final count exactly
+    // once, under the same lock used by readers and list removal.
+    retired_runtime_ += exec.runtime.load(std::memory_order_relaxed);
     execs_.erase(exec);
 }
 auto VSpace::fail_exec(u64 thread, ThreadExit result) noexcept -> Source::Publication {
     if (result.origin == EXIT_STOP || result.status == STATUS_OK) return {};
-    sync::Lock guard{lock_};
+    sync::Lock guard{exec_lock_};
     if (failed_thread_) return {};
     failed_thread_ = thread; failure_ = result; exec_flags_ |= EXEC_FAILED;
     return exec_events_.prepare(exec_flags_, true);
 }
 auto VSpace::exec_info() const noexcept -> ExecInfo {
-    sync::Lock guard{lock_};
+    sync::Lock guard{exec_lock_};
     return {.version=1, .size=sizeof(ExecInfo), .flags=exec_flags_,
         .sequence=exec_events_.snapshot().sequence, .thread=failed_thread_, .failure=failure_};
+}
+auto VSpace::runtime(const time::Clock& clock) const noexcept -> VSpaceRuntime {
+    sync::Lock guard{exec_lock_};
+    u64 total = retired_runtime_;
+    for (const auto& exec : execs_) total += exec.runtime.load(std::memory_order_relaxed);
+    return {.version=1, .size=sizeof(VSpaceRuntime), .runtime=total, .sampled=clock.rd_ticks()};
 }
 void VSpace::stop_exec() noexcept {
     Source::Publication publication;
     {
-        sync::Lock guard{lock_};
+        sync::Lock guard{exec_lock_};
         if (exec_flags_ & (EXEC_STOPPING | EXEC_STOPPED)) return;
-        exec_flags_ |= bindings_ ? EXEC_STOPPING : EXEC_STOPPED;
+        exec_flags_ |= bindings_.load(std::memory_order_relaxed) ? EXEC_STOPPING : EXEC_STOPPED;
         publication = exec_events_.prepare(exec_flags_, true);
     }
     work_->post(job_);
@@ -435,7 +445,7 @@ void VSpace::advance_exec() noexcept {
         object::ref<> ticket;
         Source::Action stop;
         {
-            sync::Lock guard{lock_};
+            sync::Lock guard{exec_lock_};
             if (!(exec_flags_ & EXEC_STOPPING)) return;
             // Rotate each claimed entry once; concurrent unlink never leaves a cursor.
             auto it = execs_.begin();
@@ -722,7 +732,7 @@ void VSpace::retire(object::cleanup&& cleanup) noexcept {
         state_ = VSpaceState::Stopping;
         libk_assert(!cleanup_);
         [[maybe_unused]] auto& retained = cleanup_.emplace(std::move(cleanup));
-        if (!root_ && bindings_ == 0) {
+        if (!root_ && bindings_.load(std::memory_order_acquire) == 0) {
             libk_assert(layout_.empty() && !active_ && !editing_);
             work_->close(job_);
             state_ = VSpaceState::Quiescent;
@@ -730,7 +740,7 @@ void VSpace::retire(object::cleanup&& cleanup) noexcept {
             complete_cleanup();
             return;
         }
-        can_start = bindings_ == 0 && !active_ && !editing_ && tlb_.active_cpus().empty();
+        can_start = bindings_.load(std::memory_order_acquire) == 0 && !active_ && !editing_ && tlb_.active_cpus().empty();
     }
     if (can_start) {
         static_cast<void>(clear(VmCtx{.local = CpuId{0}}, VRange{va_t{UserBegin}, UserEnd - UserBegin}));
@@ -1991,7 +2001,7 @@ auto VSpace::step(VmCtx ctx) noexcept -> bool {
             waiting = true;
         } else if (!invalidations_.empty()) {
             next = &invalidations_.front();
-        } else if (state_ == VSpaceState::Stopping && bindings_ == 0 && !layout_.empty() && tlb_.active_cpus().empty()) {
+        } else if (state_ == VSpaceState::Stopping && bindings_.load(std::memory_order_acquire) == 0 && !layout_.empty() && tlb_.active_cpus().empty()) {
             retire_root = true;
         } else {
             try_finish_retire();
@@ -2032,11 +2042,11 @@ auto VSpace::work_ready() const noexcept -> bool {
         return active_->flushed_ ? active_->ready() : active_->flush_.complete();
     }
     return !invalidations_.empty() ||
-           (state_ == VSpaceState::Stopping && bindings_ == 0 && tlb_.active_cpus().empty());
+           (state_ == VSpaceState::Stopping && bindings_.load(std::memory_order_acquire) == 0 && tlb_.active_cpus().empty());
 }
 
 void VSpace::try_finish_retire() noexcept {
-    if (state_ != VSpaceState::Stopping || bindings_ != 0 || active_ || editing_ || draining_ || !invalidations_.empty() || !tlb_.active_cpus().empty() || !layout_.empty()) {
+    if (state_ != VSpaceState::Stopping || bindings_.load(std::memory_order_acquire) != 0 || active_ || editing_ || draining_ || !invalidations_.empty() || !tlb_.active_cpus().empty() || !layout_.empty()) {
         return;
     }
     if (root_) release_root();

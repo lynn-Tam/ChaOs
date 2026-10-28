@@ -574,11 +574,19 @@ bool test_memory_byte_access(const TestContext&) noexcept {
     {
         auto transfer = memory.begin_transfer(0);
         if (!transfer || fixture.pmm().bytes(transfer.value().page())[17] != data[0]) return false;
+        const auto busy = memory.seal();
+        if (busy || busy.error() != MemErr::Busy || memory.seal_state() != SealState::Loadable
+            || memory.content_epoch().raw != 0) return false;
         transfer.value().abort();
     }
-    if (!memory.seal()) return false;
+    auto loan = memory.materialize(0);
+    if (!loan || !memory.seal()) return false;
     const auto sealed = memory.write(0, {data, sizeof(data)});
-    return !sealed && sealed.error() == MemErr::InvalidAccess;
+    if (sealed || sealed.error() != MemErr::InvalidAccess) return false;
+    loan->reset();
+    const auto moved = memory.begin_transfer(0);
+    return !moved && moved.error() == MemErr::InvalidAccess
+        && memory.read(0, {output, sizeof(output)}) && output[0] == data[0] && output[1] == data[1];
 }
 
 bool test_executable_seal_closes_writable_attachments(
@@ -806,10 +814,12 @@ bool test_pager_supply_moves_staging_owner(
     if (!retry_transfer) {
         return false;
     }
+    const auto busy = staging.seal();
+    if (busy || busy.error() != mm::MemErr::Busy) return false;
     if (!target.supply(pager, std::move(retry_transfer).value(), request.value().id)) {
         return false;
     }
-    if (staging.query(0).value() != mm::ContentState::Zero) {
+    if (staging.query(0).value() != mm::ContentState::Zero || !staging.seal()) {
         return false;
     }
     auto resident = target.materialize(0);

@@ -16,6 +16,7 @@
 #include <mm/pager.hpp>
 #include <boot/info.hpp>
 #include <task/env.hpp>
+#include <time.hpp>
 
 namespace {
 
@@ -556,6 +557,32 @@ bool test_memory_retire_invalidates_mapping_projection(
         && absent && absent.value().kind == mm::FaultKind::NoMapping;
 }
 
+bool test_execution_runtime_survives_unbind(const TestContext& ctx) noexcept {
+    VSpaceFixture fixture;
+    if (!fixture.initialize(false, 1)) return false;
+    const time::Clock clock{ctx.boot.timebase_frequency};
+    mm::Exec first, second;
+    auto a = Env::user(fixture.space_ref(), fixture.cspace_ref());
+    auto b = Env::user(fixture.space_ref(), fixture.cspace_ref());
+    auto stop = []() noexcept {};
+    const auto owner = fixture.space_ref().key();
+    if (!a || !b || !a->bind_exec(first, owner, Source::Action::bind(stop))
+        || !b->bind_exec(second, owner, Source::Action::bind(stop))) return false;
+    first.runtime.store(17); second.runtime.store(29);
+    const auto live = fixture.space().runtime(clock);
+    if (live.version != 1 || live.size != sizeof(VSpaceRuntime) || live.runtime != 46) return false;
+    a->detach_user();
+    second.runtime.store(32);
+    const auto mixed = fixture.space().runtime(clock);
+    if (mixed.runtime != 49 || mixed.sampled < live.sampled) return false;
+    b->detach_user(); b->detach_user();
+    const auto stopped = fixture.space().runtime(clock);
+    fixture.space().stop_exec();
+    auto rejected = Env::user(fixture.space_ref(), fixture.cspace_ref());
+    return stopped.runtime == 49 && stopped.sampled >= mixed.sampled
+        && fixture.space().binding_count() == 0 && !rejected;
+}
+
 bool test_root_close_waits_for_env(
     const TestContext&) noexcept {
     VSpaceFixture fixture{};
@@ -804,6 +831,7 @@ bool test_private_creation_refunds_failed_root(const TestContext&) noexcept {
 } // namespace
 
 void register_vspace_tests(TestRegistry& registry) noexcept {
+    (void)registry.add("vspace", "execution runtime transfers once from live roots to exited total", test_execution_runtime_survives_unbind);
     (void)registry.add("vspace", "protect preserves sealing and retired permissions", test_protect_seal);
     (void)registry.add("vspace", "owned edits drain multiple layout and PTE batches", test_batched_edit);
     (void)registry.add("vspace", "failed private root initialization drains and refunds", test_private_creation_refunds_failed_root);

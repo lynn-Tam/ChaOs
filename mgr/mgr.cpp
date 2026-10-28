@@ -17,7 +17,9 @@ static auto mgr_row(_proc* task, mgr_child::cpu_sample& sample, uint64_t child_i
             row.put("runtime", runtime);
         }
         if (const auto facts = _source_info(task->scope()); facts.status == STATUS_OK) row.put("scope_state", facts.value);
-        if (const auto cpu = sample.sample(*task, _clock_frequency().value)) row.array("cpu", std::span{cpu->second}).put("sampled", cpu->first);
+        sample.sample(*task, _clock_frequency().value);
+        row.put("cpu_status", int64_t{sample.status});
+        if (sample.value.version) row.put("cpu_time", sample.value.runtime).put("sampled", sample.value.sampled);
         if (_vspace_info(task->vspace()).status == STATUS_OK)
             row.put("resident", reinterpret_cast<const VSpaceInfo*>(_ipc())->resident);
         if (_quota_info(task->quota()).status == STATUS_OK) {
@@ -1343,52 +1345,17 @@ static auto mgr_changes(cap_t scope, cap_t cspace, ubus_value query, ubus_msg& r
         ? STATUS_OK : STATUS_WOULD_BLOCK;
 }
 
-auto mgr_child::cpu_sample::sample(const _proc& task, word_t interval) -> std::expected<std::pair<uint64_t, std::vector<uint64_t>>, status_t> {
+void mgr_child::cpu_sample::sample(const _proc& task, word_t interval) {
     const auto now = _clock_now().value;
-    // Coalesce observers into one sample per second. The timestamp travels with
-    // the data; a cached sample is never relabeled with a newer clock value.
-    if (at && now - at < interval) {
-        if (status != STATUS_OK) return std::unexpected(status);
-        return value;
-    }
+    if (at && now - at < interval) return;
     at = now;
-    const auto collect = [&]() -> std::expected<std::vector<uint64_t>, status_t> {
-        const auto ipc = reinterpret_cast<void*>(_ipc());
-        const auto identity = _object_info(task.vspace());
-        if (identity.status != STATUS_OK) return std::unexpected(identity.status);
-        const auto vm = reinterpret_cast<const ObjectInfo*>(ipc)->object_id;
-        std::vector<std::array<uint64_t, 2>> threads;
-        ScopeCursor cursor{};
-        for (;;) {
-            const auto scan = _scope_members(task.scope(), cursor);
-            if (scan.status != STATUS_OK) return std::unexpected(scan.status);
-            ScopeMembers page; ::memcpy(&page, ipc, sizeof(page));
-            for (const auto& member : std::span{page.records, page.count}) {
-                if (member.kind != ObjThread) continue;
-                const auto linked = _scope_query(task.scope(), member.object_id, SCOPE_LINKS);
-                if (linked.status != STATUS_OK) return std::unexpected(linked.status);
-                LinkRecords links; ::memcpy(&links, ipc, sizeof(links));
-                if (links.more) return std::unexpected(STATUS_EXHAUSTED);
-                if (std::ranges::none_of(std::span{links.records, links.count}, [&](const auto& link) {
-                    return link.kind == LINK_ROOT && link.object_id == vm;
-                })) continue;
-                const auto sampled = _scope_query(task.scope(), member.object_id, SCOPE_USAGE);
-                if (sampled.status != STATUS_OK) return std::unexpected(sampled.status);
-                threads.push_back({member.object_id, reinterpret_cast<const ThreadInfo*>(ipc)->runtime});
-            }
-            cursor = page.next;
-            if (!page.more) break;
-        }
-        const auto final = _scope_info(task.scope());
-        if (final.status != STATUS_OK) return std::unexpected(final.status);
-        if (reinterpret_cast<const ScopeInfo*>(ipc)->epoch != cursor.version) return std::unexpected(STATUS_STALE);
-        std::ranges::sort(threads);
-        std::vector<uint64_t> result; result.reserve(threads.size() * 2);
-        for (const auto& thread : threads) result.insert(result.end(), thread.begin(), thread.end());
-        return result;
-    };
-    auto result = collect(); status = result ? STATUS_OK : result.error();
-    if (!result) return std::unexpected(result.error());
-    value = {_clock_now().value, std::move(*result)};
-    return value;
+    const auto result = _cap_copy<VSpaceRuntime>(_vspace_runtime(task.vspace()));
+    status = result ? STATUS_OK : result.error();
+    if (!result) return;
+    if (result->version != 1 || result->size != sizeof(VSpaceRuntime)
+        || (value.version && (result->sampled < value.sampled || result->runtime < value.runtime))) {
+        status = STATUS_INTERNAL;
+        return;
+    }
+    value = *result;
 }

@@ -508,9 +508,11 @@ void Dispatcher::charge_to(u64 now) noexcept {
         if (current_sc_) current_sc_->record(elapsed);
         loan_elapsed_ += elapsed;
         if (!current_work_) {
-            sync::Lock guard{cpu_.current->lock_};
-            cpu_.current->runtime_ += elapsed;
-            cpu_.current->recorded_at_ = now;
+            auto& thread = *cpu_.current;
+            sync::Lock guard{thread.lock_};
+            auto& runtime = thread.exec_.runtime;
+            runtime.store(runtime.load(std::memory_order_relaxed) + elapsed, std::memory_order_relaxed);
+            thread.recorded_at_ = now;
         }
         auto* child = current_work_ ? current_work_ : &cpu_.current->ready_;
         if (current_sc_) child->service = current_sc_->service_;

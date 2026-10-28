@@ -434,9 +434,8 @@ class Mem final : private libk::noncopyable_nonmovable {
     [[nodiscard]] auto state() const noexcept -> MemState;
     [[nodiscard]] auto seal_state() const noexcept -> SealState;
     [[nodiscard]] auto content_epoch() const noexcept -> ContentEpoch;
-    // Publishes immutable executable content. The synchronous E0 path only
-    // succeeds once no writable mapping attachment remains; later async
-    // callers use the same state transition after retiring those mappings.
+    // Publishes immutable executable content once page preparation/transfers
+    // and writable mapping attachments have drained.
     [[nodiscard]] auto seal() noexcept -> std::expected<void, MemErr>;
     [[nodiscard]] auto query(usize page_index) const noexcept -> std::expected<ContentState, MemErr>;
     [[nodiscard]] auto materialize(usize page_index, Source::Context* = nullptr, bool wired = false) noexcept

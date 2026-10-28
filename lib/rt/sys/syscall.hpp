@@ -126,6 +126,9 @@ inline void _yield() noexcept {
 [[nodiscard]] inline auto _vspace_info(cap_t target, word_t offset = 0) noexcept -> _sys_result {
     return _call(SYS_VSPACE_INFO, target, offset);
 }
+[[nodiscard]] inline auto _vspace_runtime(cap_t target, word_t offset = 0) noexcept -> _sys_result {
+    return _call(SYS_VSPACE_RUNTIME, target, offset);
+}
 [[nodiscard]] inline auto _cspace_info(cap_t target, cap_t cursor = 0, word_t offset = 0, word_t epoch = 0) noexcept -> _sys_result {
     return _call(SYS_CSPACE_INFO, target, offset, cursor, epoch);
 }

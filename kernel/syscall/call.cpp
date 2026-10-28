@@ -1233,7 +1233,8 @@ template<usize op>
             if constexpr (std::is_same_v<T, object::Scope>) {
                 const auto view = target->view();
                 return target.value()->info(0, std::get<cap::ScopeLimit>(view.data).kinds);
-            } else return target.value()->info(inv.cpu.dispatcher().clock().rd_ticks());
+            } else if constexpr (op == SYS_VSPACE_RUNTIME) return target.value()->runtime(inv.cpu.dispatcher().clock());
+            else return target.value()->info(inv.cpu.dispatcher().clock().rd_ticks());
         }();
         return write(info);
     };
@@ -1242,7 +1243,7 @@ template<usize op>
     if constexpr (op == SYS_SC_INFO) return inspect.template operator()<sched::Sc>();
     if constexpr (op == SYS_SCOPE_INFO) return inspect.template operator()<object::Scope>();
     if constexpr (op == SYS_QUOTA_INFO) return inspect.template operator()<resource::Quota>();
-    if constexpr (op == SYS_VSPACE_INFO) return inspect.template operator()<mm::VSpace>();
+    if constexpr (op == SYS_VSPACE_INFO || op == SYS_VSPACE_RUNTIME) return inspect.template operator()<mm::VSpace>();
     return returned(STATUS_INVALID_OP);
 }
 template<usize op>

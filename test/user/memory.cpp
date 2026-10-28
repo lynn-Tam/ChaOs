@@ -14,8 +14,35 @@ static auto contract_error(unsigned line) -> status_t {
     if (result) (void)::write(1, text, result.produced);
     return STATUS_INTERNAL;
 }
-// Exercise the public write/bind and async destination authority boundaries.
+// Exercise public content immutability and async destination authority.
 static auto contracts() -> status_t {
+    {
+        const auto auth = _startup().alloc();
+        const auto pg = _pager_create(auth), src = _memory_create(auth, 4096, VM_READ | VM_WRITE);
+        if (pg.status != STATUS_OK || src.status != STATUS_OK) return STATUS_NO_MEMORY;
+        _cap_owner pager{pg.value}, source{src.value};
+        const std::byte data{0x6b};
+        if (_mem_write(source.selector(), 0, {&data, 1}).status != STATUS_OK
+            || _memory_seal(source.selector()).status != STATUS_OK) return contract_error(__LINE__);
+        const auto cloned = _memory_clone(auth, source.selector(), 0, 1);
+        if (cloned.status != STATUS_OK) return cloned.status;
+        _cap_owner clone{cloned.value};
+        const auto made = _memory_create_pager(auth, 4096, VM_READ | VM_WRITE, pager.selector(), 0, 1);
+        if (made.status != STATUS_OK && made.status != STATUS_PENDING) return made.status;
+        _cap_owner target{made.value};
+        if (made.status == STATUS_PENDING && _op_wait(target.selector()).status != STATUS_OK) return contract_error(__LINE__);
+        const auto object = _cap_copy<ObjectInfo>(_object_info(target.selector())); if (!object) return object.error();
+        if (_pager_restore(pager.selector(), object->object_id, 0).status != STATUS_PENDING) return contract_error(__LINE__);
+        if (_pager_claim(pager.selector()).status != STATUS_OK) return contract_error(__LINE__);
+        const auto request = *reinterpret_cast<const PagerReq*>(_ipc());
+        if (_pager_supply(pager.selector(), request.id, source.selector(), 0).status != STATUS_BAD_ARGS
+            || _pager_supply(pager.selector(), request.id, source.selector(), 0, PAGER_SUPPLY_COPY).status != STATUS_OK)
+            return contract_error(__LINE__);
+        for (auto memory : {source.selector(), clone.selector(), target.selector()}) {
+            std::byte output{};
+            if (_mem_read(memory, 0, {&output, 1}).status != STATUS_OK || output != data) return contract_error(__LINE__);
+        }
+    }
     for (size_t trial = 0; trial < 32; ++trial) {
         const auto made = _scope_create(_startup().alloc()); if (made.status != STATUS_OK) return made.status;
         _cap_owner scope{made.value}; const CreateAuth auth{_startup().quota, scope.selector()};

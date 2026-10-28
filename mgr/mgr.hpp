@@ -49,9 +49,9 @@ public:
     std::deque<ubus_msg> inbox;
     bool received{}, desired{}, relaunch{}, removing{}, reusable{true};
     struct cpu_sample {
-        uint64_t at{}; status_t status{};
-        std::pair<uint64_t, std::vector<uint64_t>> value;
-        auto sample(const _proc&, word_t) -> std::expected<std::pair<uint64_t, std::vector<uint64_t>>, status_t>;
+        uint64_t at{}; status_t status{STATUS_WOULD_BLOCK};
+        VSpaceRuntime value{};
+        void sample(const _proc&, word_t);
     } cpu;
     std::unique_ptr<_proc> task;
     mgr_state state{mgr_state::Idle};
@@ -98,7 +98,7 @@ class mgr {
         _ev_watch drained{};
     };
     std::map<word_t, facet> facets_;
-    ubus_object object_{"ubus.environment", 3, 0,
+    ubus_object object_{"ubus.environment", 4, 0,
         [this](word_t facet, std::string_view method) { return access(facet, method); }};
     uint64_t next_{}, next_badge_{3}, next_publication_{}, identity_{}, cspace_id_{}, epoch_{1}, deadline_{};
     size_t capacity_{128};

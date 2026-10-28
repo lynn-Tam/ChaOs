@@ -35,6 +35,10 @@ static auto ts_error(status_t s) -> std::string {
     default: return "Failed (" + std::to_string(s) + ")";
     }
 }
+static auto ts_terminal(status_t s) -> bool {
+    return s == STATUS_DENIED || s == STATUS_BAD_RIGHTS || s == STATUS_CLOSED
+        || s == STATUS_PEER_CLOSED || s == STATUS_INVALID_CAP || s == STATUS_INVALID_OP;
+}
 static auto ts_name(ubus_value row) -> std::string {
     auto name = ts_text(row["program"]);
     if (name.empty()) return ts_text(row["name"]);
@@ -59,23 +63,32 @@ struct ts_item {
     ubus_data data;
     std::optional<std::string> command;
     std::string key, path;
-    uint64_t serial{}, tick{};
-    std::vector<uint64_t> threads;
+    uint64_t serial{}, tick{}, cpu_time{};
+    status_t cpu_status{STATUS_WOULD_BLOCK};
     std::optional<uint64_t> cpu;
 
     bool expanded{true};
 };
 static void ts_sample(ts_item& item, ubus_value row) {
-    const auto samples = row["cpu"].vector<uint64_t>(); const auto tick = ts_num(row["sampled"]);
-    if (!samples) { item.cpu.reset(); item.threads.clear(); item.tick = 0; return; }
-    if (tick <= item.tick) return;
-    bool same = item.tick && item.threads.size() == samples->size(); uint64_t elapsed{};
-    for (size_t i = 0; same && i + 1 < samples->size(); i += 2) {
-        same = item.threads[i] == (*samples)[i] && item.threads[i + 1] <= (*samples)[i + 1];
-        if (same) elapsed += (*samples)[i + 1] - item.threads[i + 1];
+    const auto time = row["cpu_time"].as<uint64_t>(), tick = row["sampled"].as<uint64_t>();
+    const auto status = row["cpu_status"].as<int64_t>();
+    if (!status || !time || !tick) {
+        item.cpu_status = status && *status != STATUS_OK ? status_t(*status) : STATUS_PEER_FAULT;
+        return;
     }
-    item.cpu = same ? std::optional{elapsed * 1000 / (tick - item.tick) / _startup().cpus} : std::nullopt;
-    item.threads.assign(samples->begin(), samples->end()); item.tick = tick;
+    if (*tick < item.tick) return; // A late overview must not replace a newer List sample.
+    item.cpu_status = status_t(*status);
+    if (*time < item.cpu_time) { item.cpu.reset(); item.cpu_status = STATUS_STALE; }
+    else if (*tick == item.tick) {
+        if (*time != item.cpu_time) item.cpu_status = STATUS_PEER_FAULT;
+        return;
+    } else if (item.tick) {
+        const auto value = static_cast<unsigned __int128>(*time - item.cpu_time) * 1000
+            / (static_cast<unsigned __int128>(*tick - item.tick) * _startup().cpus);
+        if (value > UINT64_MAX) { item.cpu_status = STATUS_PEER_FAULT; return; }
+        item.cpu = uint64_t(value);
+    }
+    item.cpu_time = *time; item.tick = *tick;
 }
 struct ts_scope {
     _cap_owner cap;
@@ -84,6 +97,7 @@ struct ts_scope {
     std::vector<std::shared_ptr<ts_item>> items;
     std::string path, error;
     uint64_t identity{}, round{};
+    status_t status{STATUS_OK};
     bool attempted{};
 };
 class ts_view {
@@ -177,13 +191,13 @@ class ts_view {
     void begin(query q) {
         q.message.deadline = _after(std::chrono::milliseconds{800}).value_or(0);
         if (connection(q).active()) return;
-        const uint64_t version = q.kind == Bind ? 3 : 1;
+        const uint64_t version = q.kind == Bind ? 4 : 1;
         const auto status = q.kind == Bind || q.kind == DeviceBind
             ? connection(q).begin_bind(q.kind == Bind ? q.scope->cap.selector() : device_cap_.selector(), q.kind == Bind ? "ubus.environment" : "io.devices", version, version, 0, q.message.deadline)
             : connection(q).begin(q.kind == List || q.kind == Devices ? "List" : q.kind == DeviceGet ? "Get" : q.kind == Action ? "Action" : "Inspect", std::move(q.message));
         if (status == STATUS_OK) active_.push_back(std::move(q));
         else {
-            if (q.scope && (q.kind == Bind || q.kind == List || q.kind == Children)) q.scope->error = ts_error(status);
+            if (q.scope && (q.kind == Bind || q.kind == List || q.kind == Children)) { q.scope->status = status; q.scope->error = ts_error(status); }
             else notice_ = ts_error(status);
             dirty_ = true;
         }
@@ -205,7 +219,7 @@ class ts_view {
     void reply(query done, status_t status, ubus_msg response) {
         if (done.item && ts_num(done.item->data["run_id"]) != done.run_id) return;
         if (status != STATUS_OK) {
-            if (done.kind == List || done.kind == Bind) done.scope->error = ts_error(status);
+            if (done.kind == List || done.kind == Bind) { done.scope->status = status; done.scope->error = ts_error(status); }
             else if (done.kind == Children && done.item) {
                 auto child = std::make_shared<ts_scope>(); child->parent = done.item; child->path = done.item->path;
                 child->error = ts_error(status); child->attempted = true; done.item->children = std::move(child);
@@ -214,8 +228,12 @@ class ts_view {
             } else notice_ = ts_error(status);
             dirty_ = true; return;
         }
-        if (done.kind == List) {
-            auto& scope = *done.scope; scope.error.clear();
+        if (done.kind == Bind) {
+            done.scope->status = STATUS_OK; done.scope->error.clear();
+            done.scope->round = 0; // Successful binding makes the first List immediately eligible.
+        }
+        else if (done.kind == List) {
+            auto& scope = *done.scope; scope.status = STATUS_OK; scope.error.clear();
             const auto identity = ts_num(response.data["owner"]);
             if (identity != scope.identity) scope.items.clear();
             scope.identity = identity;
@@ -228,7 +246,9 @@ class ts_view {
                 auto item = found == scope.items.end() ? std::make_shared<ts_item>() : *found;
                 if (!item->serial) item->serial = ++serial_;
                 if (!ts_flag(row["children"]) || item->data["root_version"].as<uint64_t>() != row["root_version"].as<uint64_t>()) item->children.reset();
-                if (item->data["run_id"].as<uint64_t>() != row["run_id"].as<uint64_t>()) { item->tick = 0; item->threads.clear(); item->children.reset(); }
+                if (item->data["run_id"].as<uint64_t>() != row["run_id"].as<uint64_t>()) {
+                    item->tick = item->cpu_time = 0; item->cpu.reset(); item->cpu_status = STATUS_WOULD_BLOCK; item->children.reset();
+                }
                 if (item->data["run_id"].as<uint64_t>() != row["run_id"].as<uint64_t>()
                     || item->data["config"].as<uint64_t>() != row["config"].as<uint64_t>()) item->command.reset();
                 item->owner = done.scope; item->key = std::to_string(identity) + ":" + std::to_string(ts_num(row["child_id"]));
@@ -266,7 +286,7 @@ class ts_view {
         const auto now = _clock_now().value;
         if (now >= refresh_) {
             refresh_ = refresh_ ? refresh_ + ((now - refresh_) / frequency_ + 1) * frequency_ : now + frequency_;
-            ++round_; if (detail_) dirty_ = true;
+            ++round_; dirty_ = true;
         }
         if (page_ == 1) {
             if (environment_.active() || devices_.active()) return;
@@ -287,10 +307,11 @@ class ts_view {
         for (const auto& scope : scopes()) {
             for (auto p = scope->parent.lock(); p; p = p->owner.lock() ? p->owner.lock()->parent.lock() : nullptr)
                 if (scope->identity && p->owner.lock() && p->owner.lock()->identity == scope->identity) { scope->error = "Repeated reference"; break; }
-            if (!scope->error.empty() || scope->connection.active()) continue;
+            if (scope->connection.active() || (!scope->error.empty()
+                && (scope->status == STATUS_OK || ts_terminal(scope->status) || scope->round == round_))) continue;
             query q; q.scope = scope;
             if (!scope->connection.endpoint()) {
-                if (!scope->attempted) { scope->attempted = true; q.kind = Bind; begin(std::move(q)); }
+                if (!scope->attempted || scope->round != round_) { scope->attempted = true; scope->round = round_; q.kind = Bind; begin(std::move(q)); }
                 continue;
             }
             if (scope->round != round_) {
@@ -366,7 +387,7 @@ class ts_view {
         if (e == ftxui::Event::Character('r')) {
             refresh_ = 0;
             for (const auto& scope : scopes()) {
-                scope->error.clear(); scope->attempted = false;
+                scope->error.clear(); scope->status = STATUS_OK; scope->attempted = false;
                 for (const auto& item : scope->items) if (item->children && !item->children->error.empty()) item->children.reset();
             }
             return;
@@ -383,6 +404,16 @@ class ts_view {
             rebuild();
         }
     }
+    auto cpu_text(const ts_item& item) const -> std::string {
+        const auto state = ts_text(item.data["state"]);
+        const auto scope = item.owner.lock();
+        if ((state != "running" && state != "draining") || ts_terminal(item.cpu_status)
+            || (scope && ts_terminal(scope->status))) return "--";
+        if (!item.cpu) return item.tick && item.cpu_status == STATUS_OK ? "…" : "--";
+        const bool stale = item.cpu_status != STATUS_OK || !scope || !scope->error.empty()
+            || (now_ >= item.tick && now_ - item.tick > 2 * frequency_);
+        return (stale ? "~" : "") + ts_percent(*item.cpu);
+    }
     auto line(std::string name, std::string state, std::string a, std::string b) -> ftxui::Element {
         ftxui::Elements parts{ftxui::text(name) | ftxui::flex, ftxui::text(state) | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 12)};
         if (terminal_.columns() >= 64) parts.push_back(ftxui::text(a) | ftxui::align_right | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, page_ ? 16 : 9));
@@ -395,7 +426,7 @@ class ts_view {
         const auto tab = [&](std::string label, bool active) { return ftxui::text(" " + label + " ") | (active ? ftxui::inverted : ftxui::dim); };
         ftxui::Elements parts{ftxui::hbox({ftxui::text(" TASKS ") | ftxui::bold, tab("1 Programs", !page_), tab("2 Devices", page_), ftxui::filler(), ftxui::text(frozen_ ? "Paused " : root_->path.substr(root_->path.find_last_of('/') + 1) + " ") | ftxui::dim}), ftxui::separator()};
         if (help_) {
-            parts.push_back(ftxui::vbox({ftxui::text("Keys") | ftxui::bold, ftxui::text(""), field("Up/Down", "Select"), field("Left/Right", "Collapse / expand"), field("Enter", "Details"), field("a", "Actions"), field("/", "Search"), field("s", "Sort by name, CPU, memory"), field("t", "Tree / list"), field("h", "Include stopped programs"), field("Space", "Pause updates"), field("r", "Refresh"), field("Esc", "Back"), field("q", "Quit"), ftxui::text(""), field("CPU", "100% = all cores"), field("Memory", "Resident memory")}) | ftxui::flex);
+            parts.push_back(ftxui::vbox({ftxui::text("Keys") | ftxui::bold, ftxui::text(""), field("Up/Down", "Select"), field("Left/Right", "Collapse / expand"), field("Enter", "Details"), field("a", "Actions"), field("/", "Search"), field("s", "Sort by name, CPU, memory"), field("t", "Tree / list"), field("h", "Include stopped programs"), field("Space", "Pause updates"), field("r", "Refresh"), field("Esc", "Back"), field("q", "Quit"), ftxui::text(""), field("CPU", "100% = all cores; ~ = stale sample"), field("Memory", "Resident memory")}) | ftxui::flex);
         } else if (detail_) {
             ftxui::Elements body;
             if (page_) {
@@ -414,11 +445,19 @@ class ts_view {
                 ftxui::Elements labels, values;
                 for (const auto text : {"CPU", "Memory", "Elapsed"}) labels.push_back(ftxui::text(text) | ftxui::dim | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, terminal_.columns() / 3));
                 for (const auto& text : std::array<std::string, 3>{
-                    current && item->cpu ? ts_percent(*item->cpu) : "--",
+                    cpu_text(*item),
                     current && item->data["resident"] ? ts_bytes(ts_num(item->data["resident"])) : "--",
                     current && age && now_ >= *age ? ts_duration((now_ - *age) / frequency_) : "--"})
                     values.push_back(ftxui::text(text) | ftxui::bold | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, terminal_.columns() / 3));
                 body.insert(body.begin() + 2, {ftxui::hbox(labels), ftxui::hbox(values), ftxui::separator()});
+                if (item->tick) {
+                    body.push_back(field("CPU sample", ts_duration(now_ >= item->tick ? (now_ - item->tick) / frequency_ : 0) + " ago"));
+                    body.push_back(field("CPU time", std::to_string(uint64_t(static_cast<unsigned __int128>(item->cpu_time) * 1000 / frequency_)) + " ms"));
+                }
+                if (ts_text(row["state"]) != "running" && ts_text(row["state"]) != "draining") body.push_back(field("CPU status", "Not running"));
+                else if (scope && !scope->error.empty()) body.push_back(field("CPU status", scope->error));
+                else if (item->cpu_status != STATUS_OK) body.push_back(field("CPU status", ts_error(item->cpu_status)));
+                else if (!item->cpu && item->tick) body.push_back(field("CPU status", "Waiting for second sample"));
                 if (const auto result = row["result"].as<int64_t>(); ts_text(item->data["state"]) == "failed" && result && *result) body.push_back(field("Last error", ts_error(static_cast<status_t>(*result))));
             } else body.push_back(ftxui::text("Program ended") | ftxui::dim);
             parts.push_back(ftxui::vbox(body) | ftxui::flex);
@@ -441,7 +480,7 @@ class ts_view {
                     auto name = ts_name(item->data.view());
                     name = std::string(depth * 2, ' ') + (tree_ && ts_flag(item->data["children"]) ? item->expanded ? "- " : "+ " : "") + name;
                     const auto scope = item->owner.lock(); const bool current = scope && scope->error.empty();
-                    auto entry = line(name, current ? ts_state(item->data.view()) : "Unavailable", current && item->cpu ? ts_percent(*item->cpu) : "--", current && item->data["resident"] ? ts_bytes(ts_num(item->data["resident"])) : "--");
+                    auto entry = line(name, current ? ts_state(item->data.view()) : "Unavailable", cpu_text(*item), current && item->data["resident"] ? ts_bytes(ts_num(item->data["resident"])) : "--");
                     if (ts_text(item->data["state"]) == "failed") entry |= ftxui::color(ftxui::Color::Red);
                     if (item->key == selection_) entry = entry | ftxui::inverted | ftxui::focus;
                     rows.push_back(entry);

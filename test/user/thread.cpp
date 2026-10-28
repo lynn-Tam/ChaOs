@@ -142,6 +142,42 @@ static void native_lifetime() {
         check(std::chrono::steady_clock::now() < deadline); _yield();
     }
 }
+static void cpu_runtime() {
+    const auto read = [] {
+        const auto value = _cap_copy<VSpaceRuntime>(_vspace_runtime(_startup().vspace));
+        check(value && value->version == 1 && value->size == sizeof(VSpaceRuntime));
+        return *value;
+    };
+    const auto before = read(); auto previous = before;
+    std::atomic<uint64_t> used{};
+    uint64_t longest{};
+    for (unsigned wave = 0; wave < 6; ++wave) {
+        std::array<std::thread, 4> workers;
+        for (auto& thread : workers) thread = std::thread([&] {
+            const auto start = _cap_copy<ThreadInfo>(_thread_info(0)); check(bool(start));
+            const auto due = _after(std::chrono::milliseconds{3}); check(bool(due));
+            while (_clock_now().value < *due) std::atomic_signal_fence(std::memory_order_relaxed);
+            const auto end = _cap_copy<ThreadInfo>(_thread_info(0)); check(end && end->runtime >= start->runtime);
+            used.fetch_add(end->runtime - start->runtime, std::memory_order_relaxed);
+        });
+        for (unsigned i = 0; i < 16; ++i) {
+            const auto begin = _clock_now().value;
+            const auto sample = read();
+            longest = std::max(longest, _clock_now().value - begin);
+            check(sample.sampled >= previous.sampled && sample.runtime >= previous.runtime);
+            previous = sample;
+            const auto made = _memory_create(_startup().alloc(), 4096, VM_READ | VM_WRITE);
+            check(made.status == STATUS_OK); _cap_owner memory{made.value};
+            check(_object_destroy(memory.selector()).status == STATUS_OK);
+        }
+        for (auto& thread : workers) thread.join();
+        const auto after = read();
+        check(after.runtime >= previous.runtime && after.runtime - before.runtime >= used.load());
+        previous = after;
+    }
+    sample("runtime-query-max", longest);
+    say("[threads] CPU runtime survives short threads and object churn\n");
+}
 static void file_writes() {
     const int fd = open("thread-data", O_RDWR | O_CREAT | O_TRUNC, 0); check(fd >= 0);
     std::vector<std::jthread> threads;
@@ -243,10 +279,11 @@ static void execution_domain() {
             .resources={.bytes=4 * 1024 * 1024, .caps=192, .slots=256, .pages=36}, .events=&_events()};
         auto made = _proc_create({_startup().alloc(), _startup().domain}, {.bytes=image}, opts);
         check(bool(made)); auto child = std::move(*made);
-        const auto slice = _vm_slice(child.vspace(), 0x100000000, 4096, VM_READ, RIGHT_CONTROL | RIGHT_OBSERVE);
+        const auto slice = _vm_slice(child.vspace(), 0x100000000, 4096, VM_READ, RIGHT_CONTROL | RIGHT_OBSERVE | RIGHT_INSPECT);
         check(slice.status == STATUS_OK); _cap_owner restricted{slice.value};
         check(_vspace_stop(restricted.selector()).status == STATUS_DENIED);
         check(_vspace_exit(restricted.selector()).status == STATUS_DENIED);
+        check(_vspace_runtime(restricted.selector()).status == STATUS_DENIED);
         check(child.start() == STATUS_OK);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         for (;;) {
@@ -272,9 +309,12 @@ static void execution_domain() {
                     check(std::chrono::steady_clock::now() < deadline); _yield();
                 }
                 const auto before = _cap_copy<DomainInfo>(_domain_info(child.domain()))->runtime;
+                const auto cpu_before = _cap_copy<VSpaceRuntime>(_vspace_runtime(child.vspace())); check(bool(cpu_before));
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 const auto after = _cap_copy<DomainInfo>(_domain_info(child.domain()))->runtime;
                 check(enabled ? after > before : after == before);
+                const auto cpu_after = _cap_copy<VSpaceRuntime>(_vspace_runtime(child.vspace())); check(bool(cpu_after));
+                if (!raw) check(enabled ? cpu_after->runtime > cpu_before->runtime : cpu_after->runtime == cpu_before->runtime);
             }
             check(child.retire() == STATUS_OK);
         }
@@ -535,7 +575,7 @@ int main(int argc, char** argv) {
     check(count == 400 && destroyed.load() == 4 && local == 42);
     say("[threads] native TLS, heap, mutex, cond, join and destructors ok\n");
     address_claims(); event_dispatch(); rpc_reuse();
-    standard_threads(); native_lifetime();
+    standard_threads(); native_lifetime(); cpu_runtime();
     say("[threads] C++ jthread, shared_ptr, once, atomic wait and deadlines ok\n");
     check(!pthread_key_create(&key, key_cleanup));
     const auto fd = open("/boot/README.TXT", O_RDONLY); check(fd >= 0);

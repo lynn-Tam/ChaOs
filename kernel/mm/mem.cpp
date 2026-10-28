@@ -1029,6 +1029,9 @@ auto Mem::seal() noexcept -> std::expected<void, MemErr> {
     if (state_ != MemState::Live || seal_ != SealState::Loadable) {
         return std::unexpected(MemErr::InvalidState);
     }
+    // A transfer keeps preparation active until its source slot is committed
+    // or restored. Publish immutable content only after that boundary.
+    if (preparing_) return std::unexpected(MemErr::Busy);
     seal_ = SealState::Sealing;
     for (auto* attachment = attachments_.minimum(); attachment; attachment = attachments_.next(*attachment)) {
         if (attachment->perms_.contains(Perm::Write)) {
@@ -1134,6 +1137,7 @@ auto Mem::begin_transfer(usize page_index) noexcept -> std::expected<PageTransfe
     {
         sync::Lock guard{lock_};
         if (reassigning_) return std::unexpected(MemErr::Busy);
+        if (seal_ != SealState::Loadable) return std::unexpected(MemErr::InvalidAccess);
         if (state_ != MemState::Live || !attachments_.empty() || operations_ != 0 ||
             page_index >= logical_pages_ || !store_) {
             return std::unexpected((!attachments_.empty() || operations_ != 0) ? MemErr::Busy

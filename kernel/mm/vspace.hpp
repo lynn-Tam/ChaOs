@@ -31,6 +31,7 @@
 #include <resource/quota.hpp>
 
 class Env;
+namespace time { class Clock; }
 
 class Cpus;
 namespace object {
@@ -52,6 +53,7 @@ struct Exec final {
     libk::intrusive_list_hook hook;
     object::Key owner;
     Source::Action stop;
+    std::atomic<u64> runtime{};
     bool stopping{};
 };
 
@@ -437,6 +439,7 @@ class VSpace final : private libk::noncopyable_nonmovable {
     auto fail_exec(u64 thread, ThreadExit) noexcept -> Source::Publication;
     void stop_exec() noexcept;
     auto exec_info() const noexcept -> ExecInfo;
+    auto runtime(const time::Clock&) const noexcept -> VSpaceRuntime;
     auto exec_events() noexcept -> Source& { return exec_events_; }
     [[nodiscard]] auto state() const noexcept -> VSpaceState;
     auto info(u64) const noexcept -> VSpaceInfo;
@@ -602,9 +605,12 @@ class VSpace final : private libk::noncopyable_nonmovable {
     libk::manual_lifetime<object::cleanup> cleanup_{};
     Work job_{};
     VSpaceState state_{VSpaceState::Live};
-    usize bindings_{}; // Includes an Env being prepared before its stable Exec is bound.
+    mutable sync::Spin exec_lock_{};
+    // Includes an Env being prepared before its stable Exec is bound. Writers
+    // hold exec_lock_; VM retirement only observes the final release of zero.
+    std::atomic<usize> bindings_{};
     libk::intrusive_list<Exec, &Exec::hook> execs_;
-    u64 exec_flags_{}, failed_thread_{};
+    u64 retired_runtime_{}, exec_flags_{}, failed_thread_{};
     ThreadExit failure_{};
     Src<EXEC_FAILED | EXEC_STOPPING | EXEC_STOPPED> exec_events_{Source::Drained::bind<&VSpace::complete_cleanup>(*this)};
     void advance_exec() noexcept;

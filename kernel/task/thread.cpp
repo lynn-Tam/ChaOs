@@ -367,7 +367,7 @@ auto Thread::detach_resource(u64 generation) noexcept -> status_t {
 }
 auto Thread::info(u64 now) const noexcept -> ThreadInfo {
     sync::Lock guard{lock_};
-    const auto runtime = runtime_ + (state_ == State::Running && now > recorded_at_ ? now - recorded_at_ : 0);
+    const auto runtime = exec_.runtime.load(std::memory_order_relaxed) + (state_ == State::Running && now > recorded_at_ ? now - recorded_at_ : 0);
     return {.version = 2, .size = sizeof(ThreadInfo), .requested = requested_, .applied = applied_,
         .runtime = runtime, .association = association_,
         .flags = (enabled_ ? THREAD_ENABLED : 0U) | (applied_enabled_ ? THREAD_APPLIED : 0U)

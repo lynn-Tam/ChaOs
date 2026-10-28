@@ -70,6 +70,12 @@ struct VSpaceInfo {
     uint32_t state, reserved;
 };
 
+// Settled CPU ticks of all executions rooted here, including exited threads.
+struct VSpaceRuntime {
+    uint32_t version, size;
+    uint64_t runtime, sampled;
+};
+
 #define VM_RECORD_MAP 0U
 #define VM_RECORD_RESERVED 1U
 #define VM_RECORD_GUARD 2U
