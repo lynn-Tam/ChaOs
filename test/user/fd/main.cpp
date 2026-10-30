@@ -4,6 +4,7 @@
 #include <start.hpp>
 #include <ubus/ubus.hpp>
 #include <unistd.h>
+#include <stdio.h>
 #include <uapi/abi.h>
 #include <string_view>
 #include <vector>
@@ -208,6 +209,22 @@ int main(int argc, char** argv) {
         source[i] = 'a' + i % 26;
     if (async < 0 || write(async, source.data(), source.size()) != static_cast<ssize_t>(source.size()) || fsync(async))
         return 31;
+    auto* stream = fopen("fd-async", "rb");
+    std::vector<char> buffered(2 * BUFSIZ);
+    if (!stream || fgetc(stream) != source[0] || fseek(stream, 15, SEEK_CUR)
+        || fgetc(stream) != source[16] || ungetc('!', stream) != '!'
+        || fseek(stream, 0, SEEK_CUR) || fgetc(stream) != source[16])
+        return 71;
+    if (fseek(stream, BUFSIZ - 3, SEEK_SET) || fread(buffered.data(), 1, 12, stream) != 12
+        || ::memcmp(buffered.data(), source.data() + BUFSIZ - 3, 12)
+        || fseek(stream, 0, SEEK_SET) || fread(buffered.data(), 1, buffered.size(), stream) != buffered.size()
+        || ::memcmp(buffered.data(), source.data(), buffered.size())
+        || fseek(stream, BUFSIZ + 8, SEEK_SET) || fgetc(stream) != source[BUFSIZ + 8])
+        return 72;
+    if (fseek(stream, -1, SEEK_END) || fgetc(stream) != source.back()
+        || fgetc(stream) != EOF || !feof(stream) || fseek(stream, 0, SEEK_SET)
+        || feof(stream) || fgetc(stream) != source[0] || fclose(stream))
+        return 73;
     char boundary[20]{};
     if (pread(async, boundary, sizeof(boundary), IO_LIMIT - 6) != sizeof(boundary))
         return 45;

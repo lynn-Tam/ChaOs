@@ -38,12 +38,12 @@ int main() {
     std::array<char, 80> pending{};
     size_t pending_size{};
     bool pending_valid{};
-    io_frame outgoing;
+    ubus_frame outgoing;
     size_t sent{};
     for (;;) {
         if (sent == outgoing.size) {
             sent = outgoing.size = 0;
-            const auto received = io_recv(output, outgoing, false);
+            const auto received = ubus_recv(output, outgoing, false);
             if (received != STATUS_OK && received != STATUS_WOULD_BLOCK) _thread_exit(received);
         }
         const auto end = std::min(outgoing.size, sent + 256);

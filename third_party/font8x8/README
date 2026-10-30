@@ -1,0 +1,4 @@
+Upstream: https://github.com/dhepper/font8x8
+Commit: 8e279d2d864e79128e96188a6b9526cfa3fbfef9
+License: public domain (see original header).
+Patch: table is static const unsigned char.

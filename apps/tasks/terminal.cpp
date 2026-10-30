@@ -76,7 +76,7 @@ auto ft_terminal::present(const ftxui::Component& component) -> status_t {
 }
 auto ft_terminal::flush() -> status_t {
     for (size_t budget = 0; sent_ < pending_.size() && budget < 8; ++budget) {
-        io_frame frame; frame.size = std::min(pending_.size() - sent_, io_stream_limit);
+        ubus_frame frame; frame.size = std::min(pending_.size() - sent_, ubus_stream_limit);
         ::memcpy(frame.data, pending_.data() + sent_, frame.size);
         const auto status = output_.send(control_.endpoint(), frame, false, *control_.token("Frame"), focus_);
         if (status == STATUS_STALE) { focused_ = false; return reset(); }

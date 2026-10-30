@@ -159,7 +159,7 @@ kernel_pressure = executable(
 )
 # Export only mechanism headers. Application/private trees never enter a
 # userspace include root; Meson's implicit repository root is disabled below.
-foreach layer, directories : {'base': ['uapi', 'libk'], 'ubus': ['ubus'], 'mgr': ['mgr']}
+foreach layer, directories : {'base': ['uapi', 'libk'], 'ubus': ['ubus'], 'mgr': ['mgr'], 'gui': ['gui']}
   exported = join_paths(meson.current_build_dir(), 'include', layer)
   run_command('mkdir', '-p', exported, check: true)
   foreach directory : directories
@@ -169,7 +169,9 @@ endforeach
 user_exports = join_paths(meson.current_build_dir(), 'include')
 app_exports = join_paths(user_exports, 'apps')
 run_command('mkdir', '-p', app_exports, check: true)
-run_command('ln', '-sfn', join_paths(root, 'apps/io.hpp'), join_paths(app_exports, 'io.hpp'), check: true)
+foreach header : ['io.hpp', 'virtio.hpp']
+  run_command('ln', '-sfn', join_paths(root, 'apps', header), join_paths(app_exports, header), check: true)
+endforeach
 io_dep = declare_dependency(compile_args: ['-I' + app_exports])
 user_common_args = [
   '-Wall', '-Wextra', '-Werror', '-O2', '-g3', '-ffunction-sections', '-fdata-sections',
@@ -202,10 +204,20 @@ mgr = static_library('mgr', files('mgr/mgr.cpp'), dependencies: [proc_dep, ubus_
 mgr_dep = declare_dependency(link_with: mgr, dependencies: [proc_dep, ubus_dep],
   compile_args: ['-I' + join_paths(user_exports, 'mgr')])
 posix = static_library(
-  'posix', files('apps/posix/io.cpp', 'apps/posix/pthread.cpp'), dependencies: [ubus_dep, io_dep],
+  'posix', files('apps/posix/io.cpp', 'apps/posix/pthread.cpp', 'apps/posix/stdio.cpp', 'apps/posix/libc.cpp'), dependencies: [ubus_dep, io_dep],
   cpp_args: user_cpp_args + ['-I' + join_paths(root, 'apps/posix/include')],
   pic: false, implicit_include_directories: false, build_by_default: false,
 )
+format_runtime = static_library('format-runtime', files('apps/posix/format.c', 'third_party/scanf/scanf.c'),
+  include_directories: include_directories('third_party/stb', 'third_party/scanf', 'apps/posix/include'),
+  c_args: user_c_args + ['-DSCANF_NOMATH=1', '-DSCANF_INTERNAL_CTYPE=1', '-DSCANF_SSCANF_ONLY=0', '-Wno-unused-parameter', '-Wno-sign-compare'],
+  pic: false, implicit_include_directories: false, build_by_default: false)
+vterm = static_library('vterm', files('third_party/libvterm/src/encoding.c', 'third_party/libvterm/src/keyboard.c',
+  'third_party/libvterm/src/mouse.c', 'third_party/libvterm/src/parser.c', 'third_party/libvterm/src/pen.c',
+  'third_party/libvterm/src/screen.c', 'third_party/libvterm/src/state.c', 'third_party/libvterm/src/unicode.c', 'third_party/libvterm/src/vterm.c'),
+  include_directories: include_directories('third_party/libvterm/include', 'apps/posix/include'),
+  c_args: user_c_args + ['-Wno-unused-parameter', '-Wno-missing-field-initializers', '-Wno-sign-compare', '-Wno-implicit-fallthrough', '-Wno-maybe-uninitialized', '-Wno-empty-body', '-Wno-old-style-declaration'],
+  pic: false, implicit_include_directories: false, build_by_default: false)
 subdir('third_party/ftxui')
 cxx_runtime = static_library('cxx-runtime', files('third_party/libstdcxx/tree.cc', 'third_party/libstdcxx/shared_ptr.cc',
   'third_party/libstdcxx/thread.cc', 'third_party/libstdcxx/mutex.cc', 'third_party/libstdcxx/condition_variable.cc'),
@@ -232,6 +244,104 @@ math_runtime = static_library('math-runtime', files(
 tui = static_library('tui', files('apps/tasks/terminal.cpp'), dependencies: [ubus_dep, io_dep],
   include_directories: ftxui_inc, cpp_args: user_cpp_args,
   pic: false, implicit_include_directories: false, build_by_default: false)
+gui_protocol_dep = declare_dependency(compile_args: ['-I' + join_paths(user_exports, 'gui')])
+gui = static_library('gui', files('gui/client.cpp', 'gui/server.cpp', 'gui/host.cpp'), dependencies: [ubus_dep, gui_protocol_dep],
+  include_directories: include_directories('third_party/font8x8'),
+  cpp_args: user_cpp_args, pic: false, implicit_include_directories: false, build_by_default: false)
+gui_dep = declare_dependency(link_with: gui, dependencies: [ubus_dep, gui_protocol_dep])
+host_viewer = []
+sdl2 = dependency('sdl2', native: true, required: false)
+if sdl2.found()
+  host_viewer = [executable('host-viewer', files('tools/host.cpp'), native: true,
+    include_directories: include_directories('.'), dependencies: [sdl2, dependency('threads', native: true)],
+    cpp_args: ['-std=c++23', '-Wall', '-Wextra', '-Werror', '-O2'], build_by_default: false)]
+endif
+doom = static_library('doom', files(
+  'third_party/doomgeneric/doomgeneric/dummy.c',
+  'third_party/doomgeneric/doomgeneric/am_map.c',
+  'third_party/doomgeneric/doomgeneric/doomdef.c',
+  'third_party/doomgeneric/doomgeneric/doomstat.c',
+  'third_party/doomgeneric/doomgeneric/dstrings.c',
+  'third_party/doomgeneric/doomgeneric/d_event.c',
+  'third_party/doomgeneric/doomgeneric/d_items.c',
+  'third_party/doomgeneric/doomgeneric/d_iwad.c',
+  'third_party/doomgeneric/doomgeneric/d_loop.c',
+  'third_party/doomgeneric/doomgeneric/d_main.c',
+  'third_party/doomgeneric/doomgeneric/d_mode.c',
+  'third_party/doomgeneric/doomgeneric/d_net.c',
+  'third_party/doomgeneric/doomgeneric/f_finale.c',
+  'third_party/doomgeneric/doomgeneric/f_wipe.c',
+  'third_party/doomgeneric/doomgeneric/g_game.c',
+  'third_party/doomgeneric/doomgeneric/hu_lib.c',
+  'third_party/doomgeneric/doomgeneric/hu_stuff.c',
+  'third_party/doomgeneric/doomgeneric/info.c',
+  'third_party/doomgeneric/doomgeneric/i_cdmus.c',
+  'third_party/doomgeneric/doomgeneric/i_endoom.c',
+  'third_party/doomgeneric/doomgeneric/i_joystick.c',
+  'third_party/doomgeneric/doomgeneric/i_scale.c',
+  'third_party/doomgeneric/doomgeneric/i_sound.c',
+  'third_party/doomgeneric/doomgeneric/i_system.c',
+  'third_party/doomgeneric/doomgeneric/i_timer.c',
+  'third_party/doomgeneric/doomgeneric/memio.c',
+  'third_party/doomgeneric/doomgeneric/m_argv.c',
+  'third_party/doomgeneric/doomgeneric/m_bbox.c',
+  'third_party/doomgeneric/doomgeneric/m_cheat.c',
+  'third_party/doomgeneric/doomgeneric/m_config.c',
+  'third_party/doomgeneric/doomgeneric/m_controls.c',
+  'third_party/doomgeneric/doomgeneric/m_fixed.c',
+  'third_party/doomgeneric/doomgeneric/m_menu.c',
+  'third_party/doomgeneric/doomgeneric/m_misc.c',
+  'third_party/doomgeneric/doomgeneric/m_random.c',
+  'third_party/doomgeneric/doomgeneric/p_ceilng.c',
+  'third_party/doomgeneric/doomgeneric/p_doors.c',
+  'third_party/doomgeneric/doomgeneric/p_enemy.c',
+  'third_party/doomgeneric/doomgeneric/p_floor.c',
+  'third_party/doomgeneric/doomgeneric/p_inter.c',
+  'third_party/doomgeneric/doomgeneric/p_lights.c',
+  'third_party/doomgeneric/doomgeneric/p_map.c',
+  'third_party/doomgeneric/doomgeneric/p_maputl.c',
+  'third_party/doomgeneric/doomgeneric/p_mobj.c',
+  'third_party/doomgeneric/doomgeneric/p_plats.c',
+  'third_party/doomgeneric/doomgeneric/p_pspr.c',
+  'third_party/doomgeneric/doomgeneric/p_saveg.c',
+  'third_party/doomgeneric/doomgeneric/p_setup.c',
+  'third_party/doomgeneric/doomgeneric/p_sight.c',
+  'third_party/doomgeneric/doomgeneric/p_spec.c',
+  'third_party/doomgeneric/doomgeneric/p_switch.c',
+  'third_party/doomgeneric/doomgeneric/p_telept.c',
+  'third_party/doomgeneric/doomgeneric/p_tick.c',
+  'third_party/doomgeneric/doomgeneric/p_user.c',
+  'third_party/doomgeneric/doomgeneric/r_bsp.c',
+  'third_party/doomgeneric/doomgeneric/r_data.c',
+  'third_party/doomgeneric/doomgeneric/r_draw.c',
+  'third_party/doomgeneric/doomgeneric/r_main.c',
+  'third_party/doomgeneric/doomgeneric/r_plane.c',
+  'third_party/doomgeneric/doomgeneric/r_segs.c',
+  'third_party/doomgeneric/doomgeneric/r_sky.c',
+  'third_party/doomgeneric/doomgeneric/r_things.c',
+  'third_party/doomgeneric/doomgeneric/sha1.c',
+  'third_party/doomgeneric/doomgeneric/sounds.c',
+  'third_party/doomgeneric/doomgeneric/statdump.c',
+  'third_party/doomgeneric/doomgeneric/st_lib.c',
+  'third_party/doomgeneric/doomgeneric/st_stuff.c',
+  'third_party/doomgeneric/doomgeneric/s_sound.c',
+  'third_party/doomgeneric/doomgeneric/tables.c',
+  'third_party/doomgeneric/doomgeneric/v_video.c',
+  'third_party/doomgeneric/doomgeneric/wi_stuff.c',
+  'third_party/doomgeneric/doomgeneric/w_checksum.c',
+  'third_party/doomgeneric/doomgeneric/w_file.c',
+  'third_party/doomgeneric/doomgeneric/w_main.c',
+  'third_party/doomgeneric/doomgeneric/w_wad.c',
+  'third_party/doomgeneric/doomgeneric/z_zone.c',
+  'third_party/doomgeneric/doomgeneric/w_file_stdc.c',
+  'third_party/doomgeneric/doomgeneric/i_input.c',
+  'third_party/doomgeneric/doomgeneric/i_video.c',
+  'third_party/doomgeneric/doomgeneric/doomgeneric.c',
+), include_directories: include_directories('apps/posix/include'),
+  c_args: user_c_args + ['-DNORMALUNIX', '-DLINUX', '-Wno-unused-parameter', '-Wno-unused-variable',
+    '-Wno-unused-but-set-variable', '-Wno-sign-compare', '-Wno-pointer-sign', '-Wno-missing-field-initializers',
+    '-Wno-unused-function', '-Wno-implicit-fallthrough', '-Wno-maybe-uninitialized', '-Wno-enum-conversion', '-Wno-unused-but-set-parameter', '-Wno-dangling-pointer'],
+  pic: false, implicit_include_directories: false, build_by_default: false)
 bins = {}
 probes = {}
 foreach name, spec : {
@@ -242,6 +352,13 @@ foreach name, spec : {
   'foreign': [files('test/user/foreign.cpp'), false],
   'supervisor': [files('test/user/supervisor.cpp'), false],
   'block': [files('apps/block/main.cpp'), false],
+  'gpu': [files('apps/gpu/main.cpp'), false],
+  'gui': [files('apps/gui/main.cpp'), false],
+  'term': [files('apps/term/main.cpp'), true],
+  'doom': [files('apps/doom/main.cpp'), true],
+  'input': [files('apps/input/main.cpp'), false],
+  'stream': [files('apps/stream.cpp'), false],
+  'shared': [files('apps/shared.cpp'), false],
   'mem': [files('apps/mem/main.cpp'), false],
   'swap': [files('apps/swap.cpp'), true],
   'memcheck': [files('test/user/memory.cpp'), true],
@@ -264,11 +381,11 @@ foreach name, spec : {
   'sleep': [files('apps/sleep.cpp'), false],
 }
   binary = executable(name + '.elf', spec[0],
-    dependencies: [ubus_dep, io_dep] + (name == 'thread-test' ? [proc_dep] : []) + (['init','mgr','devices','shell','supervisor'].contains(name) ? [mgr_dep] : []),
-    c_args: user_c_args, include_directories: name == 'tasks' ? ftxui_inc : [],
+    dependencies: [ubus_dep, io_dep] + (name == 'thread-test' ? [proc_dep] : []) + (['init','mgr','devices','shell','term','supervisor'].contains(name) ? [mgr_dep] : []) + (['gui','term','doom'].contains(name) ? [gui_dep] : []) + (['gpu','input'].contains(name) ? [gui_protocol_dep] : []),
+    c_args: user_c_args, include_directories: (name == 'tasks' ? [ftxui_inc] : []) + (['gui','term'].contains(name) ? [include_directories('third_party/font8x8')] : []) + (name == 'term' ? [include_directories('third_party/libvterm/include')] : []) + (name == 'doom' ? [include_directories('third_party/doomgeneric/doomgeneric')] : []),
     cpp_args: user_cpp_args + (spec[1] ? ['-I' + join_paths(root, 'apps/posix/include')] : []),
     link_whole: [crt, user_entry] + (spec[1] ? [posix] : []),
-    link_with: [ubus, cxx_runtime] + (name == 'tasks' ? [tui, ftxui, cxx_runtime, math_runtime] : []),
+    link_with: [ubus, cxx_runtime, format_runtime] + (name == 'term' ? [vterm] : []) + (name == 'doom' ? [doom, math_runtime] : []) + (name == 'tasks' ? [tui, ftxui, cxx_runtime, math_runtime] : []),
     link_args: user_link_args + ['-Wl,--gc-sections'] + ['-Wl,-Map,' + join_paths(meson.current_build_dir(), name + '.map')],
     link_language: 'c', implicit_include_directories: false, build_by_default: false)
   if ['fill','slow','control-test','thread-test','foreign','supervisor'].contains(name)
@@ -309,6 +426,10 @@ config_builder = executable('config', files('tools/config.cpp', 'ubus/value.cpp'
   dependencies: dependency('json-c', native: true), cpp_args: ['-std=c++23', '-I' + root], build_by_default: false)
 mgr_config = custom_target('mgr-config', input: files('apps/mgr/boot.json'), output: 'mgr.config',
   command: [config_builder, '@INPUT@', '@OUTPUT@'], build_by_default: false)
+
+# Native fixtures retain their 128 MiB headless deployment budget.
+test_config = custom_target('test-config', input: files('apps/mgr/boot.json'), output: 'test.config',
+  command: [config_builder, '@INPUT@', '@OUTPUT@', 'shell/resources={"bytes":33554432,"caps":1024,"children":true}'], build_by_default: false)
 
 syscall_dependency_test = executable(
   'syscall-dependency-test', files('test/host/syscall_dependency_test.cpp'), native: true,
@@ -373,14 +494,19 @@ foreach name, app : bins
   endif
 endforeach
 base = apps + {'init': images['init'], 'mgr.config': mgr_config}
+test_base = base + {'mgr.config': test_config}
+game_data = {}
+if get_option('doom_wad') != ''
+  game_data = {'boot/doom.wad': files(get_option('doom_wad'))[0]}
+endif
 bundles = {}
 foreach name, layout : {
-  'boot': base,
-  'storage': base + {'boot/store.elf': images['store']},
-  'storage-test': base + test_apps + {'boot/store.elf': images['store']},
-  'exec': base + test_apps + {'boot/cow.elf': images['cow']},
-  'process-test': base + {'boot/shell.elf': images['process-client']},
-  'thread-test': base + test_apps + {'boot/shell.elf': images['thread-test']},
+  'system': base + game_data + {'boot/store.elf': images['store']},
+  'boot-test': test_base,
+  'storage-test': test_base + test_apps + {'boot/store.elf': images['store']},
+  'exec': test_base + test_apps + {'boot/cow.elf': images['cow']},
+  'process-test': test_base + {'boot/shell.elf': images['process-client']},
+  'thread-test': test_base + test_apps + {'boot/shell.elf': images['thread-test']},
   'ubus-test': {'init': images['ubus-test'], 'provider': images['ubus-test'], 'client': images['bus']},
   'channel-test': {'init': images['channel-test'], 'worker': images['channel-test']},
   'mgr-test': {'init': images['mgr-test'], 'worker': images['mgr-test']},
@@ -394,8 +520,8 @@ foreach name, layout : {
   bundles += {name: custom_target(name + '-bundle', input: inputs, output: name + '.bundle',
     command: [initramfs, '@OUTPUT@'] + paths, build_by_default: false)}
 endforeach
-boot_bundle = bundles['boot']
-storage_bundle = bundles['storage']
+system_bundle = bundles['system']
+boot_test_bundle = bundles['boot-test']
 storage_test_bundle = bundles['storage-test']
 exec_bundle = bundles['exec']
 process_test_bundle = bundles['process-test']
@@ -448,12 +574,13 @@ run_target('run-supervisor-matrix', command: [find_program('python3'), files('to
 
 timeout = get_option('qemu_timeout')
 smp = get_option('qemu_smp').to_string()
-run_target('run', command: [qemu, '-machine', 'virt', '-nographic', '-bios', 'default', '-kernel', kernel])
 run_target('run-timeout', command: [sh, run_qemu, qemu, '3s', '1', kernel, 'timeout'])
-run_target('run-console', command: [find_program('python3'),
-  files('tools/build/run-console-storage.py'), qemu, kernel, storage_bundle,
-  join_paths(meson.current_build_dir(), 'data.img'), smp],
-  depends: [kernel, storage_bundle])
+foreach name : ['run', 'run-console', 'run-gui']
+  run_target(name, command: [find_program('python3'), files('tools/build/run-system.py'),
+    qemu, kernel, system_bundle, smp, '--viewer', join_paths(meson.current_build_dir(), 'host-viewer')], depends: host_viewer)
+endforeach
+run_target('run-gui-matrix', command: [find_program('python3'), files('tools/build/run-system.py'),
+  qemu, kernel, system_bundle, '1,2,4', '--check'] + (get_option('doom_wad') != '' ? ['--doom'] : []))
 run_target('run-exec', command: [find_program('python3'), files('tools/build/run-console.py'),
   qemu, kernel_debug, exec_bundle, '4', 'exec', '1'])
 run_target('run-interactive', command: [find_program('python3'), files('tools/build/run-console.py'),
@@ -510,7 +637,7 @@ if scenario_marker != ''
   scenario_args_qemu += [scenario_marker]
 endif
 if scenario_name == 'initrd'
-  scenario_args_qemu += ['--initrd', boot_bundle, '--disk', probe_disk]
+  scenario_args_qemu += ['--initrd', boot_test_bundle, '--disk', probe_disk]
 endif
 if scenario_name != 'off'
   run_target('run-scenario', command: scenario_args_qemu)
@@ -518,7 +645,7 @@ endif
 
 alias_target('kernel', kernel)
 alias_target('kernel-debug', kernel_debug)
-alias_target('bundle', [boot_bundle, bins['uart']])
+alias_target('bundle', system_bundle)
 
 run_target('run-swap', command: [find_program('python3'), files('tools/build/run-console.py'),
   qemu, kernel, storage_test_bundle, '4', 'swap'])

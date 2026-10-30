@@ -14,9 +14,9 @@
 #include <string>
 #include <vector>
 
-using sh_chunk = io_frame;
+using sh_chunk = ubus_frame;
 static auto sh_send(cap_t channel, const sh_chunk& chunk, bool block = true) -> status_t {
-    io_tx output;
+    ubus_tx output;
     // Nonblocking uses here carry only input bytes/EOF. Bulk output has its
     // own transmitter in the queued output record.
     return output.send(channel, chunk, block);
@@ -43,6 +43,8 @@ struct sh_stage {
     bool end{};
     _cap_owner end_sender;
     _ev_watch end_ready, domain_ready;
+    std::unique_ptr<ubus_conn> graphics;
+    bool graphics_enabled{true};
 };
 enum class sh_state { Running, Suspending, Suspended, Terminating, Done };
 struct sh_pipeline {
@@ -68,16 +70,17 @@ struct sh_pipeline {
 class sh_shell {
     const _env& env_;
     ubus_rx input_;
-    ubus_conn bus_, files_;
+    ubus_conn bus_, files_, launcher_;
+    uint64_t rows_{24}, columns_{80};
     ubus_msg setup_;
     _vm_area source_;
     cap_t input_cap_{}, output_cap_{};
     mgr owner_{[this](mgr_child& child) { return image(child.program()); }};
     std::deque<std::unique_ptr<sh_pipeline>> pipelines_;
     uint64_t next_{}, foreground_{}, focus_{};
-    struct output { sh_chunk frame; uint64_t owner{}, focus{}; std::unique_ptr<io_tx> tx; };
+    struct output { sh_chunk frame; uint64_t owner{}, focus{}; std::unique_ptr<ubus_tx> tx; };
     std::deque<output> output_;
-    std::unique_ptr<io_tx> output_tx_;
+    std::unique_ptr<ubus_tx> output_tx_;
     _ev_watch output_ready_;
     std::string line_;
     std::string cwd_{"/"};
@@ -126,11 +129,11 @@ class sh_shell {
         // Old queued events can be replaced; old in-flight frames still carry
         // their old focus sequence and are rejected by the output broker.
         ubus_msg event;
-        event.data.put("focus", job.focus).put("focused", gained).put("rows", uint64_t{24})
-            .put("columns", uint64_t{80});
+        event.data.put("focus", job.focus).put("focused", gained).put("rows", rows_)
+            .put("columns", columns_);
         job.focus_event.emplace(std::move(event));
-        if (gained) { enqueue("\x1b[?1049h\x1b[?25h"); screen_ = true; }
-        else if (screen_) { enqueue("\x1b[?1049l\x1b[?25h"); screen_ = false; }
+        if (gained && !screen_) { enqueue("\x1b[?1049h\x1b[?25h"); screen_ = true; }
+        else if (!gained && screen_) { enqueue("\x1b[?1049l\x1b[?25h"); screen_ = false; }
     }
     void leave(sh_pipeline& job) {
         if (foreground_ != job.id) return;
@@ -248,6 +251,22 @@ class sh_shell {
                 ubus_data native; native.cap("pager", *copied); recipe.data.put("native", native);
             }
         }
+        if (policy["graphics"].as<bool>().value_or(false)) {
+            ubus_msg q, r;
+            if (launcher_.state() != STATUS_OK) {
+                (void)launcher_.close(); q.data.put("name", "gui");
+                auto status = bus_.invoke("Get", std::move(q), r);
+                if (status == STATUS_OK) status = launcher_.bind(r.capability(r.data["connector"]), "gui.launcher", 1, 1);
+                if (status != STATUS_OK) return status;
+            }
+            auto status = launcher_.invoke("Open", {}, r); if (status != STATUS_OK) return status;
+            stage.graphics = std::make_unique<ubus_conn>();
+            status = stage.graphics->bind(r.capability(r.data["control"]), "gui.control", 1, 1);
+            if (status != STATUS_OK) return status;
+            const auto idx = payload.offer(r.take(r.data["client"]), RIGHT_SEND | RIGHT_DUPLICATE);
+            if (!idx) return idx.error();
+            payload.data.cap("gui", *idx);
+        }
         recipe.data.put("setup", payload.data); payload.data = std::move(recipe.data);
         auto child = owner_.configure(std::move(payload)); if (!child) return child.error();
         stage.child = *child;
@@ -261,6 +280,8 @@ public:
         input_cap_ = setup_.capability(setup_.data["message"]["stdin"]);
         output_cap_ = setup_.capability(setup_.data["message"]["stdout"]);
         status = input_.open(input_cap_, &_events()); if (status != STATUS_OK) _thread_exit(status);
+        rows_ = setup_.data["message"]["rows"].as<uint64_t>().value_or(24);
+        columns_ = setup_.data["message"]["columns"].as<uint64_t>().value_or(80);
         status = owner_.open(); if (status != STATUS_OK) _thread_exit(status);
         if (const auto status = owner_.attach(bus_); status != STATUS_OK) _thread_exit(status);
     }
@@ -287,7 +308,9 @@ public:
     void terminate(sh_pipeline& job) {
         job.state = sh_state::Terminating;
         leave(job);
-        for (auto& stage : job.stages) if (stage.task()) (void)stage.task()->retire();
+        for (auto& stage : job.stages) {
+            if (stage.task()) (void)stage.task()->retire();
+        }
     }
     void pump(bool sleep = true) {
         bool progress{};
@@ -300,6 +323,12 @@ public:
                 auto& stage = job.stages[i];
                 if (stage.task()) {
                     if (job.execution && !stage.task()->stopping()) {
+                        if (stage.graphics && stage.graphics_enabled != *job.execution) {
+                            ubus_msg q, r; q.data.put("enabled", *job.execution).put("focus", *job.execution && foreground_ == job.id);
+                            const auto status = stage.graphics->invoke("Activate", std::move(q), r);
+                            if (status != STATUS_OK) { terminate(job); done = suspended = false; progress = true; break; }
+                            stage.graphics_enabled = *job.execution;
+                        }
                         const auto facts = _source_info(stage.task()->domain());
                         const auto state = _cap_copy<DomainInfo>(_domain_info(stage.task()->domain()));
                         const bool applied = state && state->requested == state->applied
@@ -318,7 +347,7 @@ public:
                     } else if (const auto status = stage.domain_ready.close(); status != STATUS_OK) _thread_exit(status);
                 } else if (const auto status = stage.domain_ready.close(); status != STATUS_OK) _thread_exit(status);
                 if (stage.child && !stage.task() && !stage.result) {
-                    stage.result = stage.child->result; stage.end = i + 1 < job.stages.size(); progress = true;
+                    stage.graphics.reset(); stage.result = stage.child->result; stage.end = i + 1 < job.stages.size(); progress = true;
                     if (i) (void)_channel_close(job.pipes[i - 1]->ends[0].selector());
                 }
                 if (stage.end) {
@@ -362,7 +391,7 @@ public:
             if (done && job.fullscreen && foreground_ == job.id) leave(job);
             for (unsigned i = 0; !screen_ && output_.size() < 64 && i < 16; ++i) {
                 sh_chunk frame;
-                const auto status = io_recv(job.output_rx, frame);
+                const auto status = ubus_recv(job.output_rx, frame);
                 job.output_empty = status == STATUS_WOULD_BLOCK || status == STATUS_CLOSED || status == STATUS_PEER_CLOSED;
                 if (status != STATUS_OK) break;
                 progress = true;
@@ -397,16 +426,26 @@ public:
         }
         for (unsigned i = 0; i < 16; ++i) {
             sh_chunk frame;
-            const auto status = io_recv(input_, frame);
+            ubus_request request;
+            auto status = input_.receive(request).status;
             if (status == STATUS_WOULD_BLOCK) break;
             if (status != STATUS_OK) _thread_exit(status);
+            const auto rows = request.data["rows"].as<uint64_t>(), columns = request.data["columns"].as<uint64_t>();
+            if (rows && columns && *rows && *columns && *rows <= 1024 && *columns <= 1024) {
+                if (*rows != rows_ || *columns != columns_) {
+                    rows_ = *rows; columns_ = *columns;
+                    if (auto* job = this->job(foreground_); job && job->fullscreen) focus(*job, true);
+                }
+            } else {
+                status = ubus_decode(request, frame); if (status != STATUS_OK) _thread_exit(status);
+                for (size_t i = 0; i < frame.size; ++i) input(frame.data[i]);
+            }
             progress = true;
-            for (size_t i = 0; i < frame.size; ++i) input(frame.data[i]);
         }
         while (!output_.empty()) {
             auto& next = output_.front();
             if (next.focus && (next.owner != foreground_ || !job(next.owner) || next.focus != job(next.owner)->focus)) { output_.pop_front(); continue; }
-            if (!next.tx) next.tx = output_tx_ ? std::move(output_tx_) : std::make_unique<io_tx>();
+            if (!next.tx) next.tx = output_tx_ ? std::move(output_tx_) : std::make_unique<ubus_tx>();
             const auto status = next.tx->send(output_cap_, next.frame, false);
             if (status == STATUS_WOULD_BLOCK || status == STATUS_BUSY) {
                 if (next.tx->active()) {
@@ -459,12 +498,12 @@ public:
                 if (foreground_ == job.id) focus(job, true);
                 return STATUS_OK;
             });
-        if (status == STATUS_OK) status = job.terminal.add("Frame", {{"focus", ubus_type::U64}, {"data", ubus_type::Bytes, true, io_inline}, {"buffer", ubus_type::Buffer, true}}, {},
+        if (status == STATUS_OK) status = job.terminal.add("Frame", {{"focus", ubus_type::U64}, {"data", ubus_type::Bytes, true, ubus_inline}, {"buffer", ubus_type::Buffer, true}}, {},
             [this, &job](auto& request, auto&) {
                 if (foreground_ != job.id || request.data["focus"].template as<uint64_t>() != job.focus) return STATUS_STALE;
                 if (output_.size() >= 64) return STATUS_BUSY;
                 sh_chunk frame;
-                const auto status = io_decode(request, frame);
+                const auto status = ubus_decode(request, frame);
                 if (status != STATUS_OK) return status;
                 output_.push_back({frame, job.id, job.focus, {}}); return STATUS_OK;
             }, 0, true);

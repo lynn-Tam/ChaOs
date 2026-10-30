@@ -1,0 +1,5 @@
+Upstream: https://github.com/hisahi/scanf
+Commit: 9acf085770db2a7319cdb2d7498e855d5edba9ab
+License: see original source header and LICENSE.
+
+Unmodified upstream sources. Selected narrow C-locale callback scanner; file callbacks are real stdio in apps/posix/format.c. SCANF_NOMATH=1, SCANF_INTERNAL_CTYPE=1, SCANF_SSCANF_ONLY=0.

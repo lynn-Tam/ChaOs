@@ -12,7 +12,7 @@
 class ft_terminal final {
     _ev_port* port_{};
     ubus_conn control_;
-    io_tx output_;
+    ubus_tx output_;
     _ch_pair subscription_;
     ubus_rx focus_events_, input_;
     uint64_t focus_{};
@@ -45,7 +45,7 @@ class ft_terminal final {
     }
     auto write(const char* data, size_t size) -> status_t {
         while (size) {
-            io_frame frame; frame.size = std::min(size, io_stream_limit);
+            ubus_frame frame; frame.size = std::min(size, ubus_stream_limit);
             ::memcpy(frame.data, data, frame.size);
             const auto status = output_.send(control_.endpoint(), frame, true, *control_.token("Frame"), focus_);
             if (status == STATUS_STALE) { focused_ = false; return STATUS_OK; }
@@ -79,8 +79,8 @@ class ft_terminal final {
             if (status != STATUS_WOULD_BLOCK) return status;
             if (focused_) {
                 if (!bytes_.empty()) { const auto byte = bytes_.front(); bytes_.pop_front(); return byte; }
-                io_frame message;
-                const auto received = io_recv(input_, message);
+                ubus_frame message;
+                const auto received = ubus_recv(input_, message);
                 if (received == STATUS_OK) {
                     if (message.status != STATUS_OK) return message.status;
                     if (!message.size) return STATUS_CANCELED;

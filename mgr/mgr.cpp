@@ -48,12 +48,12 @@ static auto mgr_quota(ubus_value limits) -> std::expected<_proc_limits, status_t
     q.bytes = limits["bytes"].as<uint64_t>().value_or(q.bytes);
     q.caps = limits["caps"].as<uint64_t>().value_or(q.caps);
     q.kinds = limits["kinds"].as<uint64_t>().value_or(q.kinds);
-    q.slots = limits["slots"].as<uint64_t>().value_or(q.caps);
+    q.max_caps = limits["max_caps"].as<uint64_t>().value_or(q.caps);
+    q.slots = limits["slots"].as<uint64_t>().value_or(q.max_caps);
     q.pages = limits["pages"].as<uint64_t>().value_or((q.slots + 7) / 8 + 4);
     q.watches = limits["watches"].as<uint64_t>().value_or(q.watches);
     q.hints = limits["hints"].as<uint64_t>().value_or(q.hints);
     q.max_bytes = limits["max_bytes"].as<uint64_t>().value_or(q.bytes);
-    q.max_caps = limits["max_caps"].as<uint64_t>().value_or(q.caps);
     if (limits["children"].as<bool>().value_or(false)) q.quota_perms |= RIGHT_SPLIT;
     if (!q.bytes || !q.caps || q.max_bytes < q.bytes || q.max_caps < q.caps) return std::unexpected(STATUS_BAD_ARGS);
     return q;

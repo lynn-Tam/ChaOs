@@ -1,6 +1,7 @@
 #include <ubus/value.hpp>
 #include <uapi/cap.h>
 #include <json-c/json.h>
+#include <json-c/json_pointer.h>
 #include <algorithm>
 #include <array>
 #include <fstream>
@@ -66,10 +67,31 @@ static auto append(ubus_data& output, std::string_view name, json_object* value,
     return true;
 }
 int main(int argc, char** argv) {
-    if (argc != 3) { std::cerr << "usage: config INPUT.json OUTPUT\n"; return 1; }
+    if (argc < 3) { std::cerr << "usage: config INPUT.json OUTPUT [CHILD/POINTER=JSON...]\n"; return 1; }
     std::unique_ptr<json_object, decltype(&json_object_put)> source{json_object_from_file(argv[1]), json_object_put};
     if (!source || json_object_get_type(source.get()) != json_type_object) {
         std::cerr << "expected a JSON configuration object: " << json_util_get_last_err() << '\n'; return 1;
+    }
+    for (int n = 3; n < argc; ++n) {
+        const std::string_view option{argv[n]};
+        const auto slash = option.find('/'), equal = option.find('=', slash);
+        if (!slash || slash == option.npos || equal == option.npos) {
+            std::cerr << "expected CHILD/POINTER=JSON: " << option << '\n'; return 1;
+        }
+        json_object* children{}; bool found{};
+        if (json_object_object_get_ex(source.get(), "children", &children))
+            for (size_t i = 0; i < json_object_array_length(children); ++i) {
+                auto* child = json_object_array_get_idx(children, i); json_object* name{};
+                if (json_object_object_get_ex(child, "name", &name) && std::string_view{json_object_get_string(name)} == option.substr(0, slash)) {
+                    json_tokener_error error{};
+                    std::unique_ptr<json_object, decltype(&json_object_put)> value{
+                        json_tokener_parse_verbose(argv[n] + equal + 1, &error), json_object_put};
+                    const std::string path{option.substr(slash, equal - slash)};
+                    if (error != json_tokener_success || json_pointer_set(&child, path.c_str(), value.get()) < 0) break;
+                    value.release(); found = true; break;
+                }
+            }
+        if (!found) { std::cerr << "invalid child override: " << option << '\n'; return 1; }
     }
     ubus_data wrapper;
     if (!append(wrapper, "config", source.get()) || !wrapper.valid()) { std::cerr << "invalid configuration value\n"; return 1; }

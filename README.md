@@ -21,15 +21,19 @@ Implemented or under active development:
 - runtime firmware discovery, capability-authorized MMIO/IRQ controllers,
   independent I/O address spaces, and DMA retirement
 - ordinary managed device/driver processes with reset and replacement
+- a user-space GUI framework with independent host windows, a native VirtIO GPU/Input backend, shared pixel buffers and a libvterm terminal
+- Doomgeneric as an ordinary windowed application with persistent configuration and saves
 
 The kernel and userspace interfaces are still evolving. Hardware support currently
 covers the QEMU `virt` RV64 configuration with PLIC, NS16550 UART, RISC-V IOMMU,
-and modern PCI virtio-block with one data volume. Storage is optional. This does
+and modern PCI VirtIO block, GPU 2D, keyboard and tablet devices. Storage is optional.
+The PCI launch configurations assign distinct INTx routes to interrupting devices; shared
+INTx, 3D acceleration and audio are not implemented. This does
 not imply arbitrary board, requester-alias, or hotplug support.
 
 ## Build
 
-Requirements include Meson, Ninja, QEMU, Python 3, ccache, host json-c, and a `riscv64-unknown-elf` GCC toolchain.
+Requirements include Meson, Ninja, QEMU, Python 3, ccache, host json-c, and a `riscv64-unknown-elf` GCC toolchain. The normal host-window launcher also needs the native SDL2 development package.
 
 ```sh
 CCACHE_DIR=build/ccache meson setup build/riscv64 \
@@ -39,14 +43,21 @@ CCACHE_DIR=build/ccache meson setup build/riscv64 \
 tools/build/ninja.sh kernel.elf bundle
 ```
 
-Run the native userspace environment under QEMU with:
+Run the complete system under QEMU with:
 
 ```sh
-tools/build/ninja.sh run-console
+tools/build/ninja.sh run
 ```
 
-The console boots with a persistent data disk at `build/riscv64/data.img`. On a new
-disk, run the shell `mkfs` command once; running it again erases the data volume.
+It starts the serial command line only, using one persistent data disk at
+`build/riscv64/data.img`. Starting a graphical application opens its own native
+host window; there is no QEMU desktop or second terminal at boot. `run-console`
+and `run-gui` are aliases for this same launcher, system image and disk.
+The host viewer needs SDL2 development files at build time and an available
+X11/Wayland session at runtime (including WSLg). The viewer uses shared pixels
+and a dedicated VirtIO serial stream; terminal input/logs remain separate.
+New disks have a capacity of 256 MiB. On a new disk, run the shell `mkfs` command
+once; running it again erases the data volume. Existing disks retain their contents.
 The immutable initramfs is mounted at `/boot`; a configured data disk is mounted at `/`.
 The boot mount and shell remain usable when storage is absent or stopped. Use `create note`,
 `write note hello`, `append note world`, `cat note`, `ls`, `stat note`,
@@ -58,7 +69,7 @@ the other file commands launch the ordinary `fs` program, also available as
 for example `write "my note" "hello world"`. `edit note` opens a screen editor:
 type to insert, move with the arrow keys, save with Ctrl+O, and exit with
 Ctrl+X (which asks whether to save changes). The buffer grows with the process heap. The shell brokers terminal input for the foreground pipeline. Ctrl+C terminates
-all its members; Ctrl+Z pauses their initial threads under the current single-thread runtime contract. `jobs`, `fg`, `bg`, `kill`, and `wait` manage
+all its members; Ctrl+Z pauses their execution domains. `jobs`, `fg`, `bg`, `kill`, and `wait` manage
 whole pipelines; `COMMAND &` starts one in the background with stdin left open.
 `tasks` shows programs and discovered devices; `view tasks`
 opens it with read-only management endpoints. `tasks` has Programs and Devices pages;
@@ -76,6 +87,40 @@ an extra status line; failures print `error: STATUS`.
 Acceptance precedes recovery and publication. Replacement drains only the owning
 branch; old business endpoints close and accepted business mutations are never replayed.
 Press Ctrl+A, then X to exit QEMU; later runs reuse the same data disk.
+
+`svc start term` explicitly opens an optional graphical terminal running the
+same shell, `edit`, `tasks` and file commands. The host window manager handles
+moving, resizing, switching and closing each window. F11 toggles fullscreen.
+Closing the last graphical window leaves the serial shell available. Replacing
+`gui` reconnects the graphical terminal while preserving its shell and VT state;
+ordinary applications own their own reconnect/exit policy. The host viewer is
+supervised by the launcher and rebuilds windows after a disconnect. Window geometry
+and raster dimensions are independent; a fixed raster can be scaled by the backend
+with an optional aspect-ratio constraint. Doom keeps its 640×400 buffers in fullscreen.
+The current framework implements 2D windows and input. It does not provide Wayland/RDP
+wire compatibility, 3D, audio, clipboard, drag-and-drop or IME support.
+
+To include a locally supplied Doom-compatible IWAD, configure its absolute path:
+
+```sh
+CCACHE_DIR=build/ccache meson configure build/riscv64 -Ddoom_wad=/absolute/path/to/game.wad
+tools/build/ninja.sh run
+```
+
+Run `doom` in the shell; it opens its own host window. Initialization messages appear in the terminal while assets load; the window is shown with the first rendered frame. Use `doom &` to keep the command line available. An explicit `-iwad` overrides the bundled
+`/boot/doom.wad`; relative game paths resolve in the writable `doom/` directory,
+which also holds configuration and per-IWAD saves on the same data volume as other
+applications. Default controls are arrow keys to move/turn, J to fire, Space to
+use/open, Shift to run, comma/period to strafe, number keys to select weapons,
+Tab for the map, F2/F3 to save/load, and F10 then Y to quit. Bindings in
+`doom/default.cfg` use the game's standard DOS scan codes (J is 36).
+A configured IWAD is included in the common `system.bundle` used by
+every normal entry point. Game data is not downloaded by the build or included in
+the repository. `run-gui-matrix` explicitly exercises the native VirtIO GPU/Input backend,
+terminal and recovery path on 1/2/4 harts; when an IWAD is
+configured it also saves, power cycles and loads Doom. Checks use independent
+scratch disks and do not open the persistent user disk. Headless kernel/storage
+test bundles retain their smaller deployment budgets and are used only by validation.
 
 `init` supervises one root manager through the same `mgr` mechanism used by the
 configured manager instances, device program and shell. Programs receive one opaque
@@ -110,6 +155,7 @@ uapi/       User/kernel ABI
 lib/        Native runtime/syscall SDK and ELF construction only
 ubus/       Common values, dynamic methods, discovery and direct RPC
 mgr/        Recursive environments, activation and deployment ownership
+gui/        GUI protocol, client SDK, window/session mechanisms and presentation backends
 apps/       Peer userspace programs, including managers and drivers
 apps/posix/ Explicit C/POSIX subset adapter
 tools/      Build and image tooling

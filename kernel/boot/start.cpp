@@ -133,7 +133,7 @@ static void start_worker(Boot& boot, Cpu& cpu) noexcept {
     auto root = boot.objects.get<resource::Quota>().create(std::move(*owner), resource::Reservation{}, resource::Capacity{
         .memory = static_cast<u64>(free_pages - system_pages)
             * mm::page_size,
-        .caps = 4096,
+        .caps = 8192,
     });
     libk_assert(root);
     boot.root = std::move(*root).publish();

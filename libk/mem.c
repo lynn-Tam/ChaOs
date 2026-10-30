@@ -1,20 +1,38 @@
 #include <libk/mem.h>
+#include <stdint.h>
+
+// Aligned scalar accesses only: the same implementation is used before traps
+// are available and on RV64IMAC, without an unaligned-access or SIMD contract.
+typedef uintptr_t mem_word __attribute__((__may_alias__));
+typedef uint32_t mem_u32 __attribute__((__may_alias__));
 
 void* memset(void* dst, int c, size_t n) {
     unsigned char* p = (unsigned char*)dst;
     const unsigned char byte = (unsigned char)c;
-    for (size_t i = 0; i < n; ++i) {
-        p[i] = byte;
-    }
+    while (n && (uintptr_t)p % sizeof(mem_word)) { *p++ = byte; --n; }
+    const mem_word value = (mem_word)-1 / 255 * byte;
+    while (n >= sizeof(mem_word)) { *(mem_word*)p = value; p += sizeof(mem_word); n -= sizeof(mem_word); }
+    while (n--) *p++ = byte;
     return dst;
 }
 
 void* memcpy(void* dst, const void* src, size_t n) {
     unsigned char* d = (unsigned char*)dst;
     const unsigned char* s = (const unsigned char*)src;
-    for (size_t i = 0; i < n; ++i) {
-        d[i] = s[i];
+    if (((uintptr_t)d ^ (uintptr_t)s) % sizeof(mem_u32) == 0) {
+        while (n && (uintptr_t)d % sizeof(mem_u32)) { *d++ = *s++; --n; }
+        if (((uintptr_t)d | (uintptr_t)s) % sizeof(mem_word) == 0) {
+            while (n >= sizeof(mem_word)) {
+                *(mem_word*)d = *(const mem_word*)s;
+                d += sizeof(mem_word); s += sizeof(mem_word); n -= sizeof(mem_word);
+            }
+        }
+        while (n >= sizeof(mem_u32)) {
+            *(mem_u32*)d = *(const mem_u32*)s;
+            d += sizeof(mem_u32); s += sizeof(mem_u32); n -= sizeof(mem_u32);
+        }
     }
+    while (n--) *d++ = *s++;
     return dst;
 }
 

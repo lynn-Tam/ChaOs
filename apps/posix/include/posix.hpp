@@ -5,7 +5,7 @@
 #include <io.hpp>
 
 // Explicit opt-in: receive streams from the environment; resolve files lazily through ubus.
-auto px_init() noexcept -> status_t;
+auto px_init(ubus_msg* setup = nullptr) noexcept -> status_t;
 
 // Native extensions: preserve native status values, outside the POSIX ABI.
 extern "C" {

@@ -4,9 +4,23 @@
 #include <libk/pci.hpp>
 #include <charconv>
 
-static cap_t dv_phys;
+static cap_t dv_phys, dv_shared;
+struct dv_match {
+    uint32_t identity;
+    const char *name, *type, *program, *service, *interface;
+    uint64_t bytes, caps;
+    bool publish, shared, dma{true};
+};
+static constexpr dv_match dv_drivers[]{
+    {0x1042'1af4, "Virtio block", "Storage", "/boot/block.elf", "block", "io.block", 8 << 20, 256, true, false},
+    {0x1050'1af4, "Virtio GPU", "Display", "/boot/gpu.elf", "display", "io.display", 24 << 20, 256, true, true},
+    {0x1052'1af4, "Virtio input", "Input", "/boot/input.elf", "input", "io.input", 2 << 20, 128, false, false},
+    {0x1043'1af4, "Virtio console", "Serial", "/boot/stream.elf", "display", "io.stream", 2 << 20, 128, true, false},
+    {0x1110'1af4, "Shared memory", "Memory", "/boot/shared.elf", "shared", "io.shared", 2 << 20, 128, true, true, false},
+};
 struct dv_record {
-    std::string id, name, type, location;
+    std::string id, name, type, location, service;
+    status_t error{};
     std::shared_ptr<mgr_child> driver;
 };
 
@@ -123,6 +137,7 @@ struct dv_device {
     uint16_t rid;
     uint32_t did, source;
     std::string name;
+    const dv_match& match;
     _cap_owner quota, scope, space, irq;
     std::shared_ptr<mgr_child> driver;
     uint64_t published_run{}, publication{};
@@ -130,10 +145,11 @@ struct dv_device {
     auto alloc() const noexcept -> CreateAuth { return {quota.selector(), scope.selector()}; }
     std::array<_vm_area, 6> bars;
     std::array<uint64_t, 6> addresses{};
-    dv_device(uint16_t rid, uint32_t did, uint32_t source, std::string name)
-        : rid(rid), did(did), source(source), name(std::move(name)) {}
+    dv_device(uint16_t rid, uint32_t did, uint32_t source, std::string name, const dv_match& match)
+        : rid(rid), did(did), source(source), name(std::move(name)), match(match) {}
     auto reset(dv_pci cfg) -> status_t {
         cfg.write<uint16_t>(4, 2 | (1 << 10)); // disable bus mastering and INTx
+        if (!match.dma) return STATUS_OK;
         std::array<std::pair<uintptr_t, size_t>, 6> views;
         for (size_t n = 0; n < 6; ++n) views[n] = {bars[n].address, bars[n].size};
         const auto transport = cfg.virtio(views);
@@ -156,7 +172,7 @@ struct dv_device {
         if (boundary.status != STATUS_OK) return boundary.status;
         driver.scope = _cap_owner{boundary.value};
         const CreateAuth deployment{env.quota, driver.scope.selector()};
-        const auto made = _quota_create(deployment, 12 * 1024 * 1024, 512,
+        const auto made = _quota_create(deployment, match.bytes + (4 << 20), match.caps + 256,
             _proc_base_kinds | OBJ_BIT(ObjIoSpace) | OBJ_BIT(ObjIrq));
         if (made.status != STATUS_OK) return made.status;
         quota = _cap_owner{made.value};
@@ -191,7 +207,9 @@ struct dv_device {
             fn->write<uint32_t>(0x10 + n * 4, static_cast<uint32_t>(address) | flags);
             if (bar.wide) fn->write<uint32_t>(0x14 + n * 4, address >> 32);
             addresses[n] = *physical;
-            const auto mem = _memory_create_physical(alloc(), dv_phys, *physical, bytes, VM_READ | VM_WRITE);
+            auto backing = alloc();
+            if (!match.dma && match.shared) backing.scope = dv_shared;
+            const auto mem = _memory_create_physical(backing, dv_phys, *physical, bytes, VM_READ | VM_WRITE);
             if (mem.status != STATUS_OK) return mem.status;
             auto mapping = _vm_area::map(_vm(), _cap_owner{mem.value}, 0, bytes, VM_READ | VM_WRITE);
             if (!mapping) return mapping.error();
@@ -200,6 +218,7 @@ struct dv_device {
         const auto status = reset(*fn);
         if (status != STATUS_OK) return status;
         reset_ready = true;
+        if (!match.dma) return STATUS_OK;
         const auto interrupt = _irq_create(alloc(), interrupts, source);
         if (interrupt.status != STATUS_OK) return interrupt.status;
         irq = _cap_owner{interrupt.value};
@@ -230,8 +249,15 @@ struct dv_device {
         auto status = config->detach();
         if (status == STATUS_OK) status = _memory_seal(config->memory.selector()).status;
         if (status == STATUS_OK) status = grant(driver, "pci.config", config->memory.selector(), RIGHT_MAP | RIGHT_DUPLICATE, 4096);
-        if (status == STATUS_OK) status = grant(driver, "dma", space.selector(), RIGHT_MAP | RIGHT_UNMAP | RIGHT_INSPECT | RIGHT_OBSERVE | RIGHT_CLOSE | RIGHT_DUPLICATE);
-        if (status == STATUS_OK) status = grant(driver, "irq", irq.selector(), RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK | RIGHT_DUPLICATE);
+        if (status == STATUS_OK && space) status = grant(driver, "dma", space.selector(), RIGHT_MAP | RIGHT_UNMAP | RIGHT_INSPECT | RIGHT_OBSERVE | RIGHT_CLOSE | RIGHT_DUPLICATE);
+        if (status == STATUS_OK && irq) status = grant(driver, "irq", irq.selector(), RIGHT_ROUTE | RIGHT_OBSERVE | RIGHT_ACK | RIGHT_DUPLICATE);
+        if (status == STATUS_OK && match.shared && match.dma) status = grant(driver, "shared", dv_shared, RIGHT_CREATE | RIGHT_DUPLICATE);
+        if (status == STATUS_OK) {
+            // Reset is acknowledged and the IOMMU domain is ready. DRIVER_OK
+            // gates queue processing; enable mastering before the driver can
+            // publish work, so its first notification cannot be lost.
+            fn->write<uint16_t>(4, match.dma ? 6 : 2 | (1 << 10)); (void)fn->read<uint16_t>(4);
+        }
         return status;
     }
     auto retire(dv_pci cfg) -> status_t {
@@ -271,6 +297,7 @@ int main() {
     const auto hart = message["hart"].as<uint64_t>();
     const auto format = message["format"].as<uint32_t>();
     dv_phys = setup.capability(message["physical"]);
+    dv_shared = setup.capability(message["shared"]);
     if (!buffer || !hart || !format || !dv_phys) return STATUS_BAD_ARGS;
     auto firmware = fw_view::open(env, setup.capability(message["firmware"]), buffer->size, buffer->offset, *format);
     if (!firmware) return firmware.error();
@@ -338,7 +365,7 @@ int main() {
         payload.data.put("offset", console->offset);
         recipe.data.put("setup", payload.data); payload.data = std::move(recipe.data);
         auto uart = owner.configure(std::move(payload)); if (!uart) return uart.error();
-        records.push_back({"uart", "Serial port", "Serial", "Firmware", *uart});
+        records.push_back({"uart", "Serial port", "Serial", "Firmware", "console", STATUS_OK, *uart});
         if (status == STATUS_OK) status = owner.start(**uart);
         if (status != STATUS_OK) return status;
     }
@@ -370,15 +397,19 @@ int main() {
                     char key[24] = "pci-";
                     const auto end = std::to_chars(key + 4, key + sizeof(key), rid, 16);
                     const auto bridge = (fn->read<uint32_t>(8) >> 24) == 0x06;
-                    records.push_back({std::string{key, end.ptr}, identity == 0x1042'1af4 ? "Virtio block" : bridge ? "PCI bridge" : "PCI device",
-                        identity == 0x1042'1af4 ? "Storage" : bridge ? "Bridge" : "Other",
-                        "PCI " + std::to_string(id) + ":" + std::to_string(slot) + "." + std::to_string(n), {}});
-                    if (identity != 0x1042'1af4) continue;
-                    const auto requester = bus->requester(rid), irq = bus->interrupt(rid, fn->read<uint8_t>(0x3d));
-                    if (!requester || !irq) continue;
-                    char name[24] = "block-";
-                    const auto text = std::to_chars(name + 6, name + sizeof(name), rid, 16);
-                    devices.push_back(std::make_unique<dv_device>(rid, *requester, *irq, std::string{name, text.ptr}));
+                    const auto match = std::ranges::find(dv_drivers, identity, &dv_match::identity);
+                    const bool supported = match != std::end(dv_drivers);
+                    records.push_back({std::string{key, end.ptr}, supported ? match->name : bridge ? "PCI bridge" : "PCI device",
+                        supported ? match->type : bridge ? "Bridge" : "Other",
+                        "PCI " + std::to_string(id) + ":" + std::to_string(slot) + "." + std::to_string(n), supported ? match->service : "", STATUS_OK, {}});
+                    if (!supported) continue;
+                    const auto requester = match->dma ? bus->requester(rid) : std::optional<uint32_t>{0};
+                    const auto source = match->dma ? bus->interrupt(rid, fn->read<uint8_t>(0x3d)) : std::optional<uint32_t>{0};
+                    if (!requester || !source) { records.back().error = STATUS_NOT_FOUND; continue; }
+                    if (*source && std::ranges::any_of(devices, [&](const auto& d) { return d->source == *source; })) {
+                        records.back().error = STATUS_BUSY; continue;
+                    }
+                    devices.push_back(std::make_unique<dv_device>(rid, *requester, *source, std::string{match->service} + "-" + std::string{key + 4, end.ptr}, *match));
                 }
             }
         }
@@ -387,16 +418,18 @@ int main() {
     // Reserve only the discovered hardware's deployment capacity. The parent's
     // capability ceiling authorizes growth; an unused second slot costs nothing.
     const auto quota = _cap_copy<CapInfo>(_cap_info(env.quota)); if (!quota) return quota.error();
+    uint64_t bytes = 8 << 20, caps = 512;
+    for (const auto& d : devices) { bytes += d->match.bytes + (4 << 20); caps += d->match.caps + 256; }
     ubus_msg capacity, resized;
     capacity.data.put("action", "resize")
-        .put("bytes", std::min<uint64_t>((8 + 12 * devices.size()) * 1024 * 1024, quota->view.words[0]))
-        .put("caps", std::min<uint64_t>(256 + 512 * devices.size(), quota->view.words[1]));
+        .put("bytes", std::min<uint64_t>(bytes, quota->view.words[0]))
+        .put("caps", std::min<uint64_t>(caps, quota->view.words[1]));
     status = parent.invoke("Resource", std::move(capacity), resized);
     if (status != STATUS_OK && status != STATUS_NO_MEMORY) return status;
     for (auto& device : devices) {
         auto& driver = device->driver;
-        auto recipe = mgr_recipe(device->name, "/boot/block.elf", {.bytes=8 * 1024 * 1024, .caps=256, .slots=256, .pages=36});
-        ubus_data exports{ubus_type::Array}; exports.push("block"); recipe.data.put("exports", exports).put("restart", true);
+        auto recipe = mgr_recipe(device->name, device->match.program, {.bytes=device->match.bytes, .caps=device->match.caps, .slots=device->match.caps, .pages=36});
+        ubus_data exports{ubus_type::Array}; exports.push(device->match.service); recipe.data.put("exports", exports).put("restart", true);
         auto configured = owner.configure(std::move(recipe)); if (!configured) return configured.error();
         driver = *configured;
         for (auto& record : records) {
@@ -413,9 +446,11 @@ int main() {
         ubus_data items{ubus_type::Array};
         for (const auto& record : records) {
             ubus_data row;
-            std::string_view state = "Detected";
+            std::string_view state = record.error ? "Failed" : "Detected";
+            if (record.error) row.put("error", int64_t(record.error));
             if (const auto& child = record.driver; child && owner.find(child->child_id)) {
                 const auto device = std::ranges::find_if(devices, [&](const auto& item) { return item->driver == child; });
+                if (device != devices.end()) row.put("interface", (*device)->match.interface);
                 state = child->state == mgr_state::Failed ? "Failed" : !child->task ? "Stopped"
                     : child->state == mgr_state::Draining ? "Stopping" : device != devices.end()
                     ? (*device)->published_run == child->run_id && !(*device)->quiesced ? "Ready" : "Starting" : "In use";
@@ -438,19 +473,22 @@ int main() {
         const auto id = *q.data["id"].template as<std::string_view>();
         const auto record = std::ranges::find_if(records, [&](const auto& row) { return row.id == id; });
         if (record == records.end() || !record->driver) return STATUS_NOT_FOUND;
-        auto connector = owner.lookup(record->driver->name + "/block"); if (!connector) return connector.error();
+        if (q.facet() != 1 && record->service != "block") return STATUS_DENIED;
+        auto connector = owner.lookup(record->driver->name + "/" + record->service); if (!connector) return connector.error();
         const auto index = r.give(std::move(*connector)); if (!index) return index.error();
         r.data.cap("connector", *index); return STATUS_OK;
     });
     if (status == STATUS_OK) status = inventory.open();
     if (status != STATUS_OK) return status;
-    auto listing = inventory.connector(); if (!listing) return listing.error();
-    ubus_msg announce, accepted;
-    const auto peer_idx = announce.attach(listing->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
-    if (!peer_idx) return peer_idx.error();
-    announce.data.put("name", "inventory").put("interface", "io.devices").put("version", uint64_t{1})
-        .cap("connector", *peer_idx);
-    status = parent.invoke("Publish", std::move(announce), accepted); if (status != STATUS_OK) return status;
+    auto listing = inventory.connector(), control = inventory.connector(1);
+    if (!listing || !control) return !listing ? listing.error() : control.error();
+    for (const auto& [name, connector] : std::array{
+        std::pair{"inventory", listing->selector()}, std::pair{"inventory.admin", control->selector()}}) {
+        ubus_msg announce, accepted;
+        const auto idx = announce.attach(connector, RIGHT_SEND | RIGHT_DUPLICATE); if (!idx) return idx.error();
+        announce.data.put("name", name).put("interface", "io.devices").put("version", uint64_t{1}).cap("connector", *idx);
+        status = parent.invoke("Publish", std::move(announce), accepted); if (status != STATUS_OK) return status;
+    }
     for (;;) {
         for (auto& device : devices) {
             const auto& driver = device->driver;
@@ -458,7 +496,7 @@ int main() {
             const auto advanced = driver->task->poll();
             if (advanced != STATUS_OK) return advanced;
             if (driver->task->stopped()) {
-                if ((status = _io_close_wait(device->space.selector())) != STATUS_OK) _thread_exit(status);
+                if (device->space && (status = _io_close_wait(device->space.selector())) != STATUS_OK) _thread_exit(status);
                 const auto fn = bus->function(device->rid);
                 if (!fn) _thread_exit(fn.error());
                 if ((status = device->reset(*fn)) != STATUS_OK) _thread_exit(status);
@@ -490,15 +528,17 @@ int main() {
                 }
             }
             if (driver->task && device->published_run != driver->run_id) {
-                auto connector = owner.lookup(device->name + "/block");
+                auto connector = owner.lookup(device->name + "/" + device->match.service);
                 if (!connector && connector.error() != STATUS_NOT_FOUND) return connector.error();
                 if (connector) {
-                    const auto fn = bus->function(device->rid); if (!fn) return fn.error();
-                    fn->write<uint16_t>(4, 6); (void)fn->read<uint16_t>(4);
                     device->published_run = driver->run_id;
                     // The first discovered disk is the default deployment policy.
                     // Every driver remains addressable through its recursive name.
-                    if (device != devices.front()) continue;
+                    if (!device->match.publish) continue;
+                    const auto first = std::ranges::find_if(devices, [&](const auto& d) {
+                        return std::string_view{d->match.service} == device->match.service;
+                    });
+                    if (first->get() != device.get()) continue;
                     ubus_msg request, response;
                     if (device->publication) {
                         request.data.put("instance", device->publication);
@@ -508,7 +548,7 @@ int main() {
                     request = {};
                     const auto peer_idx = request.attach(connector->selector(), RIGHT_SEND | RIGHT_DUPLICATE);
                     if (!peer_idx) return peer_idx.error();
-                    request.data.put("name", "block").put("interface", "io.block").put("version", uint64_t{1})
+                    request.data.put("name", device->match.service).put("interface", device->match.interface).put("version", uint64_t{1})
                     .cap("connector", *peer_idx);
                     status = parent.invoke("Publish", std::move(request), response); if (status != STATUS_OK) return status;
                     const auto published = response.data["instance"].as<uint64_t>();

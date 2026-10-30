@@ -1,0 +1,19 @@
+Upstream: https://github.com/ozkl/doomgeneric
+Commit: e257a09527062bfb986b6e5e0780839b6cbd5b71
+Archive: https://codeload.github.com/ozkl/doomgeneric/tar.gz/e257a09527062bfb986b6e5e0780839b6cbd5b71
+Archive SHA256: 26f8f60daa6c6e4d3c01e5eac9fb700d592dede803d13ac848154ff356b2a2e7
+License: GPL-2.0-or-later; original source headers and LICENSE retained.
+Only the selected engine and its compiled header closure are vendored. Alternate
+platform backends, build files, audio backends and network transports are omitted.
+The platform adapter is apps/doom/main.cpp. No game data is included.
+
+Local patches:
+- m_config.c: enable real configuration load/save; use ./; atomically replace
+  checked configuration writes; retain upstream per-IWAD save directory layout.
+- g_game.c: check save fclose and rename; do not unlink the previous save first.
+- i_system.c/h: const format contract; ordinary exit; remove host desktop dialogs.
+- doomkeys.h, m_controls.c, i_input.c: use canonical Doom keys so DOS scan-code
+  configuration round-trips; default fire to J for hosts reserving Ctrl; remove
+  an always-true comparison on unsigned key codes.
+- p_maputl.c: make the legacy DOS pointer-to-int emulation truncation explicit on LP64.
+Modified files: doomkeys.h, g_game.c, i_input.c, i_system.c, i_system.h, m_config.c, m_controls.c, p_maputl.c

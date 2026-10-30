@@ -40,7 +40,7 @@ struct px_context {
     ubus_conn rpc, bus;
     std::array<pending, IO_DEPTH> requests;
     request_id next{};
-    io_tx output;
+    ubus_tx output;
     _cleanup cleanup;
     ~px_context();
 };
@@ -265,7 +265,7 @@ struct directory {
 
 struct input_stream {
     _cap_owner channel;
-    io_frame frame;
+    ubus_frame frame;
     bool ended{};
     uint64_t offset{};
 };
@@ -326,10 +326,12 @@ static auto enqueue(std::shared_ptr<open_desc> file, px_op op, void* data, uint6
                     bool implicit, bool internal, pending*& out) noexcept -> int32_t {
     if (px_local().next == UINT64_MAX || (size && !data)) return STATUS_BAD_ARGS;
     for (auto& item : px_local().requests) if (!item.file) {
-        auto operation = std::make_unique<px_call>();
+        // The submitting thread owns each slot's Reply/Port transport. Keep it
+        // across completions instead of creating kernel objects for every I/O.
+        if (!item.operation) item.operation = std::make_unique<px_call>();
         const px_cmd request{.operation=op, .offset=offset, .length=size, .sequential=implicit};
-        const auto status = file->queue().submit(*operation, request, data); if (status != STATUS_OK) return status;
-        item.file = std::move(file); item.operation = std::move(operation);
+        const auto status = file->queue().submit(*item.operation, request, data); if (status != STATUS_OK) return status;
+        item.file = std::move(file);
         item.id = ++px_local().next; item.internal = internal; out = &item; return STATUS_OK;
     }
     return STATUS_BUSY;
@@ -342,7 +344,11 @@ static void pump() noexcept {
     }
 }
 static auto wait() noexcept -> int32_t { return _ev_wait(&_events()).status; }
-static auto take(pending& item) noexcept -> int64_t { const auto result = item.result; item = {}; return result; }
+static auto take(pending& item) noexcept -> int64_t {
+    const auto result = item.result;
+    item.file.reset(); item.id = 0; item.result = 0; item.ready = item.internal = false;
+    return result;
+}
 static auto drain(const std::shared_ptr<open_desc>& target = {}) noexcept -> int32_t {
     for (;;) {
         pump(); bool active{};
@@ -426,14 +432,16 @@ extern "C" int closedir(DIR* dir) {
     errno = EBADF; return -1;
 }
 
-auto px_init() noexcept -> status_t {
+auto px_init(ubus_msg* received) noexcept -> status_t {
     std::lock_guard init{init_mutex};
     if (initialized) return STATUS_BUSY;
     if (init_status != STATUS_OK) return init_status;
     const auto& env = _startup();
     std::array<_cap_owner, 3> streams;
     auto status = px_local().bus.bind(env.bootstrap); if (status != STATUS_OK) return status;
-    ubus_msg setup; status = px_local().bus.invoke("Receive", {}, setup); if (status != STATUS_OK) return status;
+    ubus_msg storage;
+    auto& setup = received ? *received : storage;
+    if (!received) { status = px_local().bus.invoke("Receive", {}, setup); if (status != STATUS_OK) return status; }
     init_status = STATUS_CLOSED; // Receive is consumed; a failed publication cannot repeat it.
     const std::array<std::string_view, 3> fields{"stdin", "stdout", "stderr"};
     for (size_t fd = 0; fd < streams.size(); ++fd) streams[fd] = setup.take(setup.data["message"][fields[fd]]);
@@ -619,7 +627,7 @@ extern "C" ssize_t read(int fd, void* data, size_t size) {
             return px_result(0);
         while (input->offset == input->frame.size) {
             if (input->ended) return 0;
-            const auto status = io_recv(input->channel.selector(), input->frame);
+            const auto status = ubus_recv(input->channel.selector(), input->frame);
             if (status != STATUS_OK) return px_result(status);
             if (input->frame.status != STATUS_OK) return px_result(input->frame.status);
             input->ended = !input->frame.size; input->offset = 0;
@@ -799,7 +807,7 @@ extern "C" ssize_t write(int fd, const void* data, size_t size) {
     const auto* bytes = static_cast<const char*>(data);
     uint64_t done{};
     while (done < size) {
-        io_frame frame; frame.size = std::min(size - done, io_stream_limit);
+        ubus_frame frame; frame.size = std::min(size - done, ubus_stream_limit);
         ::memcpy(frame.data, bytes + done, frame.size);
         const auto status = px_local().output.send(output->channel.selector(), frame);
         if (status != STATUS_OK)
@@ -808,3 +816,5 @@ extern "C" ssize_t write(int fd, const void* data, size_t size) {
     }
     return px_result(done);
 }
+
+extern "C" int mkdir(const char* path, mode_t) { return px_result(px_mkdir(path)); }

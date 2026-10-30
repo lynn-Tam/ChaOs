@@ -41,6 +41,9 @@
       "scope": {
         "$ref": "pager.scope"
       }
+    },
+    "shared.scope": {
+      "kind": "Scope"
     }
   },
   "routes": {
@@ -75,6 +78,10 @@
     "memory.admin": {
       "child": "memory",
       "name": "admin"
+    },
+    "gui": {
+      "child": "gui",
+      "name": "gui"
     }
   },
   "children": [
@@ -118,12 +125,15 @@
         "kinds": {
           "$const": "OBJ_KINDS"
         },
-        "max_bytes": 33554432,
-        "max_caps": 1280
+        "max_bytes": 100663296,
+        "max_caps": 3072
       },
       "exports": [
         "block",
-        "inventory"
+        "inventory",
+        "display",
+        "inventory.admin",
+        "shared"
       ],
       "setup": {
         "archive": {
@@ -153,6 +163,12 @@
             "$const": "RIGHT_SEND | RIGHT_DUPLICATE"
           },
           "badge": 1
+        },
+        "shared": {
+          "$ref": "shared.scope",
+          "rights": {
+            "$const": "RIGHT_CREATE | RIGHT_DUPLICATE"
+          }
         }
       }
     },
@@ -260,14 +276,133 @@
       }
     },
     {
+      "name": "gui",
+      "program": "/boot/gui.elf",
+      "restart": true,
+      "resources": {
+        "bytes": 67108864,
+        "caps": 512,
+        "max_bytes": 134217728,
+        "watches": 256
+      },
+      "exports": [
+        "gui"
+      ],
+      "routes": {
+        "display": {
+          "child": "devices",
+          "name": "display"
+        },
+        "hardware": {
+          "child": "devices",
+          "name": "inventory.admin"
+        },
+        "shared": {
+          "child": "devices",
+          "name": "shared"
+        }
+      },
+      "setup": {
+        "sessions": 8,
+        "windows": 4,
+        "bytes": 67108864,
+        "rate": 60,
+        "shared": {
+          "$ref": "shared.scope",
+          "rights": {
+            "$const": "RIGHT_CREATE | RIGHT_DUPLICATE"
+          }
+        }
+      }
+    },
+    {
+      "name": "term",
+      "program": "/boot/term.elf",
+      "resources": {
+        "bytes": 109051904,
+        "caps": 1536,
+        "children": true,
+        "watches": 128
+      },
+      "exports": [
+        "*"
+      ],
+      "setup": {
+        "shell": {
+          "commands": {
+            "$ref": "shell.commands"
+          },
+          "profiles": {
+            "$ref": "shell.profiles"
+          },
+          "routes": {
+            "$ref": "shell.routes"
+          },
+          "pager": {
+            "$ref": "pager",
+            "rights": {
+              "$const": "RIGHT_ATTACH | RIGHT_DUPLICATE"
+            }
+          },
+          "resources": {
+            "$ref": "shell.resources"
+          }
+        },
+        "pixels": 41943040
+      },
+      "routes": {
+        "boot": {
+          "child": "boot",
+          "name": "files"
+        },
+        "store": {
+          "child": "store",
+          "name": "files"
+        },
+        "files": {
+          "child": "vfs",
+          "name": "files"
+        },
+        "read": {
+          "child": "vfs",
+          "name": "read"
+        },
+        "exec": {
+          "child": "vfs",
+          "name": "exec"
+        },
+        "hardware": {
+          "child": "devices",
+          "name": "inventory"
+        },
+        "memory": {
+          "child": "memory",
+          "name": "memory"
+        },
+        "memory.admin": {
+          "child": "memory",
+          "name": "admin"
+        },
+        "gui": {
+          "child": "gui",
+          "name": "gui"
+        },
+        "store.admin": {
+          "child": "store",
+          "name": "admin"
+        },
+        "*": {
+          "local": true
+        }
+      }
+    },
+    {
       "name": "shell",
       "program": "/boot/shell.elf",
       "start": true,
       "restart": true,
       "resources": {
-        "bytes": 33554432,
-        "caps": 1024,
-        "children": true
+        "$ref": "shell.resources"
       },
       "exports": [
         "*"
@@ -287,227 +422,13 @@
           "badge": 1
         },
         "routes": {
-          "files": {
-            "parent": "files"
-          },
-          "read": {
-            "parent": "read"
-          },
-          "exec": {
-            "parent": "exec"
-          },
-          "hardware": {
-            "parent": "hardware"
-          },
-          "memory.admin": {
-            "parent": "memory.admin"
-          },
-          "memory": {
-            "parent": "memory"
-          }
+          "$ref": "shell.routes"
         },
         "commands": {
-          "tasks": {
-            "setup": {
-              "scope": {
-                "$ref": "control"
-              },
-              "scope.name": "system",
-              "devices": "hardware"
-            },
-            "routes": {
-              "hardware": {
-                "parent": "hardware"
-              }
-            },
-            "resident": true
-          },
-          "svc": {
-            "setup": {
-              "scope": {
-                "$ref": "control"
-              },
-              "scope.name": "system"
-            },
-            "resident": true
-          },
-          "bus": {
-            "setup": {
-              "control": {
-                "$ref": "control"
-              },
-              "observe": {
-                "$ref": "observe"
-              },
-              "create": {
-                "$ref": "create"
-              }
-            },
-            "routes": {
-              "*": {
-                "parent": true
-              }
-            },
-            "resident": true
-          },
-          "control-test": {
-            "setup": {
-              "control": {
-                "$ref": "debug"
-              },
-              "observe": {
-                "$ref": "observe"
-              },
-              "create": {
-                "$ref": "create"
-              }
-            },
-            "routes": {
-              "*": {
-                "parent": true
-              }
-            },
-            "resources": {
-              "bytes": 8388608,
-              "caps": 768,
-              "watches": 128
-            }
-          },
-          "fs": {
-            "routes": {
-              "files": {
-                "parent": "files"
-              },
-              "read": {
-                "parent": "read"
-              },
-              "exec": {
-                "parent": "exec"
-              },
-              "admin": {
-                "parent": "store.admin"
-              }
-            }
-          },
-          "mkfs": {
-            "program": "fs",
-            "argv": [
-              "fs",
-              "format"
-            ],
-            "routes": {
-              "files": {
-                "parent": "files"
-              },
-              "read": {
-                "parent": "read"
-              },
-              "exec": {
-                "parent": "exec"
-              },
-              "admin": {
-                "parent": "store.admin"
-              }
-            }
-          },
-          "stat": {
-            "program": "fs",
-            "argv": [
-              "fs",
-              "stat"
-            ]
-          },
-          "create": {
-            "program": "fs",
-            "argv": [
-              "fs",
-              "create"
-            ]
-          },
-          "write": {
-            "program": "fs",
-            "argv": [
-              "fs",
-              "write"
-            ]
-          },
-          "append": {
-            "program": "fs",
-            "argv": [
-              "fs",
-              "append"
-            ]
-          },
-          "swap": {
-            "resident": true
-          },
-          "memcheck": {
-            "resources": {
-              "bytes": 16777216,
-              "caps": 256,
-              "children": true
-            }
-          }
+          "$ref": "shell.commands"
         },
         "profiles": {
-          "view": {
-            "routes": {
-              "files": {
-                "parent": "read"
-              },
-              "read": {
-                "parent": "read"
-              },
-              "exec": {
-                "parent": "exec"
-              },
-              "hardware": {
-                "parent": "hardware"
-              }
-            },
-            "commands": {
-              "tasks": {
-                "setup": {
-                  "scope": {
-                    "$ref": "observe"
-                  },
-                  "scope.name": "system",
-                  "devices": "hardware"
-                }
-              },
-              "svc": {
-                "setup": {
-                  "scope": {
-                    "$ref": "observe"
-                  },
-                  "scope.name": "system"
-                }
-              },
-              "bus": {
-                "setup": {
-                  "observe": {
-                    "$ref": "observe"
-                  }
-                }
-              }
-            }
-          },
-          "debug": {
-            "routes": {
-              "*": {
-                "parent": true
-              }
-            },
-            "commands": {
-              "bus": {
-                "setup": {
-                  "control": {
-                    "$ref": "debug"
-                  }
-                }
-              }
-            }
-          }
+          "$ref": "shell.profiles"
         },
         "pager": {
           "$ref": "pager",
@@ -555,8 +476,261 @@
         "memory": {
           "child": "memory",
           "name": "memory"
+        },
+        "gui": {
+          "child": "gui",
+          "name": "gui"
         }
       }
     }
-  ]
+  ],
+  "values": {
+    "shell.commands": {
+      "tasks": {
+        "setup": {
+          "scope": {
+            "$ref": "control"
+          },
+          "scope.name": "system",
+          "devices": "hardware"
+        },
+        "routes": {
+          "hardware": {
+            "parent": "hardware"
+          }
+        },
+        "resident": true
+      },
+      "svc": {
+        "setup": {
+          "scope": {
+            "$ref": "control"
+          },
+          "scope.name": "system"
+        },
+        "resident": true
+      },
+      "bus": {
+        "setup": {
+          "control": {
+            "$ref": "control"
+          },
+          "observe": {
+            "$ref": "observe"
+          },
+          "create": {
+            "$ref": "create"
+          }
+        },
+        "routes": {
+          "*": {
+            "parent": true
+          }
+        },
+        "resident": true
+      },
+      "control-test": {
+        "setup": {
+          "control": {
+            "$ref": "debug"
+          },
+          "observe": {
+            "$ref": "observe"
+          },
+          "create": {
+            "$ref": "create"
+          }
+        },
+        "routes": {
+          "*": {
+            "parent": true
+          }
+        },
+        "resources": {
+          "bytes": 8388608,
+          "caps": 768,
+          "watches": 128
+        }
+      },
+      "fs": {
+        "routes": {
+          "files": {
+            "parent": "files"
+          },
+          "read": {
+            "parent": "read"
+          },
+          "exec": {
+            "parent": "exec"
+          },
+          "admin": {
+            "parent": "store.admin"
+          }
+        }
+      },
+      "mkfs": {
+        "program": "fs",
+        "argv": [
+          "fs",
+          "format"
+        ],
+        "routes": {
+          "files": {
+            "parent": "files"
+          },
+          "read": {
+            "parent": "read"
+          },
+          "exec": {
+            "parent": "exec"
+          },
+          "admin": {
+            "parent": "store.admin"
+          }
+        }
+      },
+      "stat": {
+        "program": "fs",
+        "argv": [
+          "fs",
+          "stat"
+        ]
+      },
+      "create": {
+        "program": "fs",
+        "argv": [
+          "fs",
+          "create"
+        ]
+      },
+      "write": {
+        "program": "fs",
+        "argv": [
+          "fs",
+          "write"
+        ]
+      },
+      "append": {
+        "program": "fs",
+        "argv": [
+          "fs",
+          "append"
+        ]
+      },
+      "swap": {
+        "resident": true
+      },
+      "memcheck": {
+        "resources": {
+          "bytes": 16777216,
+          "caps": 256,
+          "children": true
+        }
+      },
+      "doom": {
+        "graphics": true,
+        "resources": {
+          "bytes": 33554432,
+          "caps": 384
+        },
+        "resident": false,
+        "routes": {
+          "files": {
+            "parent": "files"
+          },
+          "read": {
+            "parent": "read"
+          },
+          "exec": {
+            "parent": "exec"
+          }
+        }
+      }
+    },
+    "shell.profiles": {
+      "view": {
+        "routes": {
+          "files": {
+            "parent": "read"
+          },
+          "read": {
+            "parent": "read"
+          },
+          "exec": {
+            "parent": "exec"
+          },
+          "hardware": {
+            "parent": "hardware"
+          }
+        },
+        "commands": {
+          "tasks": {
+            "setup": {
+              "scope": {
+                "$ref": "observe"
+              },
+              "scope.name": "system",
+              "devices": "hardware"
+            }
+          },
+          "svc": {
+            "setup": {
+              "scope": {
+                "$ref": "observe"
+              },
+              "scope.name": "system"
+            }
+          },
+          "bus": {
+            "setup": {
+              "observe": {
+                "$ref": "observe"
+              }
+            }
+          }
+        }
+      },
+      "debug": {
+        "routes": {
+          "*": {
+            "parent": true
+          }
+        },
+        "commands": {
+          "bus": {
+            "setup": {
+              "control": {
+                "$ref": "debug"
+              }
+            }
+          }
+        }
+      }
+    },
+    "shell.routes": {
+      "files": {
+        "parent": "files"
+      },
+      "read": {
+        "parent": "read"
+      },
+      "exec": {
+        "parent": "exec"
+      },
+      "hardware": {
+        "parent": "hardware"
+      },
+      "memory.admin": {
+        "parent": "memory.admin"
+      },
+      "memory": {
+        "parent": "memory"
+      }
+    },
+    "shell.resources": {
+      "bytes": 50331648,
+      "caps": 1024,
+      "children": true
+    }
+  }
 }

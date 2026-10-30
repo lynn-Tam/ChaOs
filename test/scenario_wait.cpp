@@ -372,6 +372,42 @@ auto live_trim(Cpu& rt) noexcept -> bool {
     return true;
 }
 
+auto ordinary_wake(Thread& thread, Cpus& cpus) noexcept -> bool {
+    auto& k = *test::boot;
+    auto& cpu = current_cpu();
+    auto made = k.objects.get<sched::ScDomain>().create(k.pmm, cpus,
+        sched::ScDomain::Config{.cpus=u64{1} << cpu.id.raw});
+    libk_assert(made && made->get().open() == STATUS_OK);
+    auto domain = made->publish();
+    libk_assert(domain->attach(k.domain) == STATUS_OK);
+    Source source;
+    unsigned steps{};
+    Work* pending{};
+    auto publish = [&]() noexcept {
+        // Cross select's finite work boundary before waking the caller.
+        if (++steps != 32) { libk_assert(domain->post(*pending) == STATUS_OK); return; }
+        libk_assert(source.post(1));
+        // Retirement callbacks can drain mail while select() is running
+        // ordinary work on behalf of an already parked outgoing thread.
+        cpu.dispatcher().drain_remote();
+    };
+    auto cancel = []() noexcept {};
+    Work work{Work::Fn::bind(publish), Work::Fn::bind(cancel)};
+    pending = &work;
+    {
+        sync::Irq irq;
+        libk_assert(source.await({thread, cpus, cpu.dispatcher()}, {}).status == STATUS_PENDING);
+        libk_assert(domain->post(work) == STATUS_OK);
+        thread.block();
+    }
+    const auto result = thread.wait().result();
+    const bool passed = result.status == STATUS_OK && result.value == 1;
+    source.close();
+    while (domain->close() != DOMAIN_DRAINED) sched::yield();
+    libk_assert(domain.destroy());
+    return passed;
+}
+
 void wait_entry(void* argument) noexcept {
     auto& state = *static_cast<WaitState*>(argument);
     auto& cpu = current_cpu();
@@ -381,7 +417,8 @@ void wait_entry(void* argument) noexcept {
     sched::yield();
     sched::block();
     console::print<"[scenario] wake credit survives dispatch before block\n">();
-    const bool passed = cancellation_publication(*cpu.current, *cpu.cpus) && source_wait(*cpu.current, *cpu.cpus) &&
+    const bool passed = ordinary_wake(*cpu.current, *cpu.cpus) &&
+                        cancellation_publication(*cpu.current, *cpu.cpus) && source_wait(*cpu.current, *cpu.cpus) &&
                         pending_vm_wait(cpu) && live_trim(cpu);
     state.ran.store(passed ? 1 : 2, std::memory_order_release);
     sched::exit_current();

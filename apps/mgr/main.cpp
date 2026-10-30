@@ -203,6 +203,14 @@ int main() {
         }
         if (!progress) return STATUS_NOT_FOUND;
     }
+    // Package values share capability-bearing setup data across deployments.
+    for (const auto value : config["values"].values()) {
+        ubus_msg item;
+        status = append(item.data, "value", value, item, config_source, context, ubus_depth, false);
+        if (status != STATUS_OK) return status;
+        auto owned = item.clone(); if (!owned) return owned.error();
+        context.emplace(std::string{value.name()}, std::move(*owned));
+    }
     const auto recipe_for = [&](ubus_value child) -> std::expected<ubus_msg, status_t> {
         ubus_msg recipe;
         for (const auto field : child.values()) {

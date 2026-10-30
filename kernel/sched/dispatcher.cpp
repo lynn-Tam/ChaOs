@@ -254,7 +254,9 @@ auto Dispatcher::select(u64& now) noexcept -> Thread* {
         while (candidate && !candidate->thread && !candidate->work) candidate = candidate->ready.minimum();
         if (!candidate) return nullptr;
         if (candidate->work) {
-            if (steps++ == 8) { (void)send_ipi(cpu_.hw); return nullptr; }
+            // A bare IPI carries no mailbox intent. Keep this boundary's
+            // reschedule pending so an idle choice cannot strand ready work.
+            if (steps++ == 8) { request_reschedule(DispatchReason::RemoteWake); return nullptr; }
             auto& owner = *candidate->domain;
             auto storage = object::ref<>::retain_alive(owner.close_work_.key());
             if (!reserve(candidate->parent, nullptr, now)) continue;
@@ -304,7 +306,11 @@ void Dispatcher::refresh(Thread& t) noexcept {
     libk_assert(!arch::interrupts_enabled());
     if (t.state_ == Thread::State::Exited) return;
     if (&t != current()) request_reschedule(DispatchReason::RemoteWake);
-    if (&t == current() && (current_sc_ || current_branch_)) { request_reschedule(DispatchReason::RemoteWake); return; }
+    // select() runs ordinary callbacks while current() still names the parked
+    // outgoing thread. Only a running thread owns the active execution grant.
+    if (&t == current() && t.state_ == Thread::State::Running && (current_sc_ || current_branch_)) {
+        request_reschedule(DispatchReason::RemoteWake); return;
+    }
     if (t.ready_.hook.is_linked() || t.maintenance_hook_.is_linked()) remove(t);
     if (t.refill_.armed()) disarm(t.refill_);
     if (t.wait_when_) {

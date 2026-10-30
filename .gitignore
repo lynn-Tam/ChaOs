@@ -37,3 +37,15 @@
 !/apps/**
 !/mgr/
 !/mgr/**
+!/gui/
+!/gui/**
+!/third_party/libvterm/
+!/third_party/libvterm/**
+!/third_party/doomgeneric/
+!/third_party/doomgeneric/**
+!/third_party/font8x8/
+!/third_party/font8x8/**
+!/third_party/stb/
+!/third_party/stb/**
+!/third_party/scanf/
+!/third_party/scanf/**
